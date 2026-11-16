@@ -1,4 +1,5 @@
 # Runtime configuration and state
+/.agent-handoff-manifest.json
 /config/config.json
 /data/
 /queue/

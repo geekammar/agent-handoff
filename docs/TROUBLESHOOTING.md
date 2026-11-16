@@ -21,6 +21,25 @@ config/config.json
 
 Never paste tokens or rclone configuration contents into chat or logs.
 
+## Installation refuses invalid OpenCode or AGY JSON
+
+The installer validates managed external JSON before changing any plugin, hook, or instruction file. If it reports `invalid opencode.json` or `invalid AGY hooks.json`, fix the JSON first:
+
+```bash
+python3 -m json.tool ~/.config/opencode/opencode.json
+python3 -m json.tool ~/.gemini/config/hooks.json
+```
+
+A failed installation restores the managed integration files it had already changed. Existing `*.backup-agent-handoff-*` files remain available for inspection.
+
+## Rollback refuses a legacy snapshot
+
+A snapshot created before ownership manifests has no `manifest.json`. The rollback refuses it because newer managed files cannot be separated safely from unmanaged files. Install or upgrade once with the current version to create a snapshot with ownership information, then roll back to that snapshot. Runtime configuration and data are never modified by the refusal.
+
+## Installer reports an unsafe managed path
+
+The installer never follows source symlinks or writes through destination symlink components. If it reports an unsafe managed path, inspect the runtime paths involved and replace the symlink with a normal directory before retrying. Do not delete runtime data or configuration directories.
+
 ## Google Drive is not authorized
 
 Symptoms:
