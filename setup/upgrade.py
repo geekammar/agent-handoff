@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import filecmp
 import json
 import os
 import shutil
@@ -10,17 +11,22 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+SETUP_DIR = Path(__file__).resolve().parent
+if str(SETUP_DIR) not in sys.path:
+    sys.path.insert(0, str(SETUP_DIR))
+
+from install import capture_external_state, external_paths, restore_external_state  # noqa: E402
+from managed import (  # noqa: E402
+    MANIFEST_NAME,
+    ManifestError,
+    load_manifest,
+    safe_target,
+    walk_files,
+    write_manifest,
+)
+
 SOURCE = Path(__file__).resolve().parents[1]
 DEFAULT_HOME = Path(os.environ.get("AGENT_HANDOFF_HOME", "/root/agent-handoff"))
-MANAGED = ["bin", "lib", "integrations", "setup", "tests", "docs", "README.md"]
-SNAPSHOT_IGNORE = shutil.ignore_patterns(
-    "__pycache__",
-    "*.pyc",
-    ".pytest_cache",
-    "acceptance-results.json",
-    "live-config.json",
-    "*.backup-agent-handoff-*",
-)
 
 
 def log(message: str) -> None:
@@ -51,29 +57,74 @@ def source_commit(source: Path) -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def unique_release(target: Path) -> Path:
+    if not target.exists():
+        return target
+    counter = 2
+    while True:
+        candidate = target.with_name(f"{target.name}-{counter}")
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def atomic_copy(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.tmp-{os.getpid()}")
+    shutil.copy2(source, temporary)
+    os.replace(temporary, target)
+
+
 def snapshot(home: Path, label: str) -> Path | None:
-    existing = [item for item in MANAGED if (home / item).exists()]
-    if not existing:
+    present = walk_files(home)
+    if not present:
         log("no installed code to snapshot")
         return None
-    target = releases_root(home) / f"{timestamp()}-{label}"
+    runtime_manifest = None
+    try:
+        runtime_manifest = load_manifest(home / MANIFEST_NAME, required=False)
+    except ManifestError as exc:
+        log(f"warning: ignoring previous ownership manifest: {exc}")
+    if runtime_manifest:
+        present_paths = {item.as_posix() for item in present}
+        files = [Path(item) for item in runtime_manifest["files"] if item in present_paths]
+        origin = "installer-manifest"
+    else:
+        files = present
+        origin = "snapshot-inventory"
+    if not files:
+        log("no installed managed files to snapshot")
+        return None
+    target = unique_release(releases_root(home) / f"{timestamp()}-{label}")
     target.mkdir(parents=True, exist_ok=False)
     code = target / "code"
     code.mkdir()
-    for item in existing:
-        source = home / item
-        destination = code / item
-        if source.is_dir():
-            shutil.copytree(source, destination, ignore=SNAPSHOT_IGNORE)
-        else:
-            shutil.copy2(source, destination)
+    for relative in files:
+        destination = code / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(home / relative, destination)
+    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    write_manifest(
+        target / "manifest.json",
+        [item.as_posix() for item in files],
+        {
+            "created_at": created_at,
+            "label": label,
+            "source": str(SOURCE),
+            "source_commit": source_commit(SOURCE),
+            "home": str(home),
+            "origin": origin,
+        },
+    )
     metadata = {
-        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "created_at": created_at,
         "label": label,
         "source": str(SOURCE),
         "source_commit": source_commit(SOURCE),
         "home": str(home),
-        "items": existing,
+        "items": sorted({item.parts[0] for item in files}),
+        "files": len(files),
+        "manifest": "manifest.json",
     }
     (target / "release.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     log(f"snapshot: {target}")
@@ -84,28 +135,84 @@ def restore(home: Path, release: Path) -> None:
     code = release / "code"
     if not code.is_dir():
         raise SystemExit(f"invalid release snapshot: {release}")
-    for item in MANAGED:
-        source = code / item
-        if not source.exists():
+    try:
+        release_manifest = load_manifest(release / "manifest.json", required=True)
+    except ManifestError as exc:
+        raise SystemExit(
+            f"cannot safely restore {release.name}: {exc}. "
+            "Legacy snapshots without an ownership manifest are not restored because newer managed files "
+            "cannot be distinguished from unmanaged files. Create a new snapshot with a version that "
+            "records ownership before rolling back."
+        )
+    release_files = set(release_manifest["files"])
+    required = {"setup/install.py", "bin/agent-handoff"}
+    missing = sorted(required - release_files)
+    if missing:
+        raise SystemExit(
+            f"invalid release snapshot {release.name}: missing required managed file(s): {', '.join(missing)}"
+        )
+    try:
+        current_manifest = load_manifest(home / MANIFEST_NAME, required=False)
+    except ManifestError as exc:
+        raise SystemExit(f"cannot safely restore {release.name}: invalid current ownership manifest: {exc}")
+    if current_manifest is None:
+        raise SystemExit(
+            f"cannot safely restore {release.name}: the current installation has no ownership manifest, "
+            "so newer managed files cannot be identified safely."
+        )
+    current_files = set(current_manifest["files"])
+    for relative in sorted(release_files):
+        source = code / relative
+        if source.is_symlink() or not source.is_file():
+            raise SystemExit(f"invalid release snapshot {release.name}: missing regular file {relative}")
+        if safe_target(home, relative) is None:
+            raise SystemExit(f"refusing to restore unsafe managed path: {relative}")
+    newer = sorted(current_files - release_files)
+    for relative in newer:
+        if safe_target(home, relative) is None:
+            raise SystemExit(f"refusing to remove unsafe managed path: {relative}")
+    removed = 0
+    for relative in newer:
+        target = safe_target(home, relative)
+        assert target is not None
+        if target.is_symlink() or (target.exists() and target.is_file()):
+            target.unlink()
+            removed += 1
+            log(f"removed newer managed file: {relative}")
+        elif target.exists():
+            log(f"warning: not removing non-file managed path: {relative}")
+    restored = 0
+    for relative in sorted(release_files):
+        source = code / relative
+        target = safe_target(home, relative)
+        assert target is not None
+        if target.exists() and target.is_file() and not target.is_symlink() and filecmp.cmp(source, target, shallow=False):
             continue
-        destination = home / item
-        if source.is_dir():
-            destination.mkdir(parents=True, exist_ok=True)
-            for path in source.rglob("*"):
-                if path.is_file():
-                    relative = path.relative_to(source)
-                    target = destination / relative
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(path, target)
-        else:
-            shutil.copy2(source, destination)
-    log(f"restored code from: {release}")
+        atomic_copy(source, target)
+        restored += 1
+    write_manifest(
+        home / MANIFEST_NAME,
+        sorted(release_files),
+        {
+            "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "state": "restored",
+            "release": release.name,
+            "source_commit": release_manifest.get("source_commit"),
+        },
+    )
+    log(f"restored code from: {release} ({restored} file(s) restored, {removed} newer file(s) removed)")
 
 
 def install(home: Path, extra: list[str] | None = None, use_source: bool = True) -> int:
-    installer = SOURCE / "setup" / "install.py" if use_source else home / "setup" / "install.py"
-    if not installer.exists():
-        installer = home / "setup" / "install.py" if use_source else SOURCE / "setup" / "install.py"
+    if use_source:
+        installer = SOURCE / "setup" / "install.py"
+        if not installer.exists():
+            installer = home / "setup" / "install.py"
+    else:
+        installer = home / "setup" / "install.py"
+        if not installer.exists():
+            log(f"missing restored installer: {installer}")
+            return 1
     command = [sys.executable, str(installer), "--home", str(home), *(extra or [])]
     result = subprocess.run(command, check=False)
     return result.returncode
@@ -130,15 +237,28 @@ def latest_release(home: Path, skip: Path | None = None) -> Path | None:
     return max(candidates, key=lambda path: path.name) if candidates else None
 
 
+def integration_state(extra: list[str] | None) -> dict[Path, tuple[str, bytes | str | None, int | None]]:
+    values = extra or []
+    return capture_external_state(
+        external_paths("--no-opencode" not in values, "--no-agy" not in values)
+    )
+
+
 def upgrade(home: Path, no_snapshot: bool, extra: list[str] | None = None) -> int:
+    external_state = integration_state(extra)
     previous = None if no_snapshot else snapshot(home, "pre-upgrade")
     log(f"installing from: {SOURCE}")
     code = install(home, extra, use_source=True)
     if code != 0:
         log(f"install failed with exit {code}")
+        restore_external_state(external_state)
         if previous:
             log("automatic rollback started")
-            restore(home, previous)
+            try:
+                restore(home, previous)
+            except SystemExit as exc:
+                log(f"automatic rollback refused: {exc}")
+                return code
             restore_code = install(home, extra, use_source=False)
             if restore_code != 0:
                 log(f"rollback install failed with exit {restore_code}")
@@ -156,11 +276,25 @@ def rollback(home: Path, release: str | None, extra: list[str] | None = None) ->
         target = latest_release(home)
     if not target or not target.is_dir():
         raise SystemExit("no release snapshot is available for rollback")
-    snapshot(home, "pre-rollback")
+    external_state = integration_state(extra)
+    previous = snapshot(home, "pre-rollback")
     restore(home, target)
     code = install(home, extra, use_source=False)
     if code != 0:
         log(f"rollback install failed with exit {code}")
+        restore_external_state(external_state)
+        if previous:
+            log("restoring the pre-rollback state")
+            try:
+                restore(home, previous)
+            except SystemExit as exc:
+                log(f"rollback recovery refused: {exc}")
+                return code
+            recovery = install(home, extra, use_source=False)
+            if recovery != 0:
+                log(f"rollback recovery install failed with exit {recovery}")
+            else:
+                log("pre-rollback state restored")
         return code
     log(f"rollback complete: {target.name}")
     return 0

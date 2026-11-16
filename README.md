@@ -28,10 +28,12 @@ agent-handoff/
     test_unit.py
     test_integration.py
     test_install.py
+    test_installer_safety.py        # source selection, ownership, integration recovery
     acceptance.py                   # live end-to-end acceptance suite
     fake-rclone                    # deterministic Drive simulator
   setup/
     install.py, install.sh          # idempotent installer
+    managed.py                      # shared source-selection and ownership policy
     upgrade.py, upgrade.sh          # snapshot + upgrade
     rollback.sh                     # restore previous snapshot
     gdrive-auth.sh                  # headless-safe authorization helper
@@ -62,14 +64,17 @@ python3 /root/projects/agent-handoff/setup/install.py --home /root/agent-handoff
 
 The installer:
 
-- synchronizes tracked source files into the runtime home,
+- synchronizes selected source files into the runtime home,
+- records the installed files in `$AGENT_HANDOFF_HOME/.agent-handoff-manifest.json`,
 - creates or updates `/usr/local/bin/agent-handoff` as a symlink,
 - installs the OpenCode plugin and instruction registration,
 - installs the AGY `Stop` hook and instruction block,
 - backs up any configuration file before changing it,
-- never touches `data/`, `queue/`, `state/`, `locks/`, `logs/`, `tmp/`, `config/config.json`, or the rclone configuration.
+- never touches `data/`, `queue/`, `state/`, `locks/`, `logs/`, `tmp/`, `releases/`, `config/config.json`, or the rclone configuration.
 
-It is idempotent: identical files are not rewritten, and duplicate plugin, hook, or instruction entries are not created.
+Source selection is the same for Git and non-Git checkouts. Only regular files under the managed source directories are copied. The installer always excludes runtime `config/config.json`, even when that file exists in an archive source or is tracked by Git, along with credentials and authorization files, runtime data and state, queues, locks, logs, temporary files, generated reports and prompt archives, live-test configuration, backups, and test artifacts. Intended assets such as `config/config.example.json` are retained. Source symlinks are skipped and destination paths through symlink components are rejected.
+
+It is idempotent: identical files are not rewritten, and duplicate plugin, hook, or instruction entries are not created. Files removed between releases are deleted only when the ownership manifest lists them.
 
 For a non-standard location:
 
@@ -194,9 +199,10 @@ python3 /root/projects/agent-handoff/setup/upgrade.py --home /root/agent-handoff
 
 The upgrade:
 
-- snapshots the currently installed code under `$AGENT_HANDOFF_HOME/releases/`,
+- snapshots the currently installed code and its ownership manifest under `$AGENT_HANDOFF_HOME/releases/`,
 - runs the same idempotent installer,
-- automatically restores the snapshot if installation fails,
+- captures managed OpenCode and AGY files in memory before installation,
+- automatically restores the snapshot and integration files if installation fails,
 - never touches runtime reports, queue, state, logs, config, or rclone authorization.
 
 Rollback to the latest snapshot:
@@ -205,6 +211,10 @@ Rollback to the latest snapshot:
 python3 /root/projects/agent-handoff/setup/upgrade.py --home /root/agent-handoff --rollback latest
 # or: setup/rollback.sh
 ```
+
+Rollback restores the selected release and removes newer files only when the runtime ownership manifest identifies them as installed by Agent Handoff. Manifest paths are validated before any change; unknown or unmanaged files, runtime configuration, and runtime data are preserved. The restored installer from the selected release is then run, so newer source code is not reapplied. Managed OpenCode and AGY entries are reconciled from the selected release while unrelated settings and instructions remain intact.
+
+Snapshots created by this version include `manifest.json`. Older snapshots without ownership information are refused with a clear error instead of deleting unknown files or claiming an exact restore. Create a new snapshot by installing or upgrading once with this version before relying on rollback. The first snapshot taken from an installation that has no ownership manifest uses a filesystem inventory; later snapshots use the recorded manifest. If rollback installation fails, the pre-rollback code and integration state are restored when the pre-rollback snapshot is complete.
 
 List snapshots:
 
@@ -215,6 +225,7 @@ python3 /root/projects/agent-handoff/setup/upgrade.py --home /root/agent-handoff
 ## Security
 
 - Credentials, rclone configuration, tokens, `.env` files, and OAuth data are never committed.
+- The ownership manifest records managed relative paths only, never file contents.
 - Runtime reports, prompt archives, queue items, state, logs, locks, and generated indexes are ignored by Git.
 - The repository contains no live Google Drive folder IDs or user-specific project paths in defaults or tests.
 - Uploaded report copies redact obvious secrets; the local copy remains intact for audit.

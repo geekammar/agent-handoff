@@ -6,10 +6,22 @@ import filecmp
 import json
 import os
 import shutil
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+SETUP_DIR = Path(__file__).resolve().parent
+if str(SETUP_DIR) not in sys.path:
+    sys.path.insert(0, str(SETUP_DIR))
+
+from managed import (  # noqa: E402
+    MANIFEST_NAME,
+    ManifestError,
+    load_manifest,
+    safe_target,
+    source_files,
+    write_manifest,
+)
 
 SOURCE = Path(__file__).resolve().parents[1]
 DEFAULT_HOME = Path(os.environ.get("AGENT_HANDOFF_HOME", "/root/agent-handoff"))
@@ -23,7 +35,6 @@ AGY_HOOKS = AGY_CONFIG / "hooks.json"
 AGY_RULES = AGY_CONFIG / "AGENTS.md"
 MARKER = "<!-- AGENT HANDOFF REPORTING v1.0 -->"
 END_MARKER = "<!-- END AGENT HANDOFF REPORTING -->"
-MANAGED_TOP = {"bin", "lib", "integrations", "setup", "tests", "docs", "config", "README.md"}
 
 
 def log(message: str) -> None:
@@ -65,46 +76,15 @@ def atomic_copy(source: Path, target: Path) -> None:
     os.replace(tmp, target)
 
 
-def tracked_files(root: Path) -> list[Path] | None:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(root), "ls-files", "-z"],
-            capture_output=True,
-            text=False,
-            timeout=30,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    return [Path(item.decode("utf-8")) for item in result.stdout.split(b"\0") if item]
-
-
-def walk_files(root: Path) -> list[Path]:
-    files = []
-    ignored = {".git", "data", "queue", "state", "locks", "logs", "tmp", "releases", "__pycache__", ".pytest_cache"}
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(root)
-        if any(part in ignored for part in relative.parts):
-            continue
-        if path.suffix in {".pyc"}:
-            continue
-        files.append(relative)
-    return files
-
-
-def source_files(source: Path) -> list[Path]:
-    files = tracked_files(source) if source != HOME else None
-    if files is None:
-        files = walk_files(source)
-    return [
-        item
-        for item in files
-        if item.parts and item.parts[0] in MANAGED_TOP and (source / item).is_file()
-    ]
+def atomic_write_bytes(path: Path, data: bytes, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    with open(tmp, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
 
 
 def sync_code(source: Path, home: Path) -> None:
@@ -112,15 +92,41 @@ def sync_code(source: Path, home: Path) -> None:
         log("source is the installation home; code sync skipped")
         return
     home.mkdir(parents=True, exist_ok=True)
+    selected = source_files(source)
+    selected_paths = [item.as_posix() for item in selected]
+    manifest = home / MANIFEST_NAME
+    previous: set[str] = set()
+    try:
+        previous_manifest = load_manifest(manifest, required=False)
+    except ManifestError as exc:
+        log(f"warning: ignoring previous ownership manifest: {exc}")
+        previous_manifest = None
+    if previous_manifest:
+        previous = set(previous_manifest["files"])
+    write_manifest(manifest, sorted(previous | set(selected_paths)), {"updated_at": timestamp(), "state": "synchronizing"})
     copied = 0
-    for relative in source_files(source):
+    for relative in selected:
         src = source / relative
-        dst = home / relative
-        if dst.exists() and dst.is_file() and filecmp.cmp(src, dst, shallow=False):
+        dst = safe_target(home, relative)
+        if dst is None:
+            raise SystemExit(f"refusing to write unsafe managed path: {relative}")
+        if dst.exists() and dst.is_file() and not dst.is_symlink() and filecmp.cmp(src, dst, shallow=False):
             continue
         atomic_copy(src, dst)
         copied += 1
-    log(f"code synchronized: {copied} file(s) updated in {home}")
+    removed = 0
+    for relative in sorted(previous - set(selected_paths)):
+        dst = safe_target(home, relative)
+        if dst is None:
+            log(f"warning: not removing unsafe managed path: {relative}")
+            continue
+        if dst.is_symlink() or (dst.exists() and dst.is_file()):
+            dst.unlink()
+            removed += 1
+        elif dst.exists():
+            log(f"warning: not removing non-file managed path: {relative}")
+    write_manifest(manifest, selected_paths, {"updated_at": timestamp(), "state": "installed"})
+    log(f"code synchronized: {copied} file(s) updated, {removed} obsolete file(s) removed in {home}")
 
 
 def install_cli(home: Path, bin_link: Path) -> None:
@@ -230,6 +236,101 @@ def install_agy(home: Path, bin_link: Path) -> None:
         log(f"AGY instruction installed: {AGY_RULES}")
 
 
+def validate_external_json(path: Path, label: str) -> None:
+    if not path.exists():
+        return
+    if not path.is_file() or path.is_symlink():
+        raise SystemExit(f"refusing to modify {label}: not a regular file: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"refusing to modify invalid {label}: {exc}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"refusing to modify {label}: root is not an object")
+
+
+def preflight(home: Path, source: Path, no_code: bool, do_opencode: bool, do_agy: bool) -> None:
+    base = home if no_code else source
+    executable = base / "bin" / "agent-handoff"
+    if not executable.is_file() or executable.is_symlink():
+        raise SystemExit(f"missing executable: {home / 'bin' / 'agent-handoff'}")
+    if do_opencode:
+        plugin = base / "integrations" / "opencode" / "agent-handoff.js"
+        if not plugin.is_file() or plugin.is_symlink():
+            raise SystemExit(f"missing OpenCode plugin source: {home / 'integrations' / 'opencode' / 'agent-handoff.js'}")
+        validate_external_json(OPENCODE_CONFIG, "opencode.json")
+    if do_agy:
+        instructions = base / "integrations" / "AGENT-INSTRUCTIONS.md"
+        if not instructions.is_file() or instructions.is_symlink():
+            raise SystemExit(f"missing instruction source: {home / 'integrations' / 'AGENT-INSTRUCTIONS.md'}")
+        try:
+            block = instructions.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as exc:
+            raise SystemExit(f"cannot read instruction source: {exc}")
+        if not block.startswith(MARKER):
+            raise SystemExit(f"instruction block marker is missing: {instructions}")
+        validate_external_json(AGY_HOOKS, "AGY hooks.json")
+        if AGY_RULES.exists():
+            if not AGY_RULES.is_file() or AGY_RULES.is_symlink():
+                raise SystemExit(f"refusing to modify AGY instructions: not a regular file: {AGY_RULES}")
+            try:
+                AGY_RULES.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                raise SystemExit(f"cannot read AGY instructions: {exc}")
+
+
+def external_paths(do_opencode: bool, do_agy: bool) -> list[Path]:
+    paths: list[Path] = []
+    if do_opencode:
+        paths.extend([OPENCODE_PLUGIN, OPENCODE_CONFIG])
+    if do_agy:
+        paths.extend([AGY_HOOKS, AGY_RULES])
+    return paths
+
+
+def capture_external_state(paths: list[Path]) -> dict[Path, tuple[str, bytes | str | None, int | None]]:
+    state: dict[Path, tuple[str, bytes | str | None, int | None]] = {}
+    for path in paths:
+        try:
+            if path.is_symlink():
+                state[path] = ("symlink", os.readlink(path), None)
+            elif path.exists():
+                if not path.is_file():
+                    raise SystemExit(f"refusing to manage non-file integration path: {path}")
+                state[path] = ("file", path.read_bytes(), path.stat().st_mode & 0o7777)
+            else:
+                state[path] = ("missing", None, None)
+        except OSError as exc:
+            raise SystemExit(f"cannot inspect integration path {path}: {exc}")
+    return state
+
+
+def restore_external_state(state: dict[Path, tuple[str, bytes | str | None, int | None]]) -> None:
+    for path, (kind, payload, mode) in state.items():
+        try:
+            if kind == "missing":
+                if path.is_symlink() or (path.exists() and path.is_file()):
+                    path.unlink()
+                elif path.exists():
+                    log(f"recovery skipped non-file: {path}")
+            elif kind == "symlink":
+                if path.is_symlink() or (path.exists() and path.is_file()):
+                    path.unlink()
+                elif path.exists():
+                    log(f"recovery skipped non-file: {path}")
+                    continue
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.symlink_to(str(payload))
+            else:
+                if path.exists() and not path.is_file():
+                    log(f"recovery skipped non-file: {path}")
+                    continue
+                assert isinstance(payload, bytes) and mode is not None
+                atomic_write_bytes(path, payload, mode)
+        except OSError as exc:
+            log(f"recovery failed for {path}: {exc}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Install or upgrade Agent Handoff without touching runtime data.")
     parser.add_argument("--home", default=str(DEFAULT_HOME), help="runtime installation directory")
@@ -242,13 +343,21 @@ def main(argv: list[str] | None = None) -> int:
     bin_link = Path(args.bin_link).expanduser()
     log(f"source: {SOURCE}")
     log(f"home: {home}")
-    if not args.no_code:
-        sync_code(SOURCE, home)
-    install_cli(home, bin_link)
-    if not args.no_opencode:
-        install_opencode(home)
-    if not args.no_agy:
-        install_agy(home, bin_link)
+    do_opencode = not args.no_opencode
+    do_agy = not args.no_agy
+    preflight(home, SOURCE, args.no_code, do_opencode, do_agy)
+    external_state = capture_external_state(external_paths(do_opencode, do_agy))
+    try:
+        if not args.no_code:
+            sync_code(SOURCE, home)
+        install_cli(home, bin_link)
+        if do_opencode:
+            install_opencode(home)
+        if do_agy:
+            install_agy(home, bin_link)
+    except BaseException:
+        restore_external_state(external_state)
+        raise
     log("done")
     return 0
 

@@ -13,7 +13,7 @@ Source code and runtime data are separate:
 - Runtime state: `data/`, `queue/`, `state/`, `locks/`, `logs/`, `tmp/`, and `config/config.json`.
 - External credentials: the rclone configuration and OAuth token, normally under `~/.config/rclone/`.
 
-The installer copies only tracked source files into the runtime home. It never copies Git-ignored files or touches runtime state.
+The installer applies one source-selection policy to Git and non-Git checkouts. Only regular files under managed source directories are copied; runtime `config/config.json`, credentials, runtime state, generated reports, live-test configuration, backups, and test artifacts are excluded even if they are present in a Git index or an archive. Source symlinks are skipped and destination symlink components are rejected. `setup/managed.py` owns this policy and the installed-file manifest.
 
 ## Components
 
@@ -73,4 +73,8 @@ manual CLI ──────┘        │
 
 ## Upgrade model
 
-`setup/upgrade.py` snapshots the installed code to `$AGENT_HANDOFF_HOME/releases/<timestamp>-pre-upgrade/`, runs `setup/install.py`, and restores the snapshot automatically if installation fails. Rollback creates a pre-rollback snapshot, restores the selected release, and re-runs the installer. Runtime state and configuration are never part of the snapshot.
+`setup/upgrade.py` snapshots the installed code to `$AGENT_HANDOFF_HOME/releases/<timestamp>-pre-upgrade/`, runs `setup/install.py`, and restores the snapshot automatically if installation fails. Runtime state and configuration are never part of the snapshot.
+
+The installer records every managed file in `$AGENT_HANDOFF_HOME/.agent-handoff-manifest.json`. Snapshots include `manifest.json` with the files captured for that release. Rollback validates both manifests and every destination path, removes files that are owned by the current installation but absent from the selected release, restores the selected files, and writes the restored ownership manifest. Unknown or unmanaged files, runtime data, and runtime configuration are preserved. Snapshots created before ownership manifests are refused rather than overlaid into a mixed release.
+
+Managed OpenCode and AGY files are captured in memory before installation and restored if installation fails. Invalid external JSON is rejected during preflight, before any plugin, configuration, hook, or instruction file is changed. A successful rollback re-runs the restored release's installer to reconcile managed integration entries while preserving unrelated settings. Automatic failure recovery restores the pre-upgrade code and integration state; if rollback installation itself fails, the pre-rollback state is restored when that snapshot is complete.

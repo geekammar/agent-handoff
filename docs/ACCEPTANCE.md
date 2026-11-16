@@ -22,6 +22,7 @@ The repository CI runs unit, integration, regression, and installation tests wit
 - `tests/test_unit.py`: redaction, report sections, config resolution, AGY outcome and transcript parsing.
 - `tests/test_integration.py`: CLI compatibility, concurrent sessions, task/run attribution, upload retry, index generation, duplicate-upload suppression, secret redaction, AGY hook capture and deduplication, OpenCode plugin contract.
 - `tests/test_install.py`: idempotent installation, runtime preservation, upgrade snapshot, and rollback.
+- `tests/test_installer_safety.py`: Git and non-Git source selection, symlink containment, ownership manifests, coherent rollback, legacy snapshot refusal, external integration preservation, and failure recovery.
 
 Command:
 
