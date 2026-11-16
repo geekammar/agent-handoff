@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "drive": {
+    "remote": "gdrive",
+    "parent_folder_id": "",
+    "parent_folder_name": "AI Project Operations",
+    "root_folder_id": "",
+    "root_folder_name": "03 — Agent Execution Reports"
+  },
+  "projects": {},
+  "workspace_roots": [
+    "/root/projects"
+  ],
+  "auto_register_projects": true,
+  "upload": {
+    "enabled": true,
+    "auto_upload": true,
+    "verify": true,
+    "timeout_seconds": 120,
+    "hook_timeout_seconds": 25,
+    "max_attempts": 0,
+    "verify_interval_minutes": 60
+  },
+  "integrations": {
+    "opencode": true,
+    "agy": true
+  },
+  "security": {
+    "redact_uploads": true,
+    "max_prompt_bytes": 200000,
+    "max_summary_bytes": 50000
+  },
+  "index": {
+    "include_pending_local": true,
+    "max_open_issues": 20
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "agent-handoff-report": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "/usr/local/bin/agent-handoff hook agy",
+        "timeout": 25
+      }
+    ]
+  }
+}

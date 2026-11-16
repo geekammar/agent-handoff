@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-handoff"
+version = "1.0.0"
+description = "Structured, upload-verified execution reports for OpenCode and AGY"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Agent Handoff maintainers" }]
+dependencies = []
+
+[project.scripts]
+agent-handoff = "agent_handoff.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "lib" }
+
+[tool.setuptools.packages.find]
+where = ["lib"]
+include = ["agent_handoff*"]

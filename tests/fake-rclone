@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+import hashlib
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+
+ROOT = Path(os.environ.get("FAKE_DRIVE_ROOT", "/tmp/fake-drive")).resolve()
+ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def fail(message: str, code: int = 1) -> int:
+    print(message, file=sys.stderr)
+    return code
+
+
+def parse_remote(spec: str) -> tuple[str | None, str]:
+    if spec.startswith("gdrive,root_folder_id="):
+        rest = spec.split("root_folder_id=", 1)[1]
+        folder_id, _, path = rest.partition(":")
+        return folder_id, path
+    if spec.startswith("gdrive:"):
+        return None, spec[len("gdrive:") :]
+    return None, ""
+
+
+def folder_path(folder_id: str) -> Path:
+    return ROOT / folder_id
+
+
+def children_path(folder_id: str) -> Path:
+    return folder_path(folder_id) / ".children.json"
+
+
+def load_children(folder_id: str) -> dict[str, str]:
+    path = children_path(folder_id)
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:
+            return {}
+    return {}
+
+
+def save_children(folder_id: str, data: dict[str, str]) -> None:
+    folder_path(folder_id).mkdir(parents=True, exist_ok=True)
+    children_path(folder_id).write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def fake_id(name: str) -> str:
+    return "fake" + hashlib.sha1(name.encode("utf-8")).hexdigest()[:20]
+
+
+def maybe_fail_once() -> None:
+    marker = os.environ.get("FAKE_FAIL_ONCE_FILE")
+    if marker and Path(marker).exists():
+        Path(marker).unlink()
+        raise RuntimeError("simulated temporary Google Drive outage")
+
+
+def command_listremotes(argv: list[str]) -> int:
+    print("gdrive:")
+    return 0
+
+
+def command_lsd(argv: list[str]) -> int:
+    return 0
+
+
+def command_lsf(argv: list[str]) -> int:
+    folder_id, path = parse_remote(argv[1])
+    if folder_id is None:
+        return 0
+    base = folder_path(folder_id) / path
+    if not base.exists():
+        return fail(f"directory not found: {base}")
+    children = load_children(folder_id)
+    if not children:
+        for child in sorted(base.iterdir()):
+            if child.is_dir() and not child.name.startswith("."):
+                children[child.name] = fake_id(child.name)
+    for name, item_id in children.items():
+        print(f"{name};{item_id}")
+    return 0
+
+
+def command_mkdir(argv: list[str]) -> int:
+    folder_id, path = parse_remote(argv[1])
+    if folder_id is None:
+        return 0
+    base = folder_path(folder_id)
+    target = base / path
+    target.mkdir(parents=True, exist_ok=True)
+    first = path.split("/", 1)[0]
+    if first and "/" not in path:
+        children = load_children(folder_id)
+        if first not in children:
+            new_id = fake_id(first)
+            children[first] = new_id
+            save_children(folder_id, children)
+            folder_path(new_id).mkdir(parents=True, exist_ok=True)
+        target = folder_path(children[first])
+    return 0
+
+
+def command_copyto(argv: list[str]) -> int:
+    try:
+        maybe_fail_once()
+    except RuntimeError as exc:
+        return fail(str(exc))
+    if len(argv) < 3:
+        return fail("copyto requires source and destination")
+    source = argv[1]
+    destination = argv[2]
+    source_is_remote = source.startswith("gdrive") and (":" in source)
+    dest_is_remote = destination.startswith("gdrive") and (":" in destination)
+    if source_is_remote and not dest_is_remote:
+        folder_id, path = parse_remote(source)
+        if folder_id is None:
+            return fail("read back from root is not supported")
+        src = folder_path(folder_id) / path
+        dst = Path(destination)
+        if not src.exists():
+            return fail(f"source not found: {src}")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+        return 0
+    if dest_is_remote:
+        folder_id, path = parse_remote(destination)
+        if folder_id is None:
+            return fail("write to root is not supported")
+        src = Path(source)
+        dst = folder_path(folder_id) / path
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            shutil.copyfile(src, dst)
+        return 0
+    return fail("one side of copyto must be remote")
+
+
+def command_md5sum(argv: list[str]) -> int:
+    folder_id, path = parse_remote(argv[1])
+    if folder_id is None:
+        return fail("md5sum on root is not supported")
+    target = folder_path(folder_id) / path
+    if not target.is_file():
+        return fail(f"file not found: {target}")
+    digest = hashlib.md5(target.read_bytes()).hexdigest()
+    print(f"{digest}  {path}")
+    return 0
+
+
+def command_lsjson(argv: list[str]) -> int:
+    target_spec = None
+    for item in argv[1:]:
+        if not item.startswith("-"):
+            target_spec = item
+            break
+    if not target_spec:
+        return fail("lsjson requires a path")
+    folder_id, path = parse_remote(target_spec)
+    if folder_id is None:
+        return fail("lsjson on root is not supported")
+    target = folder_path(folder_id) / path
+    if not target.exists():
+        return fail(f"file not found: {target}")
+    if "--stat" in argv:
+        item = {
+            "Path": path,
+            "Name": target.name,
+            "Size": target.stat().st_size if target.is_file() else 0,
+            "IsDir": target.is_dir(),
+        }
+        print(json.dumps(item))
+        return 0
+    items = []
+    for child in sorted(target.iterdir()):
+        items.append({"Path": child.name, "Name": child.name, "Size": child.stat().st_size if child.is_file() else 0, "IsDir": child.is_dir()})
+    print(json.dumps(items))
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        return fail("no command")
+    command = sys.argv[1]
+    rest = sys.argv[1:]
+    if command == "listremotes":
+        return command_listremotes(rest)
+    if command == "lsd":
+        return command_lsd(rest)
+    if command == "lsf":
+        return command_lsf(rest)
+    if command == "mkdir":
+        return command_mkdir(rest)
+    if command == "copyto":
+        return command_copyto(rest)
+    if command == "md5sum":
+        return command_md5sum(rest)
+    if command == "lsjson":
+        return command_lsjson(rest)
+    if command == "version":
+        print("fake-rclone v1")
+        return 0
+    if command == "about":
+        return 0
+    return fail(f"unsupported fake rclone command: {command}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,47 @@
+# Runtime configuration and state
+/config/config.json
+/data/
+/queue/
+/state/
+/locks/
+/logs/
+/tmp/
+/releases/
+
+# Generated reports, indexes, test artifacts
+/tests/acceptance-results.json
+/tests/live-config.json
+/tests/__pycache__/
+/__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Credentials and private data
+.env
+.env.*
+!.env.example
+rclone.conf
+**/rclone.conf
+*gdrive*token*
+*credentials*.json
+*.pem
+*.key
+**/*.backup-agent-handoff-*
+backup-agent-handoff-*
+
+# Local task reports and prompt archives if placed at the repository root
+/TASKS/
+PROJECT-STATUS.md
+/AUTO.json
+/COMPLETE.json
+/META.json
+/PROMPT.md
+/REPORT.md
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
