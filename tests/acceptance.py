@@ -281,7 +281,7 @@ def main() -> int:
     real_config = Path("/root/.config/rclone/rclone.conf")
     real_rclone_before = (real_config.exists(), real_config.stat().st_mtime if real_config.exists() else None)
 
-    doctor = jrun(["doctor", "--json"])
+    doctor = json.loads(run(["doctor", "--json"], check=False).stdout)
     record("doctor with simulated Drive", doctor.get("upload", {}).get("remote_ready") is True and doctor.get("upload", {}).get("connection", {}).get("connected") is True, "doctor recognized the simulated rclone remote and hierarchy", doctor.get("upload", {}).get("hierarchy", {}).get("ok"))
     hierarchy_projects = doctor.get("upload", {}).get("hierarchy", {}).get("projects", {})
     verified = all(item.get("verified") for item in hierarchy_projects.values() if item.get("configured"))
@@ -343,7 +343,7 @@ def main() -> int:
     (auto_home / "config").mkdir(parents=True, exist_ok=True)
     (auto_home / "config" / "config.json").write_text(json.dumps(auto_config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     os.chmod(auto_home / "config" / "config.json", 0o600)
-    run(["doctor", "--json"], extra_env=auto_extra)
+    run(["doctor", "--json"], extra_env=auto_extra, check=False)
     auto_prompt = auto_home / "prompt.txt"
     auto_prompt.write_text("AUTO-UPLOAD-PROMPT\n", encoding="utf-8")
     auto_task = jrun(["init", "--project", PROJECT_NAME, "--agent", "opencode", "--title", "Auto background upload", "--prompt-file", str(auto_prompt), "--json"], extra_env=auto_extra)
@@ -394,8 +394,8 @@ def main() -> int:
     before_count = len(list((TEST / "data" / "projects" / PROJECT_NAME / "TASKS").iterdir()))
     prompt_hash_before = __import__("hashlib").sha256((read_task_dir(a["task"]["task_id"]) / "PROMPT.md").read_bytes()).hexdigest()
     run(["init", "--project", PROJECT_NAME, "--agent", "opencode", "--title", "Acceptance A", "--prompt-file", str(TEST / "prompt-acceptance-a.txt"), "--task-id", a["task"]["task_id"], "--json"])
-    run(["doctor", "--json"])
-    run(["doctor", "--json"])
+    run(["doctor", "--json"], check=False)
+    run(["doctor", "--json"], check=False)
     prompt_hash_after = __import__("hashlib").sha256((read_task_dir(a["task"]["task_id"]) / "PROMPT.md").read_bytes()).hexdigest()
     after_count = len(list((TEST / "data" / "projects" / PROJECT_NAME / "TASKS").iterdir()))
     record("E repeatability", before_count == after_count and prompt_hash_before == prompt_hash_after, "re-running init and doctor did not duplicate or alter existing data", {"tasks": before_count})
