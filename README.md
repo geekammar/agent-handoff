@@ -56,7 +56,7 @@ The verified v1.0 environment used Python 3.14.4, rclone 1.60.1-DEV, git 2.53.0,
 Clone the private repository, then run the installer. The default runtime home is `/root/agent-handoff`; the source checkout and runtime home are separate so runtime reports, queues, state, and credentials are never part of the repository.
 
 ```bash
-git clone git@github.com:geekammar/agent-handoff.git /root/projects/agent-handoff
+git clone git@github.com:geekammar/agent-handoff-private.git /root/projects/agent-handoff
 python3 /root/projects/agent-handoff/setup/install.py --home /root/agent-handoff
 ```
 
