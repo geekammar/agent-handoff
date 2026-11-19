@@ -351,6 +351,50 @@ class Uploader:
                 except OSError:
                     pass
 
+    def read_remote_text(self, remote_rel: str, project: dict[str, Any], timeout: float = 120.0, limit: int = 200000) -> dict[str, Any]:
+        remote = self.remote_spec(project["drive_folder_id"], remote_rel)
+        fd, tmp_name = tempfile.mkstemp(prefix="remote-read-", dir=str(self.store.tmp_root))
+        os.close(fd)
+        tmp = Path(tmp_name)
+        try:
+            result = self._run(["copyto", remote, str(tmp)], timeout=timeout)
+            if result.returncode == 124:
+                result = self._run(["copyto", remote, str(tmp)], timeout=timeout)
+            if result.returncode != 0:
+                return {"ok": False, "error": sanitize_error(result.stderr or result.stdout or "remote read failed")}
+            text = read_text_limited(tmp, limit)
+            return {"ok": True, "text": text, "size": tmp.stat().st_size, "truncated": tmp.stat().st_size > len(text.encode("utf-8", errors="replace"))}
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    def remote_file_id(self, remote_rel: str, project: dict[str, Any], timeout: float = 120.0) -> dict[str, Any]:
+        remote = self.remote_spec(project["drive_folder_id"], remote_rel)
+        result = self._run(["lsjson", "--stat", remote], timeout=timeout)
+        if result.returncode == 124:
+            result = self._run(["lsjson", "--stat", remote], timeout=timeout)
+        if result.returncode != 0:
+            return {"ok": False, "error": sanitize_error(result.stderr or result.stdout or "remote file not found")}
+        try:
+            item = json.loads(result.stdout or "{}")
+        except ValueError as exc:
+            return {"ok": False, "error": f"rclone returned invalid JSON: {exc}"}
+        if not isinstance(item, dict):
+            return {"ok": False, "error": "rclone returned an unexpected remote file record"}
+        file_id = str(item.get("ID") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{10,}", file_id):
+            return {"ok": False, "error": "rclone did not return a Google Drive file id; cannot publish a direct verified link"}
+        return {
+            "ok": True,
+            "id": file_id,
+            "url": f"https://drive.google.com/file/d/{file_id}/view",
+            "size": item.get("Size"),
+            "mime_type": item.get("MimeType"),
+            "mod_time": item.get("ModTime"),
+        }
+
     def _log(self, message: str) -> None:
         path = self.store.logs_root / "upload.log"
         try:
@@ -412,7 +456,15 @@ class Uploader:
                 if not current.get("verified") or (current.get("verified_at") or "") < latest_verified:
                     self.store.queue_index(project)
 
-    def process_queue(self, force: bool = False, only_project: str | None = None, only_task: str | None = None, only_run: str | None = None, time_budget: float = 300.0) -> dict[str, Any]:
+    def process_queue(
+        self,
+        force: bool = False,
+        only_project: str | None = None,
+        only_task: str | None = None,
+        only_run: str | None = None,
+        time_budget: float = 300.0,
+        reconcile: bool = True,
+    ) -> dict[str, Any]:
         lock = self.store.worker_lock()
         if not lock.acquire():
             return {"ok": True, "busy": True, "processed": 0, "failed": 0, "pending": len(self.store.queue_items())}
@@ -420,7 +472,8 @@ class Uploader:
         summary = {"ok": True, "busy": False, "processed": 0, "failed": 0, "skipped": 0, "pending": 0, "errors": []}
         try:
             self.config = load_config()
-            self.reconcile_queue()
+            if reconcile:
+                self.reconcile_queue()
             ready, reason = self.remote_ready()
             attempted: set[str] = set()
             while True:

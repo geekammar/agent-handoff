@@ -6,6 +6,7 @@ import os
 import shutil
 import stat
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,11 @@ from .config import (
     resolve_project,
 )
 from .adapters import agy_hook, auto_complete, git_info, integration_log, normalize_outcome, normalize_status, spawn_upload
+from .dispatch.config import DispatchConfigError, validate_core_config, validate_dispatch_config
+from .dispatch.delivery import diagnose_historical_run, delivery_marker, reconcile_verified_delivery
+from .dispatch.github import GithubError, GithubTransport
+from .dispatch.ledger import Ledger, safe_record_summary
+from .dispatch.runner import DispatchRunner
 from .report import manual_report
 from .store import Store
 from .upload import Uploader
@@ -88,6 +94,7 @@ def collect_doctor(config: dict[str, Any], strict: bool = False) -> dict[str, An
         "rclone": command_version("rclone", ["version"]),
         "opencode": command_version("opencode"),
         "agy": command_version("agy"),
+        "gh": command_version("gh"),
         "agent_handoff": __version__,
     }
     py_ok = sys.version_info >= (3, 8)
@@ -151,7 +158,7 @@ def collect_doctor(config: dict[str, Any], strict: bool = False) -> dict[str, An
         paths = [p for p in project.get("paths", []) if os.path.isdir(p)]
         detail = f"folder_id={'yes' if folder_id else 'missing'}, paths={len(paths)}"
         status = "PASS" if folder_id else "WARN"
-        if project["key"] in ("rabet", "yakfi") and not paths:
+        if not paths:
             status = "WARN"
         _check(checks, f"project:{project['name']}", status, detail)
 
@@ -212,6 +219,20 @@ def collect_doctor(config: dict[str, Any], strict: bool = False) -> dict[str, An
         else:
             _check(checks, "drive hierarchy", "FAIL", hierarchy.get("error") or "verification failed")
 
+    dispatch_raw = config.get("dispatch") or {}
+    if not dispatch_raw.get("enabled"):
+        _check(checks, "dispatcher", "PASS", "disabled (optional)")
+    else:
+        try:
+            resolved, dispatch_errors, dispatch_warnings = validate_dispatch_config(config, require_enabled=True)
+            detail = f"{resolved.get('repository')} · {len(resolved.get('projects') or {})} project(s)"
+            _check(checks, "dispatcher", "PASS" if not dispatch_errors else "FAIL", detail if not dispatch_errors else "; ".join(dispatch_errors))
+            for warning in dispatch_warnings:
+                _check(checks, "dispatcher warning", "WARN", warning)
+        except DispatchConfigError as exc:
+            _check(checks, "dispatcher", "FAIL", sanitize_error(str(exc)))
+    _check(checks, "GitHub CLI", "PASS" if versions.get("gh") else "WARN", versions.get("gh") or "gh not found (required only for dispatch)")
+
     nonzero = [c for c in checks if c["status"] == "FAIL"]
     warnings = [c for c in checks if c["status"] == "WARN"]
     exit_code = 1 if nonzero else (1 if strict and warnings else 0)
@@ -232,6 +253,7 @@ def collect_doctor(config: dict[str, Any], strict: bool = False) -> dict[str, An
             "logs": str(store.logs_root),
             "opencode_plugin": str(OPENCODE_PLUGIN),
             "agy_hooks": str(AGY_HOOKS),
+            "dispatch_state": str(store.state_root / "dispatch"),
         },
         "exit_code": exit_code,
     }
@@ -266,7 +288,7 @@ def _resolve_project_or_error(config: dict[str, Any], name: str | None, cwd: str
     project = resolve_project(config, name, cwd, register=register)
     if not project:
         raise ValueError(
-            "project not found. Pass --project, or run from a git project under /root/projects. "
+            "project not found. Pass --project, or run from a configured workspace root. "
             "For a new project run: agent-handoff project add --name \"Name\""
         )
     return project
@@ -862,8 +884,8 @@ def cmd_auth(args: argparse.Namespace) -> int:
             print('     rclone authorize "drive"')
             print("2. Sign in with the Google account that owns the AI Project Operations folder.")
             print("3. Copy the token JSON that rclone prints. Do not paste it into an AI chat.")
-            print("4. Save it on this VPS as /root/gdrive-token.json (mode 600), then run:")
-            print("     agent-handoff auth --import-token-file /root/gdrive-token.json")
+            print("4. Save it on this host as ~/gdrive-token.json (mode 600), then run:")
+            print("     agent-handoff auth --import-token-file ~/gdrive-token.json")
             print("   Alternatively run the official interactive flow: rclone config")
             print("5. Verify with:")
             print("     agent-handoff auth --check && agent-handoff doctor")
@@ -907,6 +929,309 @@ def cmd_hook(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_config_validate(args: argparse.Namespace) -> int:
+    config = load_config()
+    core_errors, core_warnings = validate_core_config(config)
+    try:
+        resolved, dispatch_errors, dispatch_warnings = validate_dispatch_config(config)
+    except DispatchConfigError as exc:
+        resolved = {}
+        dispatch_errors = [str(exc)]
+        dispatch_warnings = []
+    errors = core_errors + dispatch_errors
+    warnings = core_warnings + dispatch_warnings
+    data = {
+        "ok": not errors and not (args.strict and warnings),
+        "errors": errors,
+        "warnings": warnings,
+        "config": str(CONFIG_PATH),
+        "dispatch": {
+            "enabled": bool(resolved.get("enabled")),
+            "repository": resolved.get("repository") or None,
+            "projects": sorted((resolved.get("projects") or {}).keys()),
+            "models": sorted((resolved.get("models") or {}).keys()),
+            "transport": resolved.get("transport"),
+        },
+    }
+    if args.json:
+        emit(data)
+    else:
+        print(f"Config: {data['config']}")
+        print(f"Dispatcher: {'enabled' if data['dispatch']['enabled'] else 'disabled'}")
+        if data["dispatch"]["repository"]:
+            print(f"Repository: {data['dispatch']['repository']}")
+        for warning in warnings:
+            print(f"[WARN] {warning}")
+        for error in errors:
+            print(f"[FAIL] {error}")
+        if not errors and not warnings:
+            print("OK: configuration is valid.")
+        elif not errors:
+            print(f"OK with {len(warnings)} warning(s).")
+        else:
+            print(f"FAIL: {len(errors)} error(s), {len(warnings)} warning(s).")
+    return 0 if data["ok"] else 1
+
+
+def _emit_dispatch_result(result: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        emit(result)
+        return
+    if result.get("busy"):
+        print("Another dispatcher process is already running.")
+        return
+    print(
+        "Dispatch poll: "
+        f"executed={result.get('executed', 0)} uploaded={result.get('uploaded', 0)} "
+        f"published={result.get('published', 0)} rejected={result.get('rejected', 0)} "
+        f"needs_attention={result.get('needs_attention', 0)}"
+    )
+    for warning in result.get("warnings") or []:
+        print(f"[WARN] {warning}")
+    for error in result.get("errors") or []:
+        print(f"[ERROR] {error}", file=sys.stderr)
+
+
+def cmd_dispatch_run(args: argparse.Namespace) -> int:
+    config = load_config()
+    try:
+        resolved, errors, _warnings = validate_dispatch_config(config, require_enabled=True)
+    except DispatchConfigError as exc:
+        raise ValueError(str(exc))
+    if errors:
+        raise ValueError("dispatcher configuration is invalid: " + "; ".join(errors))
+    runner = DispatchRunner(config, resolved)
+    if not args.watch:
+        result = runner.run_once(force=args.force)
+        _emit_dispatch_result(result, args.json)
+        return 0 if result.get("ok") else 1
+    try:
+        while True:
+            result = runner.run_once(force=args.force)
+            _emit_dispatch_result(result, args.json)
+            sys.stdout.flush()
+            if not result.get("ok") and args.stop_on_error:
+                return 1
+            time.sleep(max(5, int(resolved.get("poll_interval_seconds", 30))))
+    except KeyboardInterrupt:
+        print("dispatcher stopped", file=sys.stderr)
+        return 130
+
+
+def cmd_dispatch_status(args: argparse.Namespace) -> int:
+    config = load_config()
+    ledger = Ledger(config)
+    records = ledger.all()
+    if args.issue is not None:
+        records = [record for record in records if int(record.get("issue_number", -1)) == int(args.issue)]
+    summaries = [safe_record_summary(record) for record in records]
+    if args.json:
+        emit({"ok": True, "count": len(summaries), "records": summaries})
+        return 0
+    if not summaries:
+        print("No dispatch records.")
+        return 0
+    print(f"{'Issue':7} {'Status':18} {'Task':30} {'Run':30} {'Upload':10} {'Publication':12} Project")
+    for item in summaries:
+        print(
+            f"{str(item.get('issue_number')):7} {str(item.get('status'))[:18]:18} "
+            f"{str((item.get('capture') or {}).get('task_id'))[:30]:30} "
+            f"{str((item.get('capture') or {}).get('run_id'))[:30]:30} "
+            f"{str((item.get('upload') or {}).get('status'))[:10]:10} "
+            f"{str((item.get('publication') or {}).get('status'))[:12]:12} "
+            f"{item.get('project') or '-'}"
+        )
+    return 0
+
+
+def _find_run_project(config: dict[str, Any], store: Store, task_id: str, project_name: str | None) -> dict[str, Any]:
+    if project_name:
+        project = project_by_name(config, project_name)
+        if not project:
+            raise ValueError(f"project not found: {project_name}")
+        return project
+    project, _task_path, _meta = store.find_task(task_id)
+    return project
+
+
+def cmd_dispatch_inspect(args: argparse.Namespace) -> int:
+    config = load_config()
+    store = Store(config)
+    project = _find_run_project(config, store, args.task, args.project)
+    data = diagnose_historical_run(config, project, args.task, args.run)
+    if args.json:
+        emit(data)
+    else:
+        print(f"Run: {args.task} / {args.run}")
+        print(f"Local upload verified: {data.get('local_upload_verified')} at {data.get('local_verified_at')}")
+        print(f"Local report URL: {data.get('local_report_url') or 'not recorded'}")
+        remote = data.get("remote_report") or {}
+        print(f"Remote report: {remote.get('url') or remote.get('error')}")
+        complete = data.get("remote_complete") or {}
+        if complete.get("ok"):
+            try:
+                remote_json = json.loads(complete.get("text") or "{}")
+                upload = remote_json.get("upload") or {}
+                print(f"Remote COMPLETE.json upload: verified={upload.get('verified')} status={upload.get('status')}")
+            except ValueError:
+                print("Remote COMPLETE.json is not valid JSON")
+        else:
+            print(f"Remote COMPLETE.json: {complete.get('error')}")
+    return 0 if data.get("ok") else 1
+
+
+def cmd_dispatch_deliver(args: argparse.Namespace) -> int:
+    config = load_config()
+    store = Store(config)
+    project = _find_run_project(config, store, args.task, args.project)
+    uploader = Uploader(config, store)
+    ledger = Ledger(config)
+    record = ledger.find_by_run(args.task, args.run)
+    repository = (args.repository or (record or {}).get("repository") or "").strip()
+    issue_number = args.issue if args.issue is not None else (record or {}).get("issue_number")
+    if not repository or issue_number is None:
+        raise ValueError("--repository and --issue are required when no dispatch record links this run to an issue")
+    issue_number = int(issue_number)
+    dispatch_cfg = config.get("dispatch") or {}
+    transport = GithubTransport(
+        {
+            "repository": repository,
+            "allowed_users": dispatch_cfg.get("allowed_users") or [],
+            "github": {"command": ((dispatch_cfg.get("github") or {}).get("command") or "gh"), "require_private": True},
+        }
+    )
+    inbox = transport.verify_repository()
+    issue = transport.get_issue(issue_number)
+    author = str(((issue.get("user") or {}).get("login")) or "").lower()
+    allowed = {item.strip().lower() for item in (dispatch_cfg.get("allowed_users") or [])}
+    allowed.add(str(inbox.get("user") or "").lower())
+    if author not in allowed:
+        raise ValueError("the issue author is not the authenticated user and is not in dispatch.allowed_users")
+    result = reconcile_verified_delivery(
+        config,
+        store,
+        uploader,
+        project,
+        args.task,
+        args.run,
+        force=True,
+    )
+    if not result.get("ok"):
+        raise ValueError(result.get("error") or "verified upload reconciliation failed")
+    _found_project, _task_path, _meta, _run_path, complete = store.run_record(project, args.task, args.run)
+    agent = complete.get("agent") or {}
+    project_data = {
+        "name": project.get("name"),
+        "core_key": project.get("key"),
+        "core_name": project.get("name"),
+        "workspace": (project.get("paths") or [None])[0],
+        "drive_folder_id": project.get("drive_folder_id"),
+    }
+    from .dispatch.ledger import new_dispatch_record
+
+    now = utcnow_iso()
+    record = ledger.get(repository, issue_number)
+    if record:
+        capture = record.get("capture") or {}
+        if capture.get("run_id") and capture.get("run_id") != args.run:
+            raise ValueError(f"issue #{issue_number} is already linked to run {capture.get('run_id')}")
+    else:
+        record = new_dispatch_record(
+            repository=repository,
+            issue=issue,
+            project=project_data,
+            agent=str(agent.get("name") or "opencode"),
+            model=str(agent.get("model") or "unknown"),
+            request={
+                "version": "reconcile",
+                "project": project.get("name"),
+                "agent": str(agent.get("name") or "opencode"),
+                "model_alias": None,
+                "model": agent.get("model"),
+                "session": "new",
+                "body_sha256": (complete.get("dispatch") or {}).get("body_sha256"),
+                "instructions": "",
+            },
+        )
+        record["status"] = "UPLOAD_VERIFIED"
+        record["history"].append({"at": now, "status": "UPLOAD_VERIFIED", "note": "operator reconciliation of an existing run"})
+        record, _created = ledger.create(record)
+    def apply_reconcile(item: dict[str, Any]) -> None:
+        item["capture"] = {
+            **(item.get("capture") or {}),
+            "status": "CAPTURED",
+            "task_id": args.task,
+            "run_id": args.run,
+            "report_path": str(store.find_task(args.task)[1] / "RUNS" / args.run / "REPORT.md"),
+            "captured_at": now,
+            "last_error": None,
+        }
+        item["upload"] = {
+            **(item.get("upload") or {}),
+            "status": "VERIFIED",
+            "verified": True,
+            "verified_at": result.get("verified_at") or complete.get("upload", {}).get("verified_at"),
+            "report_remote_path": result.get("report_remote_path"),
+            "report_url": result.get("report_url"),
+            "receipt_remote_path": result.get("receipt_remote_path"),
+            "receipt_url": result.get("receipt_url"),
+            "last_error": None,
+        }
+        item["execution"] = {
+            **(item.get("execution") or {}),
+            "status": "COMPLETED",
+            "outcome": complete.get("outcome"),
+            "finished_at": complete.get("completed_at"),
+            "last_error": None,
+        }
+        item["session"] = {**(item.get("session") or {}), "mode": "new", "id": agent.get("session_id")}
+        item["model"] = agent.get("model")
+        item["status"] = "UPLOAD_VERIFIED"
+    record = ledger.update(repository, issue_number, apply_reconcile, note="verified upload metadata reconciled")
+    marker = delivery_marker(args.run)
+    existing_comment = transport.find_comment(issue_number, marker)
+    comment_url = (existing_comment or {}).get("html_url")
+    if not existing_comment:
+        from .dispatch.delivery import build_issue_comment
+
+        response = transport.comment(issue_number, build_issue_comment(record))
+        comment_url = response.get("url")
+    published_at = (existing_comment or {}).get("created_at") or utcnow_iso()
+    ledger.set_status(
+        repository,
+        issue_number,
+        "ISSUE_UPDATED",
+        note="operator published verified delivery",
+        updates={
+            "publication": {
+                "status": "PUBLISHED",
+                "published_at": published_at,
+                "comment_url": comment_url,
+                "last_error": None,
+            }
+        },
+    )
+    data = {
+        "ok": True,
+        "reused_comment": bool(existing_comment),
+        "task_id": args.task,
+        "run_id": args.run,
+        "issue_url": issue.get("html_url"),
+        "comment_url": comment_url,
+        "report_url": result.get("report_url"),
+        "receipt_url": result.get("receipt_url"),
+        "opencode_executed": False,
+    }
+    if args.json:
+        emit(data)
+    else:
+        print(f"Verified report: {data['report_url']}")
+        print(f"Upload receipt: {data['receipt_url']}")
+        print(f"Issue: {data['issue_url']}")
+        print(f"Publication: {'reused existing comment' if data['reused_comment'] else 'posted once'}")
+    return 0
+
+
 def cmd_version(args: argparse.Namespace) -> int:
     print(__version__)
     return 0
@@ -920,12 +1245,14 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  agent-handoff doctor\n"
-            "  agent-handoff init --project Rabet --agent opencode --title \"Fix login\" --prompt-file prompt.txt\n"
+            "  agent-handoff config validate\n"
+            "  agent-handoff init --project ProjectA --agent opencode --title \"Fix login\" --prompt-file prompt.txt\n"
             "  agent-handoff prepare-run --task-id t-20261116T130000Z-abcd1234\n"
             "  agent-handoff complete --task-id t-... --run-id r-... --report-file REPORT.md --outcome succeeded --tests passed\n"
-            "  agent-handoff list --project Rabet\n"
+            "  agent-handoff list --project ProjectA\n"
             "  agent-handoff retry-upload\n"
-            "  agent-handoff project add --name Yakfi --path /root/projects/yakfi\n"
+            "  agent-handoff project add --name ProjectA --path ~/projects/project-a\n"
+            "  agent-handoff dispatch run --once\n"
         ),
     )
     parser.add_argument("--debug", action="store_true", help="print tracebacks on errors")
@@ -1037,6 +1364,41 @@ def build_parser() -> argparse.ArgumentParser:
     p = hook_sub.add_parser("agy", help=argparse.SUPPRESS)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_hook)
+
+    config_parser = sub.add_parser("config", help="inspect and validate runtime configuration")
+    config_sub = config_parser.add_subparsers(dest="config_command", required=True)
+    p = config_sub.add_parser("validate", help="validate core and optional dispatcher configuration")
+    p.add_argument("--strict", action="store_true", help="treat warnings as a non-zero exit")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_config_validate)
+
+    dispatch_parser = sub.add_parser("dispatch", help="optional private GitHub Issues dispatcher")
+    dispatch_sub = dispatch_parser.add_subparsers(dest="dispatch_command", required=True)
+    p = dispatch_sub.add_parser("run", help="claim and execute dispatched issues once or watch for new ones")
+    p.add_argument("--once", action="store_true", help="process one poll and exit (default)")
+    p.add_argument("--watch", action="store_true", help="poll continuously")
+    p.add_argument("--force", action="store_true", help="ignore upload/publication backoff")
+    p.add_argument("--stop-on-error", action="store_true", help="stop watch mode after a fatal poll")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_dispatch_run)
+    p = dispatch_sub.add_parser("status", help="show durable dispatch records without running agents")
+    p.add_argument("--issue", type=int)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_dispatch_status)
+    p = dispatch_sub.add_parser("inspect", help="read local and remote metadata for one run without changing anything")
+    p.add_argument("--task", required=True)
+    p.add_argument("--run", required=True)
+    p.add_argument("--project")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_dispatch_inspect)
+    p = dispatch_sub.add_parser("deliver", help="reconcile an existing verified run and publish its direct link; never runs an agent")
+    p.add_argument("--task", required=True)
+    p.add_argument("--run", required=True)
+    p.add_argument("--project")
+    p.add_argument("--issue", type=int)
+    p.add_argument("--repository", help="owner/name (inferred from an existing dispatch record when omitted)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_dispatch_deliver)
 
     return parser
 

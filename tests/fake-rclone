@@ -52,6 +52,10 @@ def fake_id(name: str) -> str:
     return "fake" + hashlib.sha1(name.encode("utf-8")).hexdigest()[:20]
 
 
+def fake_file_id(path: str) -> str:
+    return "fakefile" + hashlib.sha1(path.encode("utf-8")).hexdigest()[:20]
+
+
 def maybe_fail_once() -> None:
     marker = os.environ.get("FAKE_FAIL_ONCE_FILE")
     if marker and Path(marker).exists():
@@ -174,11 +178,17 @@ def command_lsjson(argv: list[str]) -> int:
             "Size": target.stat().st_size if target.is_file() else 0,
             "IsDir": target.is_dir(),
         }
+        if target.is_file():
+            item["ID"] = fake_file_id(str(target.resolve()))
+        else:
+            item["ID"] = fake_id(str(target.name))
         print(json.dumps(item))
         return 0
     items = []
     for child in sorted(target.iterdir()):
-        items.append({"Path": child.name, "Name": child.name, "Size": child.stat().st_size if child.is_file() else 0, "IsDir": child.is_dir()})
+        item = {"Path": child.name, "Name": child.name, "Size": child.stat().st_size if child.is_file() else 0, "IsDir": child.is_dir()}
+        item["ID"] = fake_file_id(str(child.resolve())) if child.is_file() else fake_id(child.name)
+        items.append(item)
     print(json.dumps(items))
     return 0
 
