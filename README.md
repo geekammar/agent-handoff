@@ -1,103 +1,88 @@
 # Agent Handoff
 
-Structured, upload-verified execution reports for OpenCode and AGY. Reports are stored locally and copied to an existing Google Drive reports subtree using `rclone`.
+Agent Handoff is an AI-native, self-describing, portable developer tool for recording agent work and delivering upload-verified execution reports.
 
-The runtime is deliberately small: Python standard library plus `rclone`. There is no database, web server, dashboard, daemon, npm package, or PyPI dependency.
+It has two layers:
 
-This repository is the source distribution of the tested Agent Handoff v1.0 installation. Runtime data and credentials are intentionally kept outside Git.
+1. **Core capture (always available):** records structured reports for OpenCode and AGY sessions, stores them locally, uploads them to a Google Drive reports subtree with `rclone`, and verifies the upload using MD5 or read-back.
+2. **Optional GitHub Issue dispatcher (v1.1):** a separate process on your own Linux machine claims explicitly configured tasks from a private GitHub Issue, runs a local OpenCode model in a fixed project workspace, captures the report through Agent Handoff, uploads it, verifies it, and publishes the direct Drive report URL back to the originating issue.
 
-## Repository layout
+The runtime is deliberately small: Python standard library, `rclone`, and (for the optional dispatcher) the GitHub CLI `gh` plus OpenCode. There is no database server, web dashboard, inbound public port, SaaS dependency, or mandatory cloud service.
+
+**Every user owns their installation.** Nothing depends on the original author's GitHub account, Drive, VPS, project paths, or model provider.
+
+## Quick start
+
+Prerequisites: Python 3.10+, `rclone`, and (optional) OpenCode. The dispatcher additionally needs `gh` authenticated to your own GitHub account.
+
+```bash
+git clone https://github.com/OWNER/agent-handoff.git ~/src/agent-handoff
+python3 ~/src/agent-handoff/setup/install.py --home ~/agent-handoff
+agent-handoff auth
+agent-handoff project add --name ProjectA --path ~/projects/project-a
+agent-handoff doctor
+```
+
+For a non-standard runtime or PATH location:
+
+```bash
+AGENT_HANDOFF_HOME="$HOME/agent-handoff" \
+  python3 ~/src/agent-handoff/setup/install.py \
+  --home "$HOME/agent-handoff" \
+  --bin-link "$HOME/.local/bin/agent-handoff"
+```
+
+The installer synchronizes managed source files, records an ownership manifest, links the CLI, and registers the OpenCode and AGY capture integrations. It never touches runtime `data/`, `queue/`, `state/`, `locks/`, `logs/`, `tmp/`, `releases/`, `config/config.json`, or `rclone` authorization.
+
+## Architecture
 
 ```text
-agent-handoff/
-  bin/agent-handoff                 # executable wrapper
-  lib/agent_handoff/                # core Python CLI package
-    cli.py                          # command surface
-    config.py                       # runtime configuration and project mapping
-    report.py                       # report templates and required sections
-    store.py                        # atomic local task/run/report storage
-    upload.py                       # rclone queue, upload, verification
-    adapters/
-      common.py                     # shared session-ingest pipeline
-      agy.py                        # verified AGY Stop-hook adapter
-  integrations/
-    AGENT-INSTRUCTIONS.md           # rules injected into agents
-    opencode/agent-handoff.js       # OpenCode plugin (installed copy is active)
-    agy/                            # AGY hook example and capability notes
-  tests/
-    test_unit.py
-    test_integration.py
-    test_install.py
-    test_installer_safety.py        # source selection, ownership, integration recovery
-    acceptance.py                   # live end-to-end acceptance suite
-    fake-rclone                    # deterministic Drive simulator
-  setup/
-    install.py, install.sh          # idempotent installer
-    managed.py                      # shared source-selection and ownership policy
-    upgrade.py, upgrade.sh          # snapshot + upgrade
-    rollback.sh                     # restore previous snapshot
-    gdrive-auth.sh                  # headless-safe authorization helper
-  docs/
-    ARCHITECTURE.md
-    ACCEPTANCE.md
-    TROUBLESHOOTING.md
-  config/config.example.json        # no credentials, no live folder IDs
+AI assistant
+    |
+    v
+private GitHub Issue (optional dispatcher transport)
+    |
+    v
+Agent Handoff dispatcher (separate, optional process)
+    |
+    +-- request validation + authorized author check
+    +-- explicit project/model resolution
+    +-- durable execution ledger
+    |
+    v
+OpenCode adapter (only execution adapter in v1.1)
+    |
+    v
+fixed project workspace (cwd and PWD are the canonical configured path)
+    |
+    v
+Agent Handoff core
+    |
+    +-- local task/run report
+    +-- upload queue
+    +-- rclone upload + MD5/read-back verification
+    +-- direct Google Drive file URL + upload receipt
+    |
+    v
+idempotent GitHub Issue delivery reconciliation
+    |
+    v
+verified report URL
 ```
 
-## Requirements
+Core capture works with the dispatcher disabled. The dispatcher never needs an inbound public port: it polls the private repository using your authenticated `gh` session.
 
-- Python 3.10 or newer
-- `rclone` for Google Drive uploads
-- Optional: OpenCode and/or AGY for automatic capture
-- No pip packages are required at runtime
+## Supported agents
 
-The verified v1.0 environment used Python 3.14.4, rclone 1.60.1-DEV, git 2.53.0, OpenCode 1.19.5, and AGY 1.5.9.
-
-## Install
-
-Clone the private repository, then run the installer. The default runtime home is `/root/agent-handoff`; the source checkout and runtime home are separate so runtime reports, queues, state, and credentials are never part of the repository.
-
-```bash
-git clone git@github.com:geekammar/agent-handoff-private.git /root/projects/agent-handoff
-python3 /root/projects/agent-handoff/setup/install.py --home /root/agent-handoff
-```
-
-The installer:
-
-- synchronizes selected source files into the runtime home,
-- records the installed files in `$AGENT_HANDOFF_HOME/.agent-handoff-manifest.json`,
-- creates or updates `/usr/local/bin/agent-handoff` as a symlink,
-- installs the OpenCode plugin and instruction registration,
-- installs the AGY `Stop` hook and instruction block,
-- backs up any configuration file before changing it,
-- never touches `data/`, `queue/`, `state/`, `locks/`, `logs/`, `tmp/`, `releases/`, `config/config.json`, or the rclone configuration.
-
-Source selection is the same for Git and non-Git checkouts. Only regular files under the managed source directories are copied. The installer always excludes runtime `config/config.json`, even when that file exists in an archive source or is tracked by Git, along with credentials and authorization files, runtime data and state, queues, locks, logs, temporary files, generated reports and prompt archives, live-test configuration, backups, and test artifacts. Intended assets such as `config/config.example.json` are retained. Source symlinks are skipped and destination paths through symlink components are rejected.
-
-It is idempotent: identical files are not rewritten, and duplicate plugin, hook, or instruction entries are not created. Files removed between releases are deleted only when the ownership manifest lists them.
-
-For a non-standard location:
-
-```bash
-AGENT_HANDOFF_HOME=/opt/agent-handoff \
-  python3 setup/install.py --home /opt/agent-handoff --bin-link /usr/local/bin/agent-handoff
-```
-
-## Configuration
-
-Runtime configuration lives at `$AGENT_HANDOFF_HOME/config/config.json` and is created with mode `600` on first use. It is not tracked by Git. Start from `config/config.example.json` and fill in the Drive parent/root folder IDs and project mappings, or use the CLI:
-
-```bash
-agent-handoff project add --name "Project" \
-  --path /root/projects/project \
-  --folder-id "<verified-drive-folder-id>"
-```
-
-A project is data, not code. The command verifies that a supplied folder ID is a direct child of the configured reports root before saving it. If no folder ID is supplied, it reuses exactly one existing child folder or creates one after verifying the root.
+| Agent | Report capture | Dispatcher execution |
+| --- | --- | --- |
+| OpenCode | Yes (verified v1 integration) | Yes (v1.1 adapter) |
+| AGY | Yes (verified Stop hook) | No, deferred |
+| Claude Code, Gemini CLI, Codex CLI, other CLIs | No | No; the adapter boundary is documented but no speculative adapters ship |
 
 ## Google Drive authorization
 
-Authorization is the only manual setup step. The utility never prints rclone secrets or token contents.
+Authorization is the only manual Drive step. The CLI never prints rclone secrets or token contents.
 
 ```bash
 agent-handoff auth
@@ -107,143 +92,220 @@ agent-handoff doctor
 
 Headless-safe import:
 
-1. On a browser-capable machine: `rclone authorize "drive"`.
+1. On a browser-capable machine run `rclone authorize "drive"`.
 2. Sign in with the account that owns the Drive subtree.
-3. Save the JSON token as a mode-600 file on the VPS. Do not paste it into chat.
+3. Save the JSON token as a mode-600 file on the target host. Do not paste it into chat.
 4. Import it:
 
 ```bash
-agent-handoff auth --import-token-file /root/gdrive-token.json
+agent-handoff auth --import-token-file /path/to/gdrive-token.json
 agent-handoff doctor
 ```
 
-The import backs up the previous rclone config, writes only the configured remote, verifies Drive, and restores the previous config if verification fails. The helper is `setup/gdrive-auth.sh`.
+The import backs up the previous rclone config, writes only the configured remote, verifies Drive, and restores the previous config if verification fails.
 
-Drive safety rules:
-
-- Parent and reports-root IDs must resolve to the configured hierarchy before upload.
-- Uploads use ID-anchored paths: `gdrive,root_folder_id=<project-folder-id>:`.
-- `rclone sync` is never used. The utility uses `copyto`, `mkdir`, `lsf`, `lsd`, `md5sum`, and read-back verification.
-- Only generated report files and `PROJECT-STATUS.md` are uploaded.
-
-## Daily usage
+## Core usage
 
 ```bash
 agent-handoff doctor
-agent-handoff list --project Project
+agent-handoff list --project ProjectA
 agent-handoff retry-upload
+agent-handoff index --project ProjectA --upload
 ```
 
 Automatic capture:
 
-- OpenCode: the plugin listens for `chat.message` and `session.idle`, captures the first prompt and final assistant response, skips subagent sessions, and calls `agent-handoff auto-complete`.
-- AGY: the global `Stop` hook reads the conversation ID, transcript path, termination reason, and error state, then writes a task/run report. It always prints `{}` and exits 0 so reporting cannot block the agent.
+- **OpenCode:** the plugin captures the first prompt and final assistant response, then calls `agent-handoff auto-complete`.
+- **AGY:** the global `Stop` hook parses the transcript and writes a task/run report.
 
 Manual structured flow:
 
 ```bash
-agent-handoff init --project Project --agent opencode \
-  --title "Fix login redirect" --prompt-file /path/to/prompt.txt
+agent-handoff init --project ProjectA --agent opencode \
+  --title "Fix login redirect" --prompt-file prompt.txt
 agent-handoff prepare-run --task-id <task-id>
 # write RUNS/<run-id>/REPORT.md
 agent-handoff complete --task-id <task-id> --run-id <run-id> \
-  --outcome succeeded --tests passed --tests-details "exact command and result"
+  --outcome succeeded --tests passed \
+  --tests-details "exact command and result"
 ```
 
-## Report model
+Every `REPORT.md` contains required sections including Executive Summary, Task ID and Run ID, Agent and Session, Implemented Changes, Tests, Deployment, GitHub branch/commit/PR, Remaining Issues, Blockers, and Evidence links. The reporting system does not inspect diffs or run tests itself; it only records what was actually supplied.
+
+## Optional dispatcher
+
+The dispatcher is disabled by default. Start from `config/config.dispatch.example.json` and adapt it to your own GitHub repository, project paths, Drive mapping, and OpenCode models.
+
+```bash
+# Discover exact provider/model IDs available to your OpenCode installation:
+opencode models
+
+# Example-only paths and values:
+cp ~/src/agent-handoff/config/config.dispatch.example.json \
+  "$AGENT_HANDOFF_HOME/config/config.json"   # only for a brand-new installation
+agent-handoff config validate
+agent-handoff dispatch run --once
+```
+
+The example is illustrative. Do not copy it over an existing runtime config. Add `dispatch` to your existing config as a new section and preserve every existing value.
+
+Minimal dispatch section:
+
+```json
+{
+  "dispatch": {
+    "enabled": true,
+    "transport": "github_issues",
+    "repository": "example-user/private-dispatch",
+    "allowed_users": ["example-user"],
+    "agent": "opencode",
+    "models": {
+      "fast": "provider/model-name",
+      "review": "provider/other-model"
+    },
+    "default_model": "fast",
+    "projects": {
+      "ProjectA": {"workspace": "/home/dev/projects/project-a"},
+      "ProjectB": {"workspace": "/home/dev/projects/project-b"}
+    },
+    "execution": {
+      "timeout_seconds": 1200,
+      "permission_profile": "read_only",
+      "allow_write": false
+    }
+  }
+}
+```
+
+Rules enforced by the dispatcher:
+
+- The repository must be private and have Issues enabled.
+- Only logins in `allowed_users` may submit tasks.
+- `ProjectA`/`ProjectB` must already exist in the core `projects` mapping with a Drive folder ID and a matching local path.
+- Issue content selects only a configured project alias and model alias. It can never provide a filesystem path, shell command, or arbitrary model ID.
+- Unknown projects, agents, models, malformed metadata, and duplicate execution attempts are rejected.
+- `session: new` is the only supported mode in v1.1. `session: same` is rejected explicitly; it is never simulated.
+- Read-only execution is the default. A write-capable mode requires an explicit `workspace_write` permission profile and `allow_write: true`.
+
+### Issue request format
 
 ```text
-<Project>/
-  PROJECT-STATUS.md
-  TASKS/
-    <task-id>-<slug>/
-      PROMPT.md
-      META.json
-      RUNS/
-        <run-id>/
-          PROMPT.md
-          REPORT.md
-          COMPLETE.json
+<!-- agent-handoff-request -->
+handoff-version: 1
+project: ProjectA
+agent: opencode
+model: fast
+session: new
+<!-- /agent-handoff-request -->
+
+Read the first heading of README.md and report it. Do not edit files.
 ```
 
-Every `REPORT.md` contains the required sections, including Executive Summary, Task ID and Run ID, Agent and Session, Implemented Changes, Fixed Issues, Tests Passed/Failed/Not Run, Deployment Status, GitHub Branch/Commit/PR, Remaining Issues, Blockers, Recommended Next Steps, Architecture Changes, and Evidence links. Automatic reports add Verification Notes and never claim tests or deployment succeeded without evidence.
+The metadata block is versioned and parsed only from the Issue body. Free-form prose without the marker is ignored. Issue titles are not used for routing. A controlled template is included at `.github/ISSUE_TEMPLATE/agent-handoff-task.md`.
 
-`PROJECT-STATUS.md` is a report index. Local indexes list all runs; uploaded indexes list upload-verified runs only and contain no local filesystem paths.
+### Delivery guarantees and recovery
+
+The durable ledger separates:
+
+1. execution status,
+2. report capture status,
+3. upload verification status,
+4. GitHub publication status.
+
+A claimed or started request is never automatically executed again after a restart. If execution output is recoverable, the dispatcher captures and delivers it without invoking the model again. Otherwise the record becomes `NEEDS_ATTENTION` for operator review. Upload failures retry the upload only; GitHub failures retry the comment only. Existing delivery comments are detected by marker to avoid duplicates.
+
+An upload is considered verified only after every uploaded file passes MD5 or read-back verification. The dispatcher then resolves the actual Drive file ID, writes an `UPLOAD-RECEIPT.json`, re-uploads `COMPLETE.json` with truthful verified metadata, and only then publishes the direct report URL. A stale remote `COMPLETE.json` from an older upload is corrected; it is never treated as proof of verification by itself.
+
+```bash
+agent-handoff dispatch status
+agent-handoff dispatch inspect --task <task-id> --run <run-id>
+agent-handoff dispatch deliver --task <task-id> --run <run-id> \
+  --issue <number> --repository owner/private-dispatch
+```
+
+`dispatch deliver` reconciles an existing run and publishes its verified URL. It never invokes an agent.
+
+See [docs/DISPATCH.md](docs/DISPATCH.md) for the state machine, trust model, exact commands, systemd user-service example, and recovery procedures.
+
+## AI-native onboarding
+
+Share the repository URL with a tool-enabled AI assistant and point it at [AGENTS.md](AGENTS.md) or [docs/AI-QUICKSTART.md](docs/AI-QUICKSTART.md).
+
+An assistant with shell, GitHub, and Drive authorization can follow the commands and verify each step. An assistant without those permissions must explain the setup steps and ask the user to run them; it must not pretend to have installed, authenticated, executed, uploaded, or verified anything.
+
+A universal prompt is provided in `docs/AI-QUICKSTART.md`. Tool-specific instructions are thin pointers to the same canonical commands, not divergent copies.
 
 ## Tests
-
-Unit, integration, and regression tests use only the standard library and the fake rclone backend:
 
 ```bash
 PYTHONPATH=lib python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-The live acceptance suite additionally verifies real OpenCode and AGY sessions and the real Google Drive hierarchy. It reads live folder IDs from the production config and optional `tests/live-config.json` (ignored by Git):
+Deterministic tests use fake GitHub, fake OpenCode, and fake rclone backends. They do not require Drive credentials or a real model. Live acceptance optionally checks real OpenCode/AGY sessions and the real Drive hierarchy:
 
 ```bash
 cp tests/live-config.example.json tests/live-config.json
-# fill in chat/muse folder IDs and a local git project path, then:
 python3 tests/acceptance.py
 ```
 
-See `docs/ACCEPTANCE.md` for the recorded baseline and post-refactor results.
+See [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md).
 
 ## Upgrade and rollback
 
-Upgrade from a checked-out source tree:
-
 ```bash
-git -C /root/projects/agent-handoff pull --ff-only
-python3 /root/projects/agent-handoff/setup/upgrade.py --home /root/agent-handoff
+git -C ~/src/agent-handoff pull --ff-only
+python3 ~/src/agent-handoff/setup/upgrade.py --home ~/agent-handoff
+python3 ~/src/agent-handoff/setup/upgrade.py --home ~/agent-handoff --rollback latest
+python3 ~/src/agent-handoff/setup/upgrade.py --home ~/agent-handoff --list
 ```
 
-The upgrade:
+Upgrade snapshots the installed code and restores it automatically if installation fails. Rollback uses ownership manifests and refuses unsafe or legacy snapshots. Runtime reports, dispatch ledger, queue, logs, configuration, and credentials are preserved.
 
-- snapshots the currently installed code and its ownership manifest under `$AGENT_HANDOFF_HOME/releases/`,
-- runs the same idempotent installer,
-- captures managed OpenCode and AGY files in memory before installation,
-- automatically restores the snapshot and integration files if installation fails,
-- never touches runtime reports, queue, state, logs, config, or rclone authorization.
-
-Rollback to the latest snapshot:
-
-```bash
-python3 /root/projects/agent-handoff/setup/upgrade.py --home /root/agent-handoff --rollback latest
-# or: setup/rollback.sh
-```
-
-Rollback restores the selected release and removes newer files only when the runtime ownership manifest identifies them as installed by Agent Handoff. Manifest paths are validated before any change; unknown or unmanaged files, runtime configuration, and runtime data are preserved. The restored installer from the selected release is then run, so newer source code is not reapplied. Managed OpenCode and AGY entries are reconciled from the selected release while unrelated settings and instructions remain intact.
-
-Snapshots created by this version include `manifest.json`. Older snapshots without ownership information are refused with a clear error instead of deleting unknown files or claiming an exact restore. Create a new snapshot by installing or upgrading once with this version before relying on rollback. The first snapshot taken from an installation that has no ownership manifest uses a filesystem inventory; later snapshots use the recorded manifest. If rollback installation fails, the pre-rollback code and integration state are restored when the pre-rollback snapshot is complete.
-
-List snapshots:
-
-```bash
-python3 /root/projects/agent-handoff/setup/upgrade.py --home /root/agent-handoff --list
-```
-
-## Security
+## Security and privacy
 
 - Credentials, rclone configuration, tokens, `.env` files, and OAuth data are never committed.
-- The ownership manifest records managed relative paths only, never file contents.
-- Runtime reports, prompt archives, queue items, state, logs, locks, and generated indexes are ignored by Git.
-- The repository contains no live Google Drive folder IDs or user-specific project paths in defaults or tests.
-- Uploaded report copies redact obvious secrets; the local copy remains intact for audit.
-- Config and data files are mode `600`; runtime directories are mode `700`.
-- Logs contain operational errors and paths, not tokens or rclone configuration contents.
-- The private repository must never be made public without a dedicated data review.
+- The dispatcher repository must be private; only explicitly allowed authors are accepted.
+- Issue text is untrusted input, never privileged configuration.
+- The dispatcher never derives filesystem paths or shell commands from issue content.
+- The default execution policy is read-only (`plan` agent, denied writes, denied env reads).
+- Logs and uploaded reports are sanitized of obvious secrets; local report copies remain intact for audit.
+- Uploaded receipts contain identities and hashes, not local filesystem paths or credentials.
+- Runtime config and data are mode `600`/`700` and intentionally outside Git.
 
-## Troubleshooting and acceptance
+## Repository layout
 
-- `docs/TROUBLESHOOTING.md`
-- `docs/ACCEPTANCE.md`
-- `agent-handoff doctor --json`
+```text
+agent-handoff/
+  bin/agent-handoff
+  lib/agent_handoff/
+    cli.py, config.py, report.py, store.py, upload.py, util.py
+    adapters/                  # core session-ingest adapters (OpenCode/AGY capture)
+    dispatch/                  # optional v1.1 dispatcher
+      config.py, requests.py, ledger.py, github.py, runner.py, delivery.py
+      adapters/base.py, adapters/opencode.py
+  integrations/                # installed capture integrations
+  setup/                       # installer, upgrade, rollback, auth helper
+  tests/                       # deterministic tests + fake backends
+  config/                      # sanitized examples only
+  docs/                        # architecture, dispatch, acceptance, troubleshooting, AI quickstart
+  AGENTS.md                    # neutral AI entrypoint
+  SKILL.md                     # reusable skill-oriented guide
+```
 
 ## Known limitations
 
-- The rclone OAuth token can expire or be revoked.
+- SAME SESSION continuation is deferred and rejected explicitly.
+- Only OpenCode execution is implemented. AGY remains capture-only. No other CLI adapters are shipped.
+- No automatic model selection or AI-based project inference.
 - Automatic reports cannot independently verify code changes, tests, or deployments.
-- OpenCode creates a report for every top-level session; v1 has no per-session opt-out.
-- AGY `Stop` events occur per completed turn; each turn becomes a run under the conversation task.
-- The reporting system does not inspect repository diffs or run tests itself.
-- Drive folder IDs must remain stable; renaming a project in config does not rename the Drive folder.
+- The rclone OAuth token can expire or be revoked.
+- The dispatcher runs on your own host; it does not provide a hosted service or public API.
+- Google Drive folder IDs must remain stable; renaming a project in config does not rename the Drive folder.
+
+## More documentation
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/DISPATCH.md](docs/DISPATCH.md)
+- [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md)
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
+- [docs/AI-QUICKSTART.md](docs/AI-QUICKSTART.md)

@@ -62,3 +62,36 @@ The refactored code was installed into the existing runtime home with a pre-upgr
 - Other Drive subtrees remained free of Agent Handoff artifacts.
 
 The generated result file is `$AGENT_HANDOFF_HOME/tests/acceptance-results.json` and is ignored by Git. This document intentionally does not embed live task IDs or folder IDs.
+
+## v1.1 MVP automated acceptance
+
+Date: 2026-11-19
+
+Command:
+
+```bash
+python3 -m compileall -q lib setup tests
+sh -n setup/install.sh setup/upgrade.sh setup/rollback.sh setup/gdrive-auth.sh
+PYTHONPATH=lib python3 -m unittest discover -s tests -p "test_*.py" -v
+```
+
+Deterministic result: **42 tests passed, 0 failed**. The dispatch suite uses fake GitHub, fake OpenCode, and fake rclone; it does not require provider, GitHub, or Drive credentials.
+
+Covered dispatcher acceptance:
+
+- valid request executes exactly once and produces a verified direct Drive URL;
+- duplicate polling does not repeat execution or duplicate the issue comment;
+- unauthorized authors, malformed requests, unknown projects, unknown models, unsupported agents, and SAME SESSION are rejected without execution;
+- ProjectA and ProjectB execute in isolated workspaces with correct `cwd` and `PWD`;
+- a dispatch workspace that does not exactly match its core project path is rejected by config validation;
+- execution output is linked to the correct Agent Handoff task/run and session/model metadata;
+- upload failure retries upload without restarting OpenCode;
+- GitHub publication failure retries publication without re-upload or execution and without duplicate links;
+- a restart after claim does not execute the model again and marks the record `NEEDS_ATTENTION`;
+- a restart after verified upload publishes without another execution;
+- historical-style stale remote `COMPLETE.json` is reconciled with a verified receipt and direct URL without executing an agent;
+- core capture/upload still works with dispatch disabled;
+- install, upgrade, and rollback preserve runtime config, reports/data, credentials-side files, and dispatch ledger state;
+- example configurations contain only generic users, paths, models, and projects.
+
+Live checks are reported separately in the implementation report. A live check is `Not verified` unless the exact host command and result are recorded.

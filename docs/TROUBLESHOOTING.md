@@ -109,8 +109,9 @@ Inspect queue metadata without printing report contents:
 
 ```bash
 python3 - <<'PY'
-import glob, json
-root = __import__("os").environ.get("AGENT_HANDOFF_HOME", "/root/agent-handoff")
+import glob, json, os
+from pathlib import Path
+root = os.environ.get("AGENT_HANDOFF_HOME", str(Path.home() / "agent-handoff"))
 for path in sorted(glob.glob(root + "/queue/*.json")):
     data = json.load(open(path))
     print(data.get("id"), data.get("kind"), data.get("project"), data.get("run_id"),
@@ -135,7 +136,8 @@ Check the remote path recorded in `COMPLETE.json`:
 ```bash
 python3 - <<'PY'
 import glob, json, os
-root = os.environ.get("AGENT_HANDOFF_HOME", "/root/agent-handoff")
+from pathlib import Path
+root = os.environ.get("AGENT_HANDOFF_HOME", str(Path.home() / "agent-handoff"))
 for path in glob.glob(root + "/data/projects/*/TASKS/*/RUNS/*/COMPLETE.json"):
     data = json.load(open(path))
     print(data["task_id"], data["run_id"], data["upload"]["verified"], data["report"]["remote_path"])
@@ -212,7 +214,7 @@ python3 -m json.tool ~/.gemini/config/hooks.json
 It should contain an `agent-handoff-report` entry whose command includes:
 
 ```text
-/usr/local/bin/agent-handoff hook agy
+agent-handoff hook agy
 ```
 
 Test the hook manually:
@@ -262,3 +264,102 @@ python3 tests/acceptance.py
 ```
 
 The acceptance suite uses an isolated `/tmp/agent-handoff-acceptance` home and a fake rclone remote for synthetic checks. Its live checks read the configured Drive hierarchy and do not create or delete Drive folders.
+
+## Dispatcher is disabled
+
+`agent-handoff dispatch run` refuses to start when `dispatch.enabled` is false. Core capture still works. Add the `dispatch` section to the runtime config; do not replace the whole config with an example.
+
+```bash
+agent-handoff config validate
+```
+
+## Dispatcher refuses the configuration
+
+Common causes:
+
+- `dispatch.repository` is not `owner/name`.
+- The repository is public; v1.1 requires a private repository with Issues enabled.
+- The authenticated `gh` user is not in `dispatch.allowed_users`.
+- A dispatch project is not present in the core `projects` mapping.
+- A dispatch workspace does not exactly match one of that project's recorded paths.
+- A model alias is missing from `dispatch.models`.
+- `workspace_write` was selected without `allow_write: true`, or `allow_write` was enabled with `read_only`.
+
+Fix the config and rerun:
+
+```bash
+agent-handoff config validate --json
+agent-handoff doctor
+```
+
+## Issue request was rejected
+
+The dispatcher rejects, without executing:
+
+- missing or unsupported `handoff-version`;
+- unknown or duplicate metadata fields;
+- unknown project, agent, or model alias;
+- `session: same` (SAME SESSION is deferred, never simulated);
+- empty or oversized instructions;
+- unauthorized authors.
+
+A rejection comment is marker-idempotent. Editing a rejected issue does not automatically execute it; submit a new corrected issue.
+
+## Dispatch record is NEEDS_ATTENTION
+
+This means a process restarted after a claim/start and no recoverable session output was found. The agent is **not** rerun automatically.
+
+Inspect without changing anything:
+
+```bash
+agent-handoff dispatch status --json
+agent-handoff dispatch inspect --task <task-id> --run <run-id> --json
+```
+
+If the work must be repeated, submit a new issue. Do not edit the ledger to force a rerun.
+
+## Upload is pending but the report is readable on Drive
+
+A readable file is not upload verification. Check:
+
+```bash
+agent-handoff dispatch status --json
+agent-handoff dispatch inspect --task <task-id> --run <run-id> --json
+```
+
+If local verification is missing, retry the upload only:
+
+```bash
+agent-handoff retry-upload --force --task <task-id> --run <run-id>
+```
+
+If local verification succeeded but the remote `COMPLETE.json` still says pending, reconcile and publish without rerunning the agent:
+
+```bash
+agent-handoff dispatch deliver --task <task-id> --run <run-id> \
+  --issue <number> --repository owner/private-dispatch
+```
+
+This creates and verifies `UPLOAD-RECEIPT.json`, re-uploads truthful verified `COMPLETE.json`, and publishes the direct URL idempotently.
+
+## GitHub publication failed
+
+The report is safe; only the comment failed. The record remains `UPLOAD_VERIFIED` and retries automatically with backoff. Force a retry with:
+
+```bash
+agent-handoff dispatch run --once --force --json
+```
+
+Before posting, the dispatcher checks for the delivery marker. A retry after an uncertain comment post does not create a duplicate link.
+
+## Dispatcher status is ISSUE_UPDATED but I cannot see the comment
+
+Confirm the record's `comment_url` and open the issue in the authenticated browser session. Private repository visibility is required. A comment URL is publication evidence, not upload verification.
+
+## Tests and live checks
+
+```bash
+PYTHONPATH=lib python3 -m unittest discover -s tests -p "test_*.py" -v
+```
+
+Deterministic tests do not need Drive or provider credentials. Live dispatch testing requires real `gh`, OpenCode provider auth, and Drive auth; if any are unavailable, report the limitation instead of claiming a pass.
