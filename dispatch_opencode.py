@@ -78,7 +78,8 @@ def execute(issue, model, project):
         comment(number, f"{CLAIM}\nRejected: the prompt must contain 1 to 24,000 characters.")
         return
     comment(number, f"{CLAIM}\nStarting a new read-only OpenCode session with `{model}`.")
-    environment = dict(os.environ, OPENCODE_CONFIG_CONTENT=json.dumps({
+    # OpenCode may prefer the inherited PWD environment variable to the process cwd.
+    environment = dict(os.environ, PWD=str(project), OPENCODE_CONFIG_CONTENT=json.dumps({
         "share": "disabled",
         "permission": {
             "*": "deny",
@@ -139,7 +140,8 @@ def main():
     args = parser.parse_args()
     if not re.fullmatch(r"[\w.-]+/[\w./:-]*deepseek[\w./:-]*flash[\w./:-]*", args.model, re.IGNORECASE):
         parser.error("--model must identify a DeepSeek Flash model")
-    if not args.project.is_dir():
+    project = args.project.resolve()
+    if not project.is_dir():
         parser.error("--project must be an existing Rabet directory")
     STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (STATE / "rabet.lock").open("a") as lock:
@@ -150,7 +152,7 @@ def main():
         print(f"Listening for Rabet requests in {REPO} with {args.model}.", flush=True)
         while True:
             try:
-                poll(args.model, args.project)
+                poll(args.model, project)
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
                 print(f"Dispatch check failed ({type(error).__name__}). Check gh, OpenCode, and Agent Handoff.", file=sys.stderr)
                 if not args.watch:
