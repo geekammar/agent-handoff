@@ -95,3 +95,22 @@ Covered dispatcher acceptance:
 - example configurations contain only generic users, paths, models, and projects.
 
 Live checks are reported separately in the implementation report. A live check is `Not verified` unless the exact host command and result are recorded.
+
+## v1.1 real end-to-end acceptance
+
+Date: 2026-11-19
+
+A real private GitHub Issue was dispatched through the v1.1 dispatcher using real `gh`, real OpenCode, and the real Google Drive hierarchy. The execution workspace was a disposable sandbox, not Rabet or Yakfi.
+
+Post-fix result:
+
+- exactly one OpenCode NEW SESSION;
+- correct sandbox marker, model, session, task, and run recorded;
+- REPORT.md uploaded and verified by MD5;
+- `UPLOAD-RECEIPT.json` created and verified;
+- remote `COMPLETE.json` reconciled to `upload.verified=true` with a direct Drive URL;
+- direct verified report URL posted to the originating Issue;
+- a second dispatcher process produced zero additional executions, zero duplicate report comments, and identical task/run/session identity;
+- the read-only permission probe denied a requested file write in a disposable sandbox.
+
+The review found one report-truthfulness defect: when a workspace had no Git remote, the dispatcher used the dispatch Issue repository as the code repository. That fallback was removed, a regression test was added, and the real acceptance was repeated successfully. Exact live identifiers are recorded in the release-review Agent Handoff report rather than in this source document.

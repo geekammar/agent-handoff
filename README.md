@@ -267,7 +267,7 @@ Upgrade snapshots the installed code and restores it automatically if installati
 - The dispatcher repository must be private; only explicitly allowed authors are accepted.
 - Issue text is untrusted input, never privileged configuration.
 - The dispatcher never derives filesystem paths or shell commands from issue content.
-- The default execution policy is read-only (`plan` agent, denied writes, denied env reads).
+- The default execution policy is read-only (`plan` agent, denied writes, denied env reads). This is an OpenCode tool-permission policy, not an OS-level sandbox; see the security limitations in `docs/DISPATCH.md`.
 - Logs and uploaded reports are sanitized of obvious secrets; local report copies remain intact for audit.
 - Uploaded receipts contain identities and hashes, not local filesystem paths or credentials.
 - Runtime config and data are mode `600`/`700` and intentionally outside Git.

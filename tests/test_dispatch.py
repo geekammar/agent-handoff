@@ -225,6 +225,11 @@ class DispatchTests(unittest.TestCase):
         )
         self.assertEqual(complete["agent"]["session_id"], "ses_fake_00000000000000000000000000")
         self.assertEqual(complete["agent"]["model"], "provider/model-fast")
+        report_text = (self.h.task_dir_for("Alpha", task_id) / "RUNS" / run_id / "REPORT.md").read_text(encoding="utf-8")
+        self.assertIn("- Repository: `not captured`", report_text)
+        self.assertIn("- Dispatch repository: `dev/private-dispatch`", report_text)
+        self.assertNotIn("- Repository: `dev/private-dispatch`", report_text)
+        self.assertIsNone(complete["repository"])
         self.assertTrue(complete["upload"]["verified"])
         self.assertTrue(complete["upload"]["report_url"].startswith("https://drive.google.com/file/d/"))
         receipt = self.h.task_dir_for("Alpha", task_id) / "RUNS" / run_id / "UPLOAD-RECEIPT.json"

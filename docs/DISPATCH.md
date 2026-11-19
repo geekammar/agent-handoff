@@ -262,6 +262,15 @@ journalctl --user -u agent-handoff-dispatch.service -f
 
 The service runs as the user who owns `gh` and rclone credentials. It does not require root and does not open a network port.
 
+## Security limitations
+
+- `read_only` is an OpenCode tool-permission policy: the `plan` agent is used and `edit`/`bash` and other unspecified tools are denied through `OPENCODE_CONFIG_CONTENT`. It is **not** an operating-system sandbox. The dispatcher process runs with the Unix permissions of the user who started it.
+- A user who can modify the runtime config, the OpenCode binary, the model/provider, or the host can change behavior. Run the dispatcher under a dedicated Unix account if you need stronger host-level isolation.
+- If the dispatcher process is killed, an already-started OpenCode child process may continue. The ledger prevents automatic re-execution and marks the request `NEEDS_ATTENTION`; read-only mode limits the effect, but `workspace_write` requires operator care.
+- `allowed_users` matches GitHub login names, not immutable account IDs. Login renames must be handled by the repository owner.
+- Uploaded `REPORT.md` files currently include the local run directory path as audit evidence. They are stored in the user's private Drive; GitHub delivery comments contain only identifiers and verified URLs. Upload receipts omit local filesystem paths.
+- The model can read files allowed by the OpenCode read permission within the workspace. `.env`-style files are denied by pattern, but this is not a substitute for OS-level secret isolation.
+
 ## Failure recovery
 
 ```bash
