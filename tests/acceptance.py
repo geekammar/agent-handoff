@@ -16,8 +16,8 @@ TEST = Path(os.environ.get("AGENT_HANDOFF_ACCEPTANCE_HOME", "/tmp/agent-handoff-
 FAKE_DRIVE = TEST / "fake-drive"
 FAKE_BIN = TEST / "bin"
 RCLONE_CONFIG = TEST / "rclone.conf"
-PRODUCTION_HOME = Path(os.environ.get("AGENT_HANDOFF_PRODUCTION_HOME", "/root/agent-handoff"))
-DEFAULT_PROJECT = "Rabet"
+PRODUCTION_HOME = Path(os.environ.get("AGENT_HANDOFF_PRODUCTION_HOME", os.environ.get("AGENT_HANDOFF_HOME", str(Path.home() / "agent-handoff"))))
+DEFAULT_PROJECT = "ProjectA"
 DEFAULT_ROOT_NAME = "03 — Agent Execution Reports"
 DEFAULT_PARENT_NAME = "AI Project Operations"
 
@@ -57,7 +57,7 @@ def live_settings() -> dict[str, Any]:
     if not projects:
         projects = [
             {
-                "key": "rabet",
+                "key": "project-a",
                 "name": DEFAULT_PROJECT,
                 "folder_id": "acceptance_folder_0001",
                 "path": "",
@@ -278,7 +278,7 @@ def main() -> int:
     seed_drive()
     git_project = LIVE["git_project"]
     git_before = subprocess.run(["git", "-C", git_project, "status", "--porcelain"], capture_output=True, text=True).stdout if git_project and Path(git_project).is_dir() else ""
-    real_config = Path("/root/.config/rclone/rclone.conf")
+    real_config = Path.home() / ".config" / "rclone" / "rclone.conf"
     real_rclone_before = (real_config.exists(), real_config.stat().st_mtime if real_config.exists() else None)
 
     doctor = json.loads(run(["doctor", "--json"], check=False).stdout)

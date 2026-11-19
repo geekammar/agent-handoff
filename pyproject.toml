@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-handoff"
-version = "1.0.0"
-description = "Structured, upload-verified execution reports for OpenCode and AGY"
+version = "1.1.0"
+description = "AI-native, portable Agent Handoff with optional GitHub dispatch"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }

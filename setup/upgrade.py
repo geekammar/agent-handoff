@@ -26,7 +26,7 @@ from managed import (  # noqa: E402
 )
 
 SOURCE = Path(__file__).resolve().parents[1]
-DEFAULT_HOME = Path(os.environ.get("AGENT_HANDOFF_HOME", "/root/agent-handoff"))
+DEFAULT_HOME = Path(os.environ.get("AGENT_HANDOFF_HOME", str(Path.home() / "agent-handoff")))
 
 
 def log(message: str) -> None:

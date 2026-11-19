@@ -24,6 +24,8 @@ class InstallTests(unittest.TestCase):
         self.config.write_text('{"sentinel": true}\n', encoding="utf-8")
         os.chmod(self.config, 0o600)
         (self.home / "data" / "keep.txt").write_text("runtime\n", encoding="utf-8")
+        (self.home / "state" / "dispatch" / "records").mkdir(parents=True)
+        (self.home / "state" / "dispatch" / "records" / "sentinel.json").write_text('{"keep": true}\n', encoding="utf-8")
         self.link = self.root / "bin" / "agent-handoff"
 
     def tearDown(self) -> None:
@@ -54,6 +56,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self.link.resolve(), (self.home / "bin" / "agent-handoff").resolve())
         self.assertEqual(self.config.read_text(), '{"sentinel": true}\n')
         self.assertEqual((self.home / "data" / "keep.txt").read_text(), "runtime\n")
+        self.assertEqual((self.home / "state" / "dispatch" / "records" / "sentinel.json").read_text(), '{"keep": true}\n')
         marker = self.home / "lib" / "agent_handoff" / "__init__.py"
         before = marker.stat().st_mtime_ns
         second = self.install()
@@ -81,9 +84,10 @@ class InstallTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(upgrade.returncode, 0, upgrade.stderr)
-        self.assertIn('__version__ = "1.0.0"', version_file.read_text())
+        self.assertIn('__version__ = "1.1.0"', version_file.read_text())
         self.assertEqual(self.config.read_text(), '{"sentinel": true}\n')
         self.assertEqual((self.home / "data" / "keep.txt").read_text(), "runtime\n")
+        self.assertEqual((self.home / "state" / "dispatch" / "records" / "sentinel.json").read_text(), '{"keep": true}\n')
         releases = [path for path in (self.home / "releases").iterdir() if path.is_dir()]
         self.assertTrue(releases)
         version_file.write_text('__version__ = "test-new"\n', encoding="utf-8")

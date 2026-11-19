@@ -24,8 +24,8 @@ from managed import (  # noqa: E402
 )
 
 SOURCE = Path(__file__).resolve().parents[1]
-DEFAULT_HOME = Path(os.environ.get("AGENT_HANDOFF_HOME", "/root/agent-handoff"))
-DEFAULT_BIN_LINK = Path(os.environ.get("AGENT_HANDOFF_BIN_LINK", "/usr/local/bin/agent-handoff"))
+DEFAULT_HOME = Path(os.environ.get("AGENT_HANDOFF_HOME", str(Path.home() / "agent-handoff")))
+DEFAULT_BIN_LINK = Path(os.environ.get("AGENT_HANDOFF_BIN_LINK", str(Path.home() / ".local" / "bin" / "agent-handoff")))
 HOME = Path.home()
 OPENCODE_DIR = HOME / ".config" / "opencode"
 OPENCODE_PLUGIN = OPENCODE_DIR / "plugin" / "agent-handoff.js"
