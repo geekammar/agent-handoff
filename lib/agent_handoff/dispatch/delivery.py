@@ -217,7 +217,7 @@ def build_issue_comment(record: dict[str, Any]) -> str:
         "",
         f"- Project: `{(record.get('project') or {}).get('name')}`",
         f"- Agent: `{record.get('agent')}`",
-        f"- Model: `{record.get('model')}`",
+        f"- Model: `{record.get('model') or 'not captured'}`",
         f"- Session: `{session.get('id') or 'not captured'}`",
         f"- Task: `{capture.get('task_id')}`",
         f"- Run: `{capture.get('run_id')}`",
