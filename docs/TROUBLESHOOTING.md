@@ -363,6 +363,12 @@ agent-handoff dispatch run --once --force --json
 
 Only the comment is retried; the verified upload is reused.
 
+If `dispatch status` reports `health=attention` with `phase=publication_exhausted`, `dispatch.delivery.max_attempts` was reached. The verified upload is still intact. Publish manually without re-running the agent:
+
+```bash
+agent-handoff dispatch deliver --task <task-id> --run <run-id> --issue <number> --repository owner/private-dispatch --json
+```
+
 Before posting, the dispatcher checks for the delivery marker. A retry after an uncertain comment post does not create a duplicate link.
 
 ## Dispatcher status is ISSUE_UPDATED but I cannot see the comment

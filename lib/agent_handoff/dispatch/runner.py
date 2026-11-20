@@ -21,6 +21,7 @@ from .delivery import (
     reconcile_verified_delivery,
     rejection_marker,
     upload_backoff,
+    upload_due,
 )
 from .github import GithubError, GithubTransport
 from .ledger import Ledger, new_dispatch_record
@@ -392,6 +393,7 @@ class DispatchRunner:
                     lambda item: item.setdefault("session", {}).update({"id": session_id}),
                     note=f"session {session_id} started",
                 ),
+                on_progress=lambda stage, message: self._progress(stage, message, record),
             )
         except Exception as exc:
             error = sanitize_error(str(exc))
@@ -656,6 +658,14 @@ class DispatchRunner:
         capture = current.get("capture") or {}
         if capture.get("status") != "CAPTURED":
             return
+        if not upload_due(current, force=force):
+            next_at = (current.get("upload") or {}).get("next_attempt_at")
+            self._progress(
+                "waiting",
+                f"upload retry is not due before {next_at}; no agent session will be re-executed",
+                current,
+            )
+            return
         project = self._project_for(current)
         if not project:
             reason = "Agent Handoff project is no longer configured"
@@ -737,7 +747,8 @@ class DispatchRunner:
                     "receipt_url": result.get("receipt_url"),
                     "last_error": None,
                     "next_attempt_at": None,
-                }
+                },
+                "attention_reason": None,
             },
         )
         self.summary["uploaded"] += 1
@@ -751,6 +762,8 @@ class DispatchRunner:
             return
         publication = current.get("publication") or {}
         if publication.get("status") == "PUBLISHED":
+            return
+        if publication.get("status") == "EXHAUSTED" and not force:
             return
         if not publication_due(current, force=force):
             return
@@ -825,11 +838,13 @@ class DispatchRunner:
                             "comment_url": existing.get("html_url"),
                             "last_error": None,
                             "next_attempt_at": None,
-                        }
+                        },
+                        "attention_reason": None,
                     },
                 )
                 self._progress("completed", "existing delivery comment was already present; no duplicate was posted", current)
                 return
+            self._progress("publishing", "no existing delivery marker; posting one verified report comment", current)
             response = self.transport.comment(int(current["issue_number"]), build_issue_comment(current))
             self.ledger.set_status(
                 current["repository"],
@@ -843,7 +858,8 @@ class DispatchRunner:
                         "comment_url": response.get("url"),
                         "last_error": None,
                         "next_attempt_at": None,
-                    }
+                    },
+                    "attention_reason": None,
                 },
             )
             self.summary["published"] += 1
@@ -854,30 +870,41 @@ class DispatchRunner:
             error = sanitize_error(str(exc))
             max_attempts = int((self.dispatch.get("delivery") or {}).get("max_attempts", 0))
             exhausted = bool(max_attempts and attempts >= max_attempts)
+            next_at = None if exhausted else publication_backoff(
+                attempts, int((self.dispatch.get("delivery") or {}).get("retry_seconds", 60))
+            )
             self.ledger.set_status(
                 current["repository"],
                 int(current["issue_number"]),
                 "UPLOAD_VERIFIED",
-                note="GitHub publication failed; retryable",
+                note="GitHub publication retries exhausted; manual delivery required"
+                if exhausted
+                else "GitHub publication failed; retryable",
                 updates={
                     "publication": {
-                        "status": "FAILED",
+                        "status": "EXHAUSTED" if exhausted else "FAILED",
                         "attempts": attempts,
                         "last_error": error,
-                        "next_attempt_at": publication_backoff(
-                            attempts, int((self.dispatch.get("delivery") or {}).get("retry_seconds", 60))
-                        ),
+                        "next_attempt_at": next_at,
                     },
                     "attention_reason": error if exhausted else current.get("attention_reason"),
                 },
             )
             self.summary["ok"] = False
             self.summary["errors"].append(f"issue #{current['issue_number']} publication: {error}")
-            next_at = publication_backoff(attempts, int((self.dispatch.get("delivery") or {}).get("retry_seconds", 60)))
-            self._progress(
-                "retryable",
-                f"GitHub publication failed; retry scheduled for {next_at}. "
-                "Only the comment is retried; the verified upload is reused.",
-                current,
-            )
+            if exhausted:
+                self._progress(
+                    "needs_attention",
+                    f"GitHub publication failed {attempts} time(s) and dispatch.delivery.max_attempts was reached. "
+                    "The verified upload is preserved; use agent-handoff dispatch deliver for a manual retry. "
+                    "The agent is not re-executed.",
+                    current,
+                )
+            else:
+                self._progress(
+                    "retryable",
+                    f"GitHub publication failed; retry scheduled for {next_at}. "
+                    "Only the comment is retried; the verified upload is reused.",
+                    current,
+                )
             self._log(f"issue #{current['issue_number']} publication failed: {error}")

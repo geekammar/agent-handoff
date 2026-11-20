@@ -39,7 +39,7 @@ The installer applies one source-selection policy to Git and non-Git checkouts. 
 - `runner.py`: claim/execute/capture/upload/publish state machine, restart recovery, and per-record error isolation.
 - `delivery.py`: verified upload reconciliation, direct Drive URL resolution, `UPLOAD-RECEIPT.json`, remote `COMPLETE.json` re-upload, comment rendering, and publication backoff.
 - `adapters/base.py`: small execution-adapter protocol so a future CLI adapter can be added without changing the ledger, GitHub transport, project routing, upload, or delivery.
-- `adapters/opencode.py`: the only v1.1 execution adapter. Sets both `cwd` and `PWD` to the canonical workspace, uses `--pure`, applies a read-only or explicitly enabled write permission policy, streams JSON events to a mode-600 session file, and preserves the session ID as soon as it appears.
+- `adapters/opencode.py`: the only v1.1 execution adapter. Sets both `cwd` and `PWD` to the canonical workspace, uses `--pure`, applies a read-only or explicitly enabled write permission policy, streams JSON events to a mode-600 session file, preserves the session ID as soon as it appears, emits bounded execution heartbeats without prompt content, and terminates its process group on timeout or orderly shutdown.
 
 ### OpenCode capture integration
 
@@ -111,7 +111,7 @@ Execution, capture, upload, and publication are separate facts:
 execution.status:  NEW | CLAIMED | RUNNING | COMPLETED | FAILED | UNCERTAIN
 capture.status:    PENDING | CAPTURED | FAILED | NOT_STARTED
 upload.status:     PENDING | VERIFIED | FAILED | NOT_STARTED
-publication.status:PENDING | PUBLISHED | FAILED | NOT_STARTED
+publication.status:PENDING | PUBLISHED | FAILED | EXHAUSTED | NOT_STARTED
 ```
 
 The top-level lifecycle is a convenience view:

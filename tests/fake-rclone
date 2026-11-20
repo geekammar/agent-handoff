@@ -74,6 +74,9 @@ def command_lsd(argv: list[str]) -> int:
 
 
 def command_lsf(argv: list[str]) -> int:
+    delay = float(os.environ.get("FAKE_SLOW_LSF_SECONDS", "0") or 0)
+    if delay:
+        time.sleep(delay)
     folder_id, path = parse_remote(argv[1])
     if folder_id is None:
         return 0

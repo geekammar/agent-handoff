@@ -89,7 +89,7 @@ Fields:
 | `execution.permission_profile` | `read_only` (default) or `workspace_write`. |
 | `execution.allow_write` | Must be explicitly true with `workspace_write`. |
 | `delivery.retry_seconds` | Base backoff for GitHub publication retries. |
-| `delivery.max_attempts` | `0` means retry indefinitely. |
+| `delivery.max_attempts` | `0` means retry indefinitely. A non-zero value stops automatic publication retries after that many failures; the verified upload is preserved and `dispatch deliver` can publish manually. |
 | `github.command` | `gh` executable name or absolute path. |
 | `github.require_private` | Must remain `true`. |
 
@@ -253,8 +253,11 @@ discovering -> discovered -> validated -> claimed -> executing -> executed
 ```
 
 - Long operations say they are bounded and cite the configured timeout; no total ETA is invented.
-- A single slow rclone upload, MD5/read-back verification, or Drive file-id lookup emits a periodic `waiting` heartbeat with elapsed seconds and the bounded timeout. It never estimates remaining time.
-- Failures add a `retryable` stage with the next retry time and state whether only the upload or only the publication is retried.
+- Long OpenCode execution emits a periodic `executing` heartbeat with elapsed seconds, the number of parsed events, and the configured execution timeout. It never includes prompt text or model output.
+- A single slow rclone upload, folder listing, MD5/read-back verification, or Drive file-id lookup emits a periodic `waiting` heartbeat with elapsed seconds and the bounded timeout. It never estimates remaining time.
+- GitHub marker lookup and comment posting are named progress stages; `gh` calls remain bounded by their own timeout.
+- Failures add a `retryable` stage with the next retry time and state whether only the upload or only the publication is retried. When `delivery.max_attempts` is reached, publication becomes `EXHAUSTED` and `dispatch status` asks for a manual `dispatch deliver`.
+- Upload retries honor the recorded `next_attempt_at`; a normal poll does not bypass backoff. `--force` performs an operator-controlled immediate retry.
 - Progress never includes Issue instructions, prompt text, environment contents, tokens, or local workspace paths. Local paths in error text are replaced with `<local>` before printing.
 - The final poll summary includes `elapsed_seconds`. In watch mode, elapsed time resets for each poll.
 
@@ -301,7 +304,7 @@ The service runs as the user who owns `gh` and rclone credentials. It does not r
 
 - `read_only` is an OpenCode tool-permission policy: the `plan` agent is used and `edit`/`bash` and other unspecified tools are denied through `OPENCODE_CONFIG_CONTENT`. It is **not** an operating-system sandbox. The dispatcher process runs with the Unix permissions of the user who started it.
 - A user who can modify the runtime config, the OpenCode binary, the model/provider, or the host can change behavior. Run the dispatcher under a dedicated Unix account if you need stronger host-level isolation.
-- If the dispatcher process is killed, an already-started OpenCode child process may continue. The ledger prevents automatic re-execution and marks the request `NEEDS_ATTENTION`; read-only mode limits the effect, but `workspace_write` requires operator care.
+- SIGINT and SIGTERM attempt to stop the OpenCode and rclone child process groups before the dispatcher exits. A forced `SIGKILL` cannot run cleanup, so an already-started OpenCode child may continue. The ledger prevents automatic re-execution and marks the request `NEEDS_ATTENTION`; read-only mode limits the effect, but `workspace_write` requires operator care.
 - `allowed_users` matches GitHub login names, not immutable account IDs. Login renames must be handled by the repository owner.
 - Uploaded `REPORT.md` files currently include the local run directory path as audit evidence. They are stored in the user's private Drive; GitHub delivery comments contain only identifiers and verified URLs. Upload receipts omit local filesystem paths.
 - The model can read files allowed by the OpenCode read permission within the workspace. `.env`-style files are denied by pattern, but this is not a substitute for OS-level secret isolation.
@@ -329,10 +332,13 @@ Deterministic tests use fake GitHub, fake OpenCode, and fake rclone. They cover:
 - project and session isolation;
 - cwd/PWD correctness;
 - execution → task/run attribution;
-- upload retry without model restart;
-- publication retry without duplicate links;
+- upload retry without model restart and upload backoff without `--force`;
+- publication retry without duplicate links and `delivery.max_attempts` exhaustion;
+- long OpenCode execution heartbeat with no prompt or path leakage;
+- execution timeout and dispatcher SIGTERM terminating the child process;
 - restart after claim and after verified upload;
 - stale remote `COMPLETE.json` reconciliation and receipts;
+- `--watch --json` newline-delimited JSON purity;
 - core capture with dispatch disabled;
 - configuration preservation across install/upgrade/rollback.
 

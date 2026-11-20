@@ -98,15 +98,18 @@ def record_status_view(
     retry_at = None
 
     if status in ("CLAIMED", "RUNNING"):
-        if runner_alive is False:
+        stall_age = started_age if status == "RUNNING" else updated_age
+        if runner_alive is False or (
+            runner_alive is None and stall_age is not None and stall_age > timeout_seconds + 120
+        ):
             health = STALLED
             phase = "stalled_execution"
             stalled = True
             next_action = (
-                "The dispatcher process is no longer alive. Run agent-handoff dispatch run --once "
+                "The recorded dispatcher process is not alive. Run agent-handoff dispatch run --once "
                 "to reconcile from persisted session output without re-executing OpenCode."
             )
-        elif started_age is not None and started_age > timeout_seconds + 120:
+        elif stall_age is not None and stall_age > timeout_seconds + 120:
             health = STALLED
             phase = "stalled_execution"
             stalled = True
@@ -119,10 +122,16 @@ def record_status_view(
             phase = "executing" if status == "RUNNING" else "claimed"
             elapsed = started_age if status == "RUNNING" else updated_age
             detail = f" for {elapsed}s" if elapsed is not None else ""
-            next_action = (
-                f"OpenCode is executing{detail} under a bounded {timeout_seconds:g}s timeout; "
-                "wait and do not submit a duplicate issue."
-            )
+            if status == "RUNNING":
+                next_action = (
+                    f"OpenCode is executing{detail} under a bounded {timeout_seconds:g}s timeout; "
+                    "wait and do not submit a duplicate issue."
+                )
+            else:
+                next_action = (
+                    f"The request is claimed{detail} by a live dispatcher process; execution startup is in "
+                    "progress. Wait and do not submit a duplicate issue."
+                )
     elif status == "EXECUTION_COMPLETED":
         health = PENDING
         phase = "pending_capture"
@@ -130,7 +139,15 @@ def record_status_view(
     elif status in ("REPORT_CAPTURED", "UPLOAD_PENDING"):
         health, phase, next_action = _action_for_upload(view)
     elif status == "UPLOAD_VERIFIED":
-        if publication.get("status") == "FAILED":
+        if publication.get("status") == "EXHAUSTED":
+            health = ATTENTION
+            phase = "publication_exhausted"
+            next_action = (
+                "Publication retries reached dispatch.delivery.max_attempts. Use "
+                "agent-handoff dispatch deliver to publish the verified report manually; "
+                "the upload is reused and the agent is not re-executed."
+            )
+        elif publication.get("status") == "FAILED":
             health = RETRYABLE
             phase = "retry_publication"
             retry_at = publication.get("next_attempt_at")

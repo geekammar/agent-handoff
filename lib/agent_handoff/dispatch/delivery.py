@@ -152,6 +152,7 @@ def reconcile_verified_delivery(
             "receipt_remote_path": upload.get("receipt_remote_path"),
             "report_file_id": upload.get("report_file_id"),
             "receipt_file_id": upload.get("receipt_file_id"),
+            "verified_at": upload.get("verified_at"),
         }
 
     _notify(on_progress, "verifying", "resolving the verified report Drive file id")
@@ -259,16 +260,21 @@ def upload_backoff(attempts: int, retry_seconds: int = 60) -> str:
     return publication_backoff(attempts, retry_seconds)
 
 
-def publication_due(record: dict[str, Any], force: bool = False) -> bool:
-    if force:
-        return True
-    next_at = (record.get("publication") or {}).get("next_attempt_at")
-    if not next_at:
+def _retry_due(next_at: str | None, force: bool) -> bool:
+    if force or not next_at:
         return True
     try:
         return datetime.fromisoformat(str(next_at).replace("Z", "+00:00")) <= utcnow()
     except ValueError:
         return True
+
+
+def publication_due(record: dict[str, Any], force: bool = False) -> bool:
+    return _retry_due((record.get("publication") or {}).get("next_attempt_at"), force)
+
+
+def upload_due(record: dict[str, Any], force: bool = False) -> bool:
+    return _retry_due((record.get("upload") or {}).get("next_attempt_at"), force)
 
 
 def diagnose_historical_run(config: dict[str, Any], project: dict[str, Any], task_id: str, run_id: str) -> dict[str, Any]:

@@ -34,6 +34,7 @@ from .store import Store
 from .upload import Uploader
 from .util import (
     atomic_write_text,
+    graceful_sigterm,
     new_id,
     read_json,
     read_text,
@@ -1016,24 +1017,25 @@ def cmd_dispatch_run(args: argparse.Namespace) -> int:
         raise ValueError("dispatcher configuration is invalid: " + "; ".join(errors))
     reporter = _dispatch_reporter(args)
     runner = DispatchRunner(config, resolved, progress=reporter)
-    if not args.watch:
-        result = runner.run_once(force=args.force)
-        _emit_dispatch_result(result, args.json, quiet=args.quiet)
-        return 0 if result.get("ok") else 1
-    try:
-        while True:
+    with graceful_sigterm():
+        if not args.watch:
             result = runner.run_once(force=args.force)
-            if args.json:
-                print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
-            else:
-                _emit_dispatch_result(result, args.json, quiet=args.quiet)
-            sys.stdout.flush()
-            if not result.get("ok") and args.stop_on_error:
-                return 1
-            time.sleep(max(5, int(resolved.get("poll_interval_seconds", 30))))
-    except KeyboardInterrupt:
-        print("dispatcher stopped", file=sys.stderr)
-        return 130
+            _emit_dispatch_result(result, args.json, quiet=args.quiet)
+            return 0 if result.get("ok") else 1
+        try:
+            while True:
+                result = runner.run_once(force=args.force)
+                if args.json:
+                    print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+                else:
+                    _emit_dispatch_result(result, args.json, quiet=args.quiet)
+                sys.stdout.flush()
+                if not result.get("ok") and args.stop_on_error:
+                    return 1
+                time.sleep(max(5, int(resolved.get("poll_interval_seconds", 30))))
+        except KeyboardInterrupt:
+            print("dispatcher stopped", file=sys.stderr)
+            return 130
 
 
 def cmd_dispatch_status(args: argparse.Namespace) -> int:
@@ -1108,6 +1110,11 @@ def cmd_dispatch_inspect(args: argparse.Namespace) -> int:
 
 
 def cmd_dispatch_deliver(args: argparse.Namespace) -> int:
+    with graceful_sigterm():
+        return _cmd_dispatch_deliver(args)
+
+
+def _cmd_dispatch_deliver(args: argparse.Namespace) -> int:
     config = load_config()
     reporter = _dispatch_reporter(args)
     store = Store(config)
@@ -1240,7 +1247,9 @@ def cmd_dispatch_deliver(args: argparse.Namespace) -> int:
                 "published_at": published_at,
                 "comment_url": comment_url,
                 "last_error": None,
-            }
+                "next_attempt_at": None,
+            },
+            "attention_reason": None,
         },
     )
     data = {

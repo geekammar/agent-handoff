@@ -42,6 +42,7 @@ def main() -> int:
     message = "msg_fake_0001"
     log_call(
         {
+            "pid": os.getpid(),
             "cwd": os.getcwd(),
             "PWD": os.environ.get("PWD"),
             "session": session,

@@ -316,6 +316,199 @@ class DispatchTests(unittest.TestCase):
         self.assertFalse(validation["ok"])
         self.assertTrue(any("cross-project" in item for item in validation["errors"]))
 
+    def test_upload_backoff_is_honored_without_force(self) -> None:
+        self.h.add_issue(number=1, body=request_body())
+        marker = self.root / "fail-upload-backoff-once"
+        marker.write_text("1", encoding="utf-8")
+        first = self.h.dispatch(extra_env={"FAKE_FAIL_ONCE_FILE": str(marker)}, check=False)
+        self.assertEqual(first["executed"], 1)
+        self.assertEqual(first["uploaded"], 0)
+        record = self.h.record(1)
+        next_at = record["upload"]["next_attempt_at"]
+        self.assertTrue(next_at)
+        attempts = record["upload"]["attempts"]
+        skipped = self.h.dispatch()
+        self.assertEqual(skipped["uploaded"], 0)
+        self.assertEqual(skipped["executed"], 0)
+        unchanged = self.h.record(1)
+        self.assertEqual(unchanged["upload"]["attempts"], attempts)
+        self.assertEqual(unchanged["upload"]["next_attempt_at"], next_at)
+        self.assertEqual(len(self.h.opencode_calls()), 1)
+        self.assertEqual(len(self.h.comments(1)), 0)
+        forced = self.h.dispatch("--force")
+        self.assertEqual(forced["uploaded"], 1)
+        self.assertEqual(forced["published"], 1)
+        self.assertEqual(len(self.h.opencode_calls()), 1)
+
+    def test_publication_max_attempts_stops_automatic_retry(self) -> None:
+        self.h.config["dispatch"]["delivery"]["max_attempts"] = 1
+        self.h.write_config()
+        self.h.add_issue(number=1, body=request_body())
+        marker = self.root / "fail-comment-exhaust-once"
+        marker.write_text("1", encoding="utf-8")
+        first = self.h.dispatch(extra_env={"FAKE_GH_FAIL_COMMENT_FILE": str(marker)}, check=False)
+        self.assertEqual(first["executed"], 1)
+        self.assertEqual(first["published"], 0)
+        record = self.h.record(1)
+        self.assertEqual(record["status"], "UPLOAD_VERIFIED")
+        self.assertEqual(record["publication"]["status"], "EXHAUSTED")
+        self.assertIsNone(record["publication"]["next_attempt_at"])
+        self.assertTrue(record["attention_reason"])
+        status = self.h.jrun(["dispatch", "status", "--json"])["records"][0]
+        self.assertEqual(status["health"], "attention")
+        self.assertEqual(status["phase"], "publication_exhausted")
+        self.assertIn("dispatch deliver", status["next_action"])
+        comment_calls = [call for call in self.h.gh_calls() if call[:2] == ["issue", "comment"]]
+        skipped = self.h.dispatch()
+        self.assertEqual(skipped["published"], 0)
+        self.assertEqual(
+            len([call for call in self.h.gh_calls() if call[:2] == ["issue", "comment"]]),
+            len(comment_calls),
+        )
+        forced = self.h.dispatch("--force")
+        self.assertEqual(forced["published"], 1)
+        self.assertEqual(len(self.h.comments(1)), 1)
+        self.assertEqual(self.h.record(1)["status"], "ISSUE_UPDATED")
+
+    def test_long_execution_emits_heartbeat_without_prompt_or_path(self) -> None:
+        from agent_handoff.dispatch.adapters.base import ExecutionRequest
+        from agent_handoff.dispatch.adapters.opencode import OpenCodeAdapter
+
+        messages: list[tuple[str, str]] = []
+        env = self.h.env({"FAKE_OPENCODE_DELAY": "0.5"})
+        with mock.patch.dict(os.environ, env, clear=False):
+            adapter = OpenCodeAdapter(
+                {"timeout_seconds": 10, "permission_profile": "read_only", "allow_write": False}
+            )
+            result = adapter.run(
+                ExecutionRequest(
+                    model="provider/model-fast",
+                    workspace=str(self.h.project_path.resolve()),
+                    title="Heartbeat check",
+                    instructions="SENSITIVE-INSTRUCTION-MARKER",
+                    permission_profile="read_only",
+                    allow_write=False,
+                    timeout_seconds=10,
+                ),
+                events_path=str(self.root / "heartbeat-events.jsonl"),
+                on_session=lambda _session_id: None,
+                on_progress=lambda stage, message: messages.append((stage, message)),
+                heartbeat_seconds=0.1,
+            )
+        self.assertEqual(result.outcome, "succeeded")
+        heartbeat = " ".join(
+            message for stage, message in messages if stage == "executing" and "still running" in message
+        )
+        self.assertTrue(heartbeat, messages)
+        self.assertIn("bounded timeout", heartbeat)
+        self.assertIn("no ETA", heartbeat)
+        self.assertNotIn("SENSITIVE-INSTRUCTION-MARKER", heartbeat)
+        self.assertNotIn(str(self.h.project_path), heartbeat)
+
+    def test_execution_timeout_terminates_child_process(self) -> None:
+        from agent_handoff.dispatch.adapters.base import ExecutionRequest
+        from agent_handoff.dispatch.adapters.opencode import OpenCodeAdapter
+
+        env = self.h.env({"FAKE_OPENCODE_DELAY": "10"})
+        started = time.monotonic()
+        with mock.patch.dict(os.environ, env, clear=False):
+            adapter = OpenCodeAdapter(
+                {"timeout_seconds": 1, "permission_profile": "read_only", "allow_write": False}
+            )
+            result = adapter.run(
+                ExecutionRequest(
+                    model="provider/model-fast",
+                    workspace=str(self.h.project_path.resolve()),
+                    title="Timeout check",
+                    instructions="Timeout cleanup.",
+                    permission_profile="read_only",
+                    allow_write=False,
+                    timeout_seconds=1,
+                ),
+                events_path=str(self.root / "timeout-events.jsonl"),
+                on_session=lambda _session_id: None,
+                heartbeat_seconds=0.2,
+            )
+        elapsed = time.monotonic() - started
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.outcome, "blocked")
+        self.assertLess(elapsed, 8)
+        pid = self.h.opencode_calls()[-1]["pid"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail(f"OpenCode child process {pid} survived the execution timeout")
+
+    def test_sigterm_stops_dispatcher_and_terminates_opencode_child(self) -> None:
+        self.h.add_issue(number=1, body=request_body())
+        env = self.h.env({"FAKE_OPENCODE_DELAY": "30"})
+        process = subprocess.Popen(
+            [sys.executable, str(BIN), "dispatch", "run", "--once", "--json"],
+            cwd=str(self.h.root),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        child_pid = None
+        try:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                calls = self.h.opencode_calls()
+                if calls and calls[-1].get("pid"):
+                    child_pid = int(calls[-1]["pid"])
+                    break
+                if process.poll() is not None:
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(child_pid)
+            os.kill(process.pid, signal.SIGTERM)
+            process.communicate(timeout=20)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 143)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(int(child_pid), 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail(f"OpenCode child process {child_pid} survived dispatcher SIGTERM")
+
+    def test_watch_json_writes_one_valid_json_object_per_line(self) -> None:
+        process = subprocess.Popen(
+            [sys.executable, str(BIN), "dispatch", "run", "--watch", "--json"],
+            cwd=str(self.h.root),
+            env=self.h.env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            first_line = process.stdout.readline() if process.stdout else ""
+            self.assertTrue(first_line.strip(), "watch mode produced no JSON line")
+            data = json.loads(first_line)
+            self.assertTrue(data["ok"], data)
+            os.killpg(process.pid, signal.SIGINT)
+            _stdout, _stderr = process.communicate(timeout=15)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 130)
+        self.assertEqual(_stdout.strip(), "")
+
     def test_upload_failure_retries_without_restarting_opencode(self) -> None:
         self.h.add_issue(number=1, body=request_body())
         marker = self.root / "fail-upload-once"
@@ -431,6 +624,39 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(self.h.opencode_calls(), [])
         self.assertEqual(len(self.h.comments(1)), 1)
 
+    def test_deliver_progress_stays_on_stderr_and_json_stdout_stays_valid(self) -> None:
+        item = self.h.create_run("opencode", "Deliver progress", "PRIVATE-PROMPT-MARKER", "Deliver progress report.")
+        self.h.complete(item)
+        self.h.jrun(["retry-upload", "--force", "--json"])
+        self.h.add_issue(number=1, body="historical delivery without the metadata block")
+        task_id = item["task"]["task_id"]
+        run_id = item["run"]["run_id"]
+        result = self.h.run(
+            [
+                "dispatch",
+                "deliver",
+                "--task",
+                task_id,
+                "--run",
+                run_id,
+                "--project",
+                "Alpha",
+                "--issue",
+                "1",
+                "--repository",
+                GH_REPO,
+                "--json",
+                "--progress",
+            ]
+        )
+        data = json.loads(result.stdout)
+        self.assertTrue(data["ok"], data)
+        self.assertFalse(data["opencode_executed"])
+        self.assertIn("verifying:", result.stderr)
+        self.assertIn("completed:", result.stderr)
+        self.assertNotIn("PRIVATE-PROMPT-MARKER", result.stderr)
+        self.assertNotIn(str(self.h.project_path), result.stderr)
+
     def test_manual_delivery_reconciles_stale_remote_complete_without_execution(self) -> None:
         item = self.h.create_run("opencode", "Historical reconciliation", "PROMPT-HIST", "Historical report.")
         self.h.complete(item)
@@ -499,6 +725,23 @@ class DispatchTests(unittest.TestCase):
         )
         self.assertTrue(again["reused_comment"])
         self.assertEqual(len(self.h.comments(1)), 1)
+        from agent_handoff.dispatch.delivery import reconcile_verified_delivery
+        from agent_handoff.store import Store
+        from agent_handoff.upload import Uploader
+
+        store = Store(self.h.config)
+        reused = reconcile_verified_delivery(
+            self.h.config,
+            store,
+            Uploader(self.h.config, store),
+            self.h.config["projects"]["alpha"],
+            task_id,
+            run_id,
+        )
+        self.assertTrue(reused["ok"])
+        self.assertTrue(reused["reused"])
+        self.assertTrue(reused["verified_at"])
+        self.assertEqual(reused["report_url"], result["report_url"])
 
     def test_progress_is_visible_before_slow_upload_and_stdout_stays_json(self) -> None:
         self.h.add_issue(number=1, body=request_body())
@@ -588,6 +831,33 @@ class DispatchTests(unittest.TestCase):
         self.assertNotIn("ETA:", heartbeat)
         self.assertNotIn(str(self.h.project_path), heartbeat)
 
+    def test_slow_folder_listing_emits_heartbeat_without_a_path(self) -> None:
+        from agent_handoff import upload as upload_module
+        from agent_handoff.store import Store
+        from agent_handoff.upload import Uploader
+
+        config = json.loads(json.dumps(self.h.config))
+        project = config["projects"]["alpha"]
+        messages: list[tuple[str, str]] = []
+        old_interval = upload_module.HEARTBEAT_SECONDS
+        upload_module.HEARTBEAT_SECONDS = 0.1
+        try:
+            with mock.patch.dict(os.environ, self.h.env({"FAKE_SLOW_LSF_SECONDS": "0.5"}), clear=False):
+                result = Uploader(config, Store(config)).verify_project(
+                    project,
+                    on_progress=lambda stage, message: messages.append((stage, message)),
+                )
+        finally:
+            upload_module.HEARTBEAT_SECONDS = old_interval
+        self.assertTrue(result["ok"], result)
+        waiting = [message for stage, message in messages if stage == "waiting"]
+        self.assertTrue(waiting, messages)
+        heartbeat = " ".join(waiting)
+        self.assertIn("folder listing", heartbeat)
+        self.assertIn("bounded timeout", heartbeat)
+        self.assertIn("no ETA", heartbeat)
+        self.assertNotIn(str(self.h.project_path), heartbeat)
+
     def test_progress_reporter_redacts_local_paths_and_secrets(self) -> None:
         from io import StringIO
 
@@ -651,8 +921,35 @@ class DispatchTests(unittest.TestCase):
         stalled = self.h.jrun(["dispatch", "status", "--issue", "2", "--json"])["records"][0]
         self.assertEqual(stalled["health"], "stalled")
         self.assertTrue(stalled["stalled"])
-        self.assertIn("no longer alive", stalled["next_action"])
+        self.assertIn("not alive", stalled["next_action"])
         self.assertEqual(len(self.h.opencode_calls()), 1)
+
+        issue = self.h.add_issue(number=3, body=request_body(instructions="Legacy stalled task"))
+        legacy = new_dispatch_record(
+            repository=GH_REPO,
+            issue=issue,
+            project={
+                "name": "Alpha",
+                "core_key": "alpha",
+                "core_name": "Alpha",
+                "workspace": str(self.h.project_path.resolve()),
+                "drive_folder_id": "alpha_folder_0001",
+            },
+            agent="opencode",
+            model="provider/model-fast",
+            request={"version": "1", "instructions": "stored request"},
+        )
+        ledger.create(legacy)
+        ledger.set_status(
+            GH_REPO,
+            3,
+            "RUNNING",
+            note="simulated legacy record without a runner pid",
+            updates={"execution": {"status": "RUNNING", "started_at": "2020-01-01T00:00:00Z"}},
+        )
+        legacy_stalled = self.h.jrun(["dispatch", "status", "--issue", "3", "--json"])["records"][0]
+        self.assertEqual(legacy_stalled["health"], "stalled")
+        self.assertTrue(legacy_stalled["stalled"])
 
     def test_interrupted_upload_restart_keeps_identity_and_does_not_rerun(self) -> None:
         self.h.add_issue(number=1, body=request_body())

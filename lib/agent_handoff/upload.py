@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -127,34 +128,54 @@ class Uploader:
         started = time.monotonic()
         deadline = started + timeout
         try:
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
         except OSError as exc:
             return subprocess.CompletedProcess(args=command, returncode=127, stdout="", stderr=str(exc))
         next_beat = started + heartbeat_seconds
-        while True:
-            now = time.monotonic()
-            remaining = deadline - now
-            if remaining <= 0:
-                process.kill()
+        try:
+            while True:
+                now = time.monotonic()
+                remaining = deadline - now
+                if remaining <= 0:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except OSError:
+                        process.kill()
+                    try:
+                        process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    return subprocess.CompletedProcess(args=command, returncode=124, stdout="", stderr=f"timeout after {timeout}s")
+                wait = min(remaining, max(0.05, next_beat - now))
+                try:
+                    stdout, stderr = process.communicate(timeout=wait)
+                    return subprocess.CompletedProcess(args=command, returncode=process.returncode, stdout=stdout, stderr=stderr)
+                except subprocess.TimeoutExpired:
+                    now = time.monotonic()
+                    if now >= next_beat:
+                        _notify(
+                            on_progress,
+                            "waiting",
+                            f"{action} is still in progress after {now - started:.0f}s "
+                            f"(bounded timeout {timeout:g}s; no ETA)",
+                        )
+                        next_beat = now + heartbeat_seconds
+        finally:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    process.kill()
                 try:
                     process.communicate(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
-                return subprocess.CompletedProcess(args=command, returncode=124, stdout="", stderr=f"timeout after {timeout}s")
-            wait = min(remaining, max(0.05, next_beat - now))
-            try:
-                stdout, stderr = process.communicate(timeout=wait)
-                return subprocess.CompletedProcess(args=command, returncode=process.returncode, stdout=stdout, stderr=stderr)
-            except subprocess.TimeoutExpired:
-                now = time.monotonic()
-                if now >= next_beat:
-                    _notify(
-                        on_progress,
-                        "waiting",
-                        f"{action} is still in progress after {now - started:.0f}s "
-                        f"(bounded timeout {timeout:g}s; no ETA)",
-                    )
-                    next_beat = now + heartbeat_seconds
 
     def check_connection(self, timeout: float = 90.0) -> dict[str, Any]:
         ready, error = self.remote_ready()
@@ -177,13 +198,21 @@ class Uploader:
             "config": str(self.config_file()),
         }
 
-    def list_folder_ids(self, folder_id: str, timeout: float = 90.0) -> dict[str, Any]:
+    def list_folder_ids(
+        self,
+        folder_id: str,
+        timeout: float = 90.0,
+        on_progress: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
         cached = self._listing_cache.get(folder_id)
         if cached and cached[0] > time.monotonic():
             return cached[1]
         result = self._run(
             ["lsf", self.remote_spec(folder_id), "--dirs-only", "--format", "pi"],
             timeout=timeout,
+            on_progress=on_progress,
+            heartbeat_seconds=HEARTBEAT_SECONDS,
+            action="rclone Drive folder listing",
         )
         if result.returncode != 0:
             return {"ok": False, "error": sanitize_error(result.stderr or result.stdout), "items": {}}
@@ -246,7 +275,13 @@ class Uploader:
             }
         return {"ok": True, "projects": projects, "root_items": root["items"]}
 
-    def verify_project(self, project: dict[str, Any], create: bool = False, timeout: float = 90.0) -> dict[str, Any]:
+    def verify_project(
+        self,
+        project: dict[str, Any],
+        create: bool = False,
+        timeout: float = 90.0,
+        on_progress: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
         cache_key = f"{project.get('key')}:{project.get('drive_folder_id')}"
         if not create:
             cached = self._project_verify_cache.get(cache_key)
@@ -259,7 +294,7 @@ class Uploader:
         folder_id = project.get("drive_folder_id")
         if not folder_id and not create:
             return {"ok": False, "error": f"project '{project['name']}' has no Drive folder id; run: agent-handoff project add --name \"{project['name']}\""}
-        listing = self.list_folder_ids(root_id, timeout=timeout)
+        listing = self.list_folder_ids(root_id, timeout=timeout, on_progress=on_progress)
         if not listing.get("ok"):
             return {"ok": False, "error": f"cannot list 03 Agent Execution Reports: {listing.get('error')}"}
         items = listing["items"]
@@ -287,7 +322,7 @@ class Uploader:
         if result.returncode != 0:
             return {"ok": False, "error": sanitize_error(result.stderr or result.stdout)}
         self._listing_cache.pop(root_id, None)
-        listing = self.list_folder_ids(root_id, timeout=timeout)
+        listing = self.list_folder_ids(root_id, timeout=timeout, on_progress=on_progress)
         if not listing.get("ok"):
             return {"ok": False, "error": f"folder created but cannot be listed: {listing.get('error')}"}
         folder_id = listing["items"].get(project["name"])
@@ -635,7 +670,7 @@ class Uploader:
                     self._queue_failure(item, f"project is no longer configured: {data.get('project')}")
                     summary["failed"] += 1
                     continue
-                verification = self.verify_project(project)
+                verification = self.verify_project(project, on_progress=on_progress)
                 if not verification.get("ok"):
                     prior_attempts = int(data.get("attempts", 0))
                     self._queue_failure(item, verification.get("error") or "project folder verification failed")
