@@ -226,7 +226,7 @@ agent-handoff dispatch deliver --task <task-id> --run <run-id> \
   --issue <number> --repository owner/private-dispatch
 ```
 
-Progress reports discovered, validated, executing, captured, uploading, verifying, receipt reconciliation, publishing, and completion stages with elapsed time. It never prints Issue instructions, prompt text, tokens, or local workspace paths. `--quiet` suppresses human progress without changing JSON stdout. `dispatch deliver` reconciles an existing run and publishes its verified URL. It never invokes an agent.
+Progress reports discovered, validated, executing, captured, uploading, verifying, receipt reconciliation, publishing, and completion stages with elapsed time, plus a periodic heartbeat during slow uploads or verification without inventing an ETA. It never prints Issue instructions, prompt text, tokens, or local workspace paths. `--quiet` suppresses human progress without changing JSON stdout. `dispatch deliver` reconciles an existing run and publishes its verified URL. It never invokes an agent.
 
 See [docs/DISPATCH.md](docs/DISPATCH.md) for the state machine, trust model, exact commands, systemd user-service example, and recovery procedures.
 

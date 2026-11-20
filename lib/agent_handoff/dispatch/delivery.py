@@ -155,7 +155,7 @@ def reconcile_verified_delivery(
         }
 
     _notify(on_progress, "verifying", "resolving the verified report Drive file id")
-    report_file = uploader.remote_file_id(report_remote_path, project)
+    report_file = uploader.remote_file_id(report_remote_path, project, on_progress=on_progress)
     if not report_file.get("ok"):
         return {"ok": False, "error": report_file.get("error") or "cannot resolve the report Drive file id"}
 
@@ -175,7 +175,7 @@ def reconcile_verified_delivery(
     receipt_upload = uploader.upload_file(receipt_path, receipt_remote_path, project, on_progress=on_progress)
     if not receipt_upload.get("ok"):
         return {"ok": False, "error": receipt_upload.get("error") or "upload receipt failed"}
-    receipt_file = uploader.remote_file_id(receipt_remote_path, project)
+    receipt_file = uploader.remote_file_id(receipt_remote_path, project, on_progress=on_progress)
     if not receipt_file.get("ok"):
         return {"ok": False, "error": receipt_file.get("error") or "cannot resolve the receipt Drive file id"}
 

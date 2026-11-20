@@ -248,11 +248,12 @@ Progress stages describe observed work, not guesses:
 
 ```text
 discovering -> discovered -> validated -> claimed -> executing -> executed
--> capturing -> captured -> uploading -> verifying -> receipt
+-> capturing -> captured -> uploading -> waiting -> verifying -> receipt
 -> reconciling -> publishing -> completed
 ```
 
 - Long operations say they are bounded and cite the configured timeout; no total ETA is invented.
+- A single slow rclone upload, MD5/read-back verification, or Drive file-id lookup emits a periodic `waiting` heartbeat with elapsed seconds and the bounded timeout. It never estimates remaining time.
 - Failures add a `retryable` stage with the next retry time and state whether only the upload or only the publication is retried.
 - Progress never includes Issue instructions, prompt text, environment contents, tokens, or local workspace paths. Local paths in error text are replaced with `<local>` before printing.
 - The final poll summary includes `elapsed_seconds`. In watch mode, elapsed time resets for each poll.

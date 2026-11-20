@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "lib") not in sys.path:
@@ -552,6 +553,55 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(json.loads(quiet.stdout)["ok"])
         self.assertEqual(quiet.stderr.strip(), "")
         self.assertEqual(len(self.h.opencode_calls()), 2)
+
+    def test_long_upload_emits_periodic_heartbeat_without_an_eta(self) -> None:
+        from agent_handoff import upload as upload_module
+        from agent_handoff.store import Store
+        from agent_handoff.upload import Uploader
+
+        config = json.loads(json.dumps(self.h.config))
+        project = config["projects"]["alpha"]
+        store = Store(config)
+        local = store.data_root / "heartbeat-report.md"
+        local.write_text("# heartbeat\n", encoding="utf-8")
+        messages: list[tuple[str, str]] = []
+        old_interval = upload_module.HEARTBEAT_SECONDS
+        upload_module.HEARTBEAT_SECONDS = 0.1
+        try:
+            with mock.patch.dict(os.environ, self.h.env({"FAKE_SLOW_SECONDS": "0.5"}), clear=False):
+                result = Uploader(config, store).upload_file(
+                    local,
+                    "TASKS/heartbeat/RUNS/r-heartbeat/REPORT.md",
+                    project,
+                    timeout=10,
+                    on_progress=lambda stage, message: messages.append((stage, message)),
+                )
+        finally:
+            upload_module.HEARTBEAT_SECONDS = old_interval
+        self.assertTrue(result["ok"], result)
+        waiting = [message for stage, message in messages if stage == "waiting"]
+        self.assertTrue(waiting, messages)
+        heartbeat = " ".join(waiting)
+        self.assertIn("still in progress", heartbeat)
+        self.assertIn("bounded timeout", heartbeat)
+        self.assertIn("no ETA", heartbeat)
+        self.assertNotIn("ETA:", heartbeat)
+        self.assertNotIn(str(self.h.project_path), heartbeat)
+
+    def test_progress_reporter_redacts_local_paths_and_secrets(self) -> None:
+        from io import StringIO
+
+        from agent_handoff.dispatch.progress import ProgressReporter
+
+        stream = StringIO()
+        reporter = ProgressReporter(enabled=True, stream=stream)
+        reporter.add_redaction(str(self.h.project_path))
+        reporter.emit("uploading", f"copying {self.h.project_path}/report.md API_KEY=supersecretvalue123")
+        text = stream.getvalue()
+        self.assertNotIn(str(self.h.project_path), text)
+        self.assertNotIn("supersecretvalue123", text)
+        self.assertIn("<local>", text)
+        self.assertIn("[REDACTED]", text)
 
     def test_status_explains_delivered_runs_and_dead_execution(self) -> None:
         self.h.add_issue(number=1, body=request_body())

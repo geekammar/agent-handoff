@@ -26,6 +26,7 @@ from .util import (
 )
 
 REMOTE_TIMEOUT = 120.0
+HEARTBEAT_SECONDS = 5.0
 
 
 def _notify(callback: Callable[[str, str], None] | None, stage: str, message: str) -> None:
@@ -93,17 +94,67 @@ class Uploader:
             raise ValueError("remote path escapes project folder")
         return f"{self.remote_name},root_folder_id={folder_id}:{rel}"
 
-    def _run(self, args: list[str], timeout: float = REMOTE_TIMEOUT) -> subprocess.CompletedProcess:
+    def _run(
+        self,
+        args: list[str],
+        timeout: float = REMOTE_TIMEOUT,
+        *,
+        on_progress: Callable[[str, str], None] | None = None,
+        heartbeat_seconds: float | None = None,
+        action: str | None = None,
+    ) -> subprocess.CompletedProcess:
         binary = self.rclone()
         if not binary:
             return subprocess.CompletedProcess(args=["rclone", *args], returncode=127, stdout="", stderr="rclone is not installed")
         command = [binary, *args]
+        if on_progress is not None and heartbeat_seconds and heartbeat_seconds > 0:
+            return self._run_with_heartbeat(command, timeout, on_progress, heartbeat_seconds, action or "the rclone operation")
         try:
             return subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
         except subprocess.TimeoutExpired:
             return subprocess.CompletedProcess(args=command, returncode=124, stdout="", stderr=f"timeout after {timeout}s")
         except OSError as exc:
             return subprocess.CompletedProcess(args=command, returncode=127, stdout="", stderr=str(exc))
+
+    def _run_with_heartbeat(
+        self,
+        command: list[str],
+        timeout: float,
+        on_progress: Callable[[str, str], None],
+        heartbeat_seconds: float,
+        action: str,
+    ) -> subprocess.CompletedProcess:
+        started = time.monotonic()
+        deadline = started + timeout
+        try:
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except OSError as exc:
+            return subprocess.CompletedProcess(args=command, returncode=127, stdout="", stderr=str(exc))
+        next_beat = started + heartbeat_seconds
+        while True:
+            now = time.monotonic()
+            remaining = deadline - now
+            if remaining <= 0:
+                process.kill()
+                try:
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                return subprocess.CompletedProcess(args=command, returncode=124, stdout="", stderr=f"timeout after {timeout}s")
+            wait = min(remaining, max(0.05, next_beat - now))
+            try:
+                stdout, stderr = process.communicate(timeout=wait)
+                return subprocess.CompletedProcess(args=command, returncode=process.returncode, stdout=stdout, stderr=stderr)
+            except subprocess.TimeoutExpired:
+                now = time.monotonic()
+                if now >= next_beat:
+                    _notify(
+                        on_progress,
+                        "waiting",
+                        f"{action} is still in progress after {now - started:.0f}s "
+                        f"(bounded timeout {timeout:g}s; no ETA)",
+                    )
+                    next_beat = now + heartbeat_seconds
 
     def check_connection(self, timeout: float = 90.0) -> dict[str, Any]:
         ready, error = self.remote_ready()
@@ -270,10 +321,23 @@ class Uploader:
                 return tmp, count, True
         return local, 0, False
 
-    def verify_remote_file(self, remote_rel: str, local: Path, project: dict[str, Any], timeout: float = 60.0) -> dict[str, Any]:
+    def verify_remote_file(
+        self,
+        remote_rel: str,
+        local: Path,
+        project: dict[str, Any],
+        timeout: float = 60.0,
+        on_progress: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
         remote = self.remote_spec(project["drive_folder_id"], remote_rel)
         local_md5 = md5_file(local)
-        result = self._run(["md5sum", remote], timeout=timeout)
+        result = self._run(
+            ["md5sum", remote],
+            timeout=timeout,
+            on_progress=on_progress,
+            heartbeat_seconds=HEARTBEAT_SECONDS,
+            action="rclone MD5 verification",
+        )
         remote_md5 = ""
         if result.returncode == 0:
             first = (result.stdout or "").strip().splitlines()[0] if (result.stdout or "").strip() else ""
@@ -292,7 +356,13 @@ class Uploader:
         os.close(fd)
         tmp = Path(tmp_name)
         try:
-            readback = self._run(["copyto", remote, str(tmp)], timeout=timeout)
+            readback = self._run(
+                ["copyto", remote, str(tmp)],
+                timeout=timeout,
+                on_progress=on_progress,
+                heartbeat_seconds=HEARTBEAT_SECONDS,
+                action="rclone read-back verification",
+            )
             if readback.returncode != 0:
                 return {
                     "verified": False,
@@ -333,7 +403,13 @@ class Uploader:
         parent = str(Path(remote_rel).parent)
         mkdir_key = f"{project['drive_folder_id']}:{parent}"
         if parent and parent != "." and mkdir_key not in self._mkdir_cache:
-            mkdir = self._run(["mkdir", self.remote_spec(project["drive_folder_id"], parent)], timeout=timeout)
+            mkdir = self._run(
+                ["mkdir", self.remote_spec(project["drive_folder_id"], parent)],
+                timeout=timeout,
+                on_progress=on_progress,
+                heartbeat_seconds=HEARTBEAT_SECONDS,
+                action="rclone remote folder creation",
+            )
             if mkdir.returncode != 0:
                 return {"ok": False, "error": sanitize_error(mkdir.stderr or mkdir.stdout), "redactions": 0}
             self._mkdir_cache.add(mkdir_key)
@@ -343,11 +419,14 @@ class Uploader:
             transfer = self._run(
                 ["copyto", str(sanitized), self.remote_spec(project["drive_folder_id"], remote_rel), "--ignore-times", "--stats", "0"],
                 timeout=timeout,
+                on_progress=on_progress,
+                heartbeat_seconds=HEARTBEAT_SECONDS,
+                action="rclone upload transfer",
             )
             if transfer.returncode != 0:
                 return {"ok": False, "error": sanitize_error(transfer.stderr or transfer.stdout), "redactions": redactions}
             _notify(on_progress, "verifying", f"verifying {remote_rel} with MD5/read-back (bounded timeout {timeout:g}s)")
-            verification = self.verify_remote_file(remote_rel, sanitized, project, timeout=timeout)
+            verification = self.verify_remote_file(remote_rel, sanitized, project, timeout=timeout, on_progress=on_progress)
             if not verification.get("verified"):
                 return {
                     "ok": False,
@@ -388,11 +467,29 @@ class Uploader:
             except OSError:
                 pass
 
-    def remote_file_id(self, remote_rel: str, project: dict[str, Any], timeout: float = 120.0) -> dict[str, Any]:
+    def remote_file_id(
+        self,
+        remote_rel: str,
+        project: dict[str, Any],
+        timeout: float = 120.0,
+        on_progress: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
         remote = self.remote_spec(project["drive_folder_id"], remote_rel)
-        result = self._run(["lsjson", "--stat", remote], timeout=timeout)
+        result = self._run(
+            ["lsjson", "--stat", remote],
+            timeout=timeout,
+            on_progress=on_progress,
+            heartbeat_seconds=HEARTBEAT_SECONDS,
+            action="rclone Drive file id resolution",
+        )
         if result.returncode == 124:
-            result = self._run(["lsjson", "--stat", remote], timeout=timeout)
+            result = self._run(
+                ["lsjson", "--stat", remote],
+                timeout=timeout,
+                on_progress=on_progress,
+                heartbeat_seconds=HEARTBEAT_SECONDS,
+                action="rclone Drive file id resolution",
+            )
         if result.returncode != 0:
             return {"ok": False, "error": sanitize_error(result.stderr or result.stdout or "remote file not found")}
         try:
