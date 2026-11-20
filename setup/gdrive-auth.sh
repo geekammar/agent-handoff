@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-TOKEN_FILE="${1:-/root/gdrive-token.json}"
+TOKEN_FILE="${1:-${HOME}/gdrive-token.json}"
 if [ -s "$TOKEN_FILE" ]; then
   chmod 600 "$TOKEN_FILE" 2>/dev/null || true
   exec agent-handoff auth --import-token-file "$TOKEN_FILE"
@@ -15,11 +15,11 @@ Option 1 - import a token produced elsewhere (headless-safe):
        rclone authorize "drive"
   2. Sign in with the Google account that owns "AI Project Operations".
   3. Copy the JSON token that rclone prints.
-  4. On this VPS, save it as /root/gdrive-token.json without pasting it into chat.
-     For example, run `cat > /root/gdrive-token.json`, paste the JSON, then press Ctrl-D.
+  4. On this host, save it as ~/gdrive-token.json without pasting it into chat.
+     For example, run `cat > ~/gdrive-token.json`, paste the JSON, then press Ctrl-D.
      Ensure the file is mode 600.
   5. Run:
-       agent-handoff auth --import-token-file /root/gdrive-token.json
+       agent-handoff auth --import-token-file ~/gdrive-token.json
        agent-handoff auth --check
        agent-handoff doctor
      The import command verifies Google Drive before keeping the config.

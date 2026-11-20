@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "drive": {
+    "remote": "gdrive",
+    "parent_folder_id": "",
+    "parent_folder_name": "AI Project Operations",
+    "root_folder_id": "",
+    "root_folder_name": "03 — Agent Execution Reports"
+  },
+  "projects": {
+    "project-a": {
+      "name": "ProjectA",
+      "drive_folder_id": "",
+      "paths": ["/home/dev/projects/project-a"],
+      "path_prefixes": [],
+      "aliases": ["project-a"],
+      "auto_registered": false
+    },
+    "project-b": {
+      "name": "ProjectB",
+      "drive_folder_id": "",
+      "paths": ["/home/dev/projects/project-b"],
+      "path_prefixes": [],
+      "aliases": ["project-b"],
+      "auto_registered": false
+    }
+  },
+  "workspace_roots": ["/home/dev/projects"],
+  "auto_register_projects": false,
+  "upload": {
+    "enabled": true,
+    "auto_upload": true,
+    "verify": true,
+    "timeout_seconds": 120,
+    "hook_timeout_seconds": 25,
+    "max_attempts": 0,
+    "verify_interval_minutes": 60
+  },
+  "integrations": {"opencode": true, "agy": false},
+  "security": {
+    "redact_uploads": true,
+    "max_prompt_bytes": 200000,
+    "max_summary_bytes": 50000
+  },
+  "index": {"include_pending_local": true, "max_open_issues": 20},
+  "dispatch": {
+    "enabled": false,
+    "transport": "github_issues",
+    "repository": "example-user/private-dispatch",
+    "allowed_users": ["example-user"],
+    "agent": "opencode",
+    "models": {
+      "fast": "provider/model-fast",
+      "review": "provider/model-review"
+    },
+    "default_model": "fast",
+    "projects": {
+      "ProjectA": {"workspace": "/home/dev/projects/project-a"},
+      "ProjectB": {"workspace": "/home/dev/projects/project-b"}
+    },
+    "poll_interval_seconds": 30,
+    "execution": {
+      "timeout_seconds": 1200,
+      "max_prompt_bytes": 50000,
+      "permission_profile": "read_only",
+      "allow_write": false
+    },
+    "delivery": {"retry_seconds": 60, "max_attempts": 0},
+    "github": {"command": "gh", "require_private": true}
+  }
+}

@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-MANAGED_TOP = frozenset({"bin", "lib", "integrations", "setup", "tests", "docs", "config", "README.md"})
+MANAGED_TOP = frozenset({"bin", "lib", "integrations", "setup", "tests", "docs", "config", "README.md", "AGENTS.md", "SKILL.md"})
 RUNTIME_TOP = frozenset({"data", "queue", "state", "locks", "logs", "tmp", "releases"})
 SKIPPED_PARTS = frozenset({"__pycache__", ".pytest_cache", "TASKS"})
 ROOT_ARTIFACTS = frozenset(

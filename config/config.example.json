@@ -9,7 +9,7 @@
   },
   "projects": {},
   "workspace_roots": [
-    "/root/projects"
+    "/home/dev/projects"
   ],
   "auto_register_projects": true,
   "upload": {
@@ -33,5 +33,30 @@
   "index": {
     "include_pending_local": true,
     "max_open_issues": 20
+  },
+  "dispatch": {
+    "enabled": false,
+    "transport": "github_issues",
+    "repository": "",
+    "allowed_users": [],
+    "agent": "opencode",
+    "models": {},
+    "default_model": "",
+    "projects": {},
+    "poll_interval_seconds": 30,
+    "execution": {
+      "timeout_seconds": 1200,
+      "max_prompt_bytes": 50000,
+      "permission_profile": "read_only",
+      "allow_write": false
+    },
+    "delivery": {
+      "retry_seconds": 60,
+      "max_attempts": 0
+    },
+    "github": {
+      "command": "gh",
+      "require_private": true
+    }
   }
 }

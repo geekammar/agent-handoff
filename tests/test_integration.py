@@ -22,7 +22,7 @@ class IntegrationTests(unittest.TestCase):
 
     def test_doctor_and_cli_compatibility(self) -> None:
         version = self.h.run(["--version"]).stdout.strip()
-        self.assertEqual(version, "agent-handoff 1.0.0")
+        self.assertEqual(version, "agent-handoff 1.1.0")
         doctor = json.loads(self.h.run(["doctor", "--json"], check=False).stdout)
         self.assertTrue(doctor["upload"]["remote_ready"])
         self.assertTrue(doctor["upload"]["hierarchy"]["projects"]["alpha"]["verified"])
