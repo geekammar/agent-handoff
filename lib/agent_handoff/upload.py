@@ -4,12 +4,13 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import all_projects, load_config, project_by_name
 from .store import Store
@@ -26,6 +27,16 @@ from .util import (
 )
 
 REMOTE_TIMEOUT = 120.0
+HEARTBEAT_SECONDS = 5.0
+
+
+def _notify(callback: Callable[[str, str], None] | None, stage: str, message: str) -> None:
+    if callback is None:
+        return
+    try:
+        callback(stage, message)
+    except Exception:
+        pass
 
 
 def _md5_hex(value: str) -> bool:
@@ -84,17 +95,87 @@ class Uploader:
             raise ValueError("remote path escapes project folder")
         return f"{self.remote_name},root_folder_id={folder_id}:{rel}"
 
-    def _run(self, args: list[str], timeout: float = REMOTE_TIMEOUT) -> subprocess.CompletedProcess:
+    def _run(
+        self,
+        args: list[str],
+        timeout: float = REMOTE_TIMEOUT,
+        *,
+        on_progress: Callable[[str, str], None] | None = None,
+        heartbeat_seconds: float | None = None,
+        action: str | None = None,
+    ) -> subprocess.CompletedProcess:
         binary = self.rclone()
         if not binary:
             return subprocess.CompletedProcess(args=["rclone", *args], returncode=127, stdout="", stderr="rclone is not installed")
         command = [binary, *args]
+        if on_progress is not None and heartbeat_seconds and heartbeat_seconds > 0:
+            return self._run_with_heartbeat(command, timeout, on_progress, heartbeat_seconds, action or "the rclone operation")
         try:
             return subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
         except subprocess.TimeoutExpired:
             return subprocess.CompletedProcess(args=command, returncode=124, stdout="", stderr=f"timeout after {timeout}s")
         except OSError as exc:
             return subprocess.CompletedProcess(args=command, returncode=127, stdout="", stderr=str(exc))
+
+    def _run_with_heartbeat(
+        self,
+        command: list[str],
+        timeout: float,
+        on_progress: Callable[[str, str], None],
+        heartbeat_seconds: float,
+        action: str,
+    ) -> subprocess.CompletedProcess:
+        started = time.monotonic()
+        deadline = started + timeout
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            return subprocess.CompletedProcess(args=command, returncode=127, stdout="", stderr=str(exc))
+        next_beat = started + heartbeat_seconds
+        try:
+            while True:
+                now = time.monotonic()
+                remaining = deadline - now
+                if remaining <= 0:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except OSError:
+                        process.kill()
+                    try:
+                        process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    return subprocess.CompletedProcess(args=command, returncode=124, stdout="", stderr=f"timeout after {timeout}s")
+                wait = min(remaining, max(0.05, next_beat - now))
+                try:
+                    stdout, stderr = process.communicate(timeout=wait)
+                    return subprocess.CompletedProcess(args=command, returncode=process.returncode, stdout=stdout, stderr=stderr)
+                except subprocess.TimeoutExpired:
+                    now = time.monotonic()
+                    if now >= next_beat:
+                        _notify(
+                            on_progress,
+                            "waiting",
+                            f"{action} is still in progress after {now - started:.0f}s "
+                            f"(bounded timeout {timeout:g}s; no ETA)",
+                        )
+                        next_beat = now + heartbeat_seconds
+        finally:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    process.kill()
+                try:
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
 
     def check_connection(self, timeout: float = 90.0) -> dict[str, Any]:
         ready, error = self.remote_ready()
@@ -117,13 +198,21 @@ class Uploader:
             "config": str(self.config_file()),
         }
 
-    def list_folder_ids(self, folder_id: str, timeout: float = 90.0) -> dict[str, Any]:
+    def list_folder_ids(
+        self,
+        folder_id: str,
+        timeout: float = 90.0,
+        on_progress: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
         cached = self._listing_cache.get(folder_id)
         if cached and cached[0] > time.monotonic():
             return cached[1]
         result = self._run(
             ["lsf", self.remote_spec(folder_id), "--dirs-only", "--format", "pi"],
             timeout=timeout,
+            on_progress=on_progress,
+            heartbeat_seconds=HEARTBEAT_SECONDS,
+            action="rclone Drive folder listing",
         )
         if result.returncode != 0:
             return {"ok": False, "error": sanitize_error(result.stderr or result.stdout), "items": {}}
@@ -186,7 +275,13 @@ class Uploader:
             }
         return {"ok": True, "projects": projects, "root_items": root["items"]}
 
-    def verify_project(self, project: dict[str, Any], create: bool = False, timeout: float = 90.0) -> dict[str, Any]:
+    def verify_project(
+        self,
+        project: dict[str, Any],
+        create: bool = False,
+        timeout: float = 90.0,
+        on_progress: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
         cache_key = f"{project.get('key')}:{project.get('drive_folder_id')}"
         if not create:
             cached = self._project_verify_cache.get(cache_key)
@@ -199,7 +294,7 @@ class Uploader:
         folder_id = project.get("drive_folder_id")
         if not folder_id and not create:
             return {"ok": False, "error": f"project '{project['name']}' has no Drive folder id; run: agent-handoff project add --name \"{project['name']}\""}
-        listing = self.list_folder_ids(root_id, timeout=timeout)
+        listing = self.list_folder_ids(root_id, timeout=timeout, on_progress=on_progress)
         if not listing.get("ok"):
             return {"ok": False, "error": f"cannot list 03 Agent Execution Reports: {listing.get('error')}"}
         items = listing["items"]
@@ -227,7 +322,7 @@ class Uploader:
         if result.returncode != 0:
             return {"ok": False, "error": sanitize_error(result.stderr or result.stdout)}
         self._listing_cache.pop(root_id, None)
-        listing = self.list_folder_ids(root_id, timeout=timeout)
+        listing = self.list_folder_ids(root_id, timeout=timeout, on_progress=on_progress)
         if not listing.get("ok"):
             return {"ok": False, "error": f"folder created but cannot be listed: {listing.get('error')}"}
         folder_id = listing["items"].get(project["name"])
@@ -261,10 +356,23 @@ class Uploader:
                 return tmp, count, True
         return local, 0, False
 
-    def verify_remote_file(self, remote_rel: str, local: Path, project: dict[str, Any], timeout: float = 60.0) -> dict[str, Any]:
+    def verify_remote_file(
+        self,
+        remote_rel: str,
+        local: Path,
+        project: dict[str, Any],
+        timeout: float = 60.0,
+        on_progress: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
         remote = self.remote_spec(project["drive_folder_id"], remote_rel)
         local_md5 = md5_file(local)
-        result = self._run(["md5sum", remote], timeout=timeout)
+        result = self._run(
+            ["md5sum", remote],
+            timeout=timeout,
+            on_progress=on_progress,
+            heartbeat_seconds=HEARTBEAT_SECONDS,
+            action="rclone MD5 verification",
+        )
         remote_md5 = ""
         if result.returncode == 0:
             first = (result.stdout or "").strip().splitlines()[0] if (result.stdout or "").strip() else ""
@@ -283,7 +391,13 @@ class Uploader:
         os.close(fd)
         tmp = Path(tmp_name)
         try:
-            readback = self._run(["copyto", remote, str(tmp)], timeout=timeout)
+            readback = self._run(
+                ["copyto", remote, str(tmp)],
+                timeout=timeout,
+                on_progress=on_progress,
+                heartbeat_seconds=HEARTBEAT_SECONDS,
+                action="rclone read-back verification",
+            )
             if readback.returncode != 0:
                 return {
                     "verified": False,
@@ -304,7 +418,14 @@ class Uploader:
             except OSError:
                 pass
 
-    def upload_file(self, local_path: str | Path, remote_rel: str, project: dict[str, Any], timeout: float = REMOTE_TIMEOUT) -> dict[str, Any]:
+    def upload_file(
+        self,
+        local_path: str | Path,
+        remote_rel: str,
+        project: dict[str, Any],
+        timeout: float = REMOTE_TIMEOUT,
+        on_progress: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
         local = Path(local_path)
         if not local.exists() or not local.is_file():
             return {"ok": False, "error": f"local file missing: {local}", "redactions": 0}
@@ -313,10 +434,17 @@ class Uploader:
         remote_rel = (remote_rel or "").strip().lstrip("/")
         if not remote_rel or remote_rel.startswith("..") or "/../" in remote_rel:
             return {"ok": False, "error": f"invalid remote path: {remote_rel!r}", "redactions": 0}
+        _notify(on_progress, "uploading", f"transferring {remote_rel} (bounded timeout {timeout:g}s, no total ETA)")
         parent = str(Path(remote_rel).parent)
         mkdir_key = f"{project['drive_folder_id']}:{parent}"
         if parent and parent != "." and mkdir_key not in self._mkdir_cache:
-            mkdir = self._run(["mkdir", self.remote_spec(project["drive_folder_id"], parent)], timeout=timeout)
+            mkdir = self._run(
+                ["mkdir", self.remote_spec(project["drive_folder_id"], parent)],
+                timeout=timeout,
+                on_progress=on_progress,
+                heartbeat_seconds=HEARTBEAT_SECONDS,
+                action="rclone remote folder creation",
+            )
             if mkdir.returncode != 0:
                 return {"ok": False, "error": sanitize_error(mkdir.stderr or mkdir.stdout), "redactions": 0}
             self._mkdir_cache.add(mkdir_key)
@@ -326,10 +454,14 @@ class Uploader:
             transfer = self._run(
                 ["copyto", str(sanitized), self.remote_spec(project["drive_folder_id"], remote_rel), "--ignore-times", "--stats", "0"],
                 timeout=timeout,
+                on_progress=on_progress,
+                heartbeat_seconds=HEARTBEAT_SECONDS,
+                action="rclone upload transfer",
             )
             if transfer.returncode != 0:
                 return {"ok": False, "error": sanitize_error(transfer.stderr or transfer.stdout), "redactions": redactions}
-            verification = self.verify_remote_file(remote_rel, sanitized, project, timeout=timeout)
+            _notify(on_progress, "verifying", f"verifying {remote_rel} with MD5/read-back (bounded timeout {timeout:g}s)")
+            verification = self.verify_remote_file(remote_rel, sanitized, project, timeout=timeout, on_progress=on_progress)
             if not verification.get("verified"):
                 return {
                     "ok": False,
@@ -370,11 +502,29 @@ class Uploader:
             except OSError:
                 pass
 
-    def remote_file_id(self, remote_rel: str, project: dict[str, Any], timeout: float = 120.0) -> dict[str, Any]:
+    def remote_file_id(
+        self,
+        remote_rel: str,
+        project: dict[str, Any],
+        timeout: float = 120.0,
+        on_progress: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
         remote = self.remote_spec(project["drive_folder_id"], remote_rel)
-        result = self._run(["lsjson", "--stat", remote], timeout=timeout)
+        result = self._run(
+            ["lsjson", "--stat", remote],
+            timeout=timeout,
+            on_progress=on_progress,
+            heartbeat_seconds=HEARTBEAT_SECONDS,
+            action="rclone Drive file id resolution",
+        )
         if result.returncode == 124:
-            result = self._run(["lsjson", "--stat", remote], timeout=timeout)
+            result = self._run(
+                ["lsjson", "--stat", remote],
+                timeout=timeout,
+                on_progress=on_progress,
+                heartbeat_seconds=HEARTBEAT_SECONDS,
+                action="rclone Drive file id resolution",
+            )
         if result.returncode != 0:
             return {"ok": False, "error": sanitize_error(result.stderr or result.stdout or "remote file not found")}
         try:
@@ -421,14 +571,18 @@ class Uploader:
     def _mark_run_failure(self, project: dict[str, Any], task_id: str, run_id: str, error: str, attempts: int) -> None:
         try:
             with self.store.lock():
-                _, task_path, _, run_path, _ = self.store.run_record(project, task_id, run_id)
+                _, task_path, _, run_path, complete = self.store.run_record(project, task_id, run_id)
+                try:
+                    previous = max(0, int((complete.get("upload") or {}).get("attempts") or 0))
+                except (TypeError, ValueError):
+                    previous = 0
                 self.store.update_complete(
                     run_path,
                     {
                         "upload": {
                             "status": "pending",
                             "verified": False,
-                            "attempts": attempts,
+                            "attempts": max(previous + 1, attempts),
                             "last_error": sanitize_error(error),
                         }
                     },
@@ -464,6 +618,7 @@ class Uploader:
         only_run: str | None = None,
         time_budget: float = 300.0,
         reconcile: bool = True,
+        on_progress: Callable[[str, str], None] | None = None,
     ) -> dict[str, Any]:
         lock = self.store.worker_lock()
         if not lock.acquire():
@@ -519,7 +674,7 @@ class Uploader:
                     self._queue_failure(item, f"project is no longer configured: {data.get('project')}")
                     summary["failed"] += 1
                     continue
-                verification = self.verify_project(project)
+                verification = self.verify_project(project, on_progress=on_progress)
                 if not verification.get("ok"):
                     prior_attempts = int(data.get("attempts", 0))
                     self._queue_failure(item, verification.get("error") or "project folder verification failed")
@@ -530,7 +685,7 @@ class Uploader:
                     summary["errors"].append(verification.get("error") or "project folder verification failed")
                     continue
                 if data.get("kind") == "run":
-                    result = self._process_run(project, item)
+                    result = self._process_run(project, item, on_progress=on_progress)
                 elif data.get("kind") == "index":
                     result = self._process_index(project, item)
                 else:
@@ -553,7 +708,13 @@ class Uploader:
         finally:
             lock.release()
 
-    def _process_run(self, project: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    def _process_run(
+        self,
+        project: dict[str, Any],
+        item: dict[str, Any],
+        *,
+        on_progress: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
         data = item["data"]
         task_id = data.get("task_id")
         run_id = data.get("run_id")
@@ -574,12 +735,20 @@ class Uploader:
         verified_files = []
         total_redactions = 0
         for file_item in files:
-            result = self.upload_file(file_item["local"], file_item["remote"], project)
+            result = self.upload_file(file_item["local"], file_item["remote"], project, on_progress=on_progress)
             if not result.get("ok"):
                 return {"ok": False, "error": result.get("error") or "upload failed"}
             total_redactions += int(result.get("redactions") or 0)
             verified_files.append({"remote": result.get("remote"), "size": result.get("size"), "verification": result.get("verification", {}).get("method")})
-        attempts = int(data.get("attempts", 0)) + 1
+        try:
+            queue_attempts = max(0, int(data.get("attempts") or 0))
+        except (TypeError, ValueError):
+            queue_attempts = 0
+        try:
+            recorded_attempts = max(0, int((complete.get("upload") or {}).get("attempts") or 0))
+        except (TypeError, ValueError):
+            recorded_attempts = 0
+        attempts = max(queue_attempts, recorded_attempts) + 1
         with self.store.lock():
             self.store.update_complete(
                 run_path,

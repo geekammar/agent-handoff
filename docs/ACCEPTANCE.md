@@ -114,3 +114,30 @@ Post-fix result:
 - the read-only permission probe denied a requested file write in a disposable sandbox.
 
 The review found one report-truthfulness defect: when a workspace had no Git remote, the dispatcher used the dispatch Issue repository as the code repository. That fallback was removed, a regression test was added, and the real acceptance was repeated successfully. Exact live identifiers are recorded in the release-review Agent Handoff report rather than in this source document.
+
+## v1.2 P0 deterministic acceptance
+
+Date: 2026-11-20
+
+Command:
+
+```bash
+python3 -m compileall -q lib setup tests
+sh -n setup/install.sh setup/upgrade.sh setup/rollback.sh setup/gdrive-auth.sh
+PYTHONPATH=lib python3 -m unittest discover -s tests -p "test_*.py" -v
+```
+
+Deterministic result: **56 tests passed, 0 failed**. This run used fake GitHub, fake OpenCode, and fake rclone; it does not prove a live provider, GitHub, or Drive path.
+
+Additional P0 coverage:
+
+- long OpenCode execution emits an `executing` heartbeat without prompt text or workspace paths;
+- execution timeout and dispatcher SIGTERM terminate the OpenCode child process;
+- slow rclone folder listing emits a `waiting` heartbeat without local paths;
+- `--watch --json` emits one valid compact JSON object per line;
+- `dispatch deliver --json --progress` keeps JSON on stdout and progress on stderr;
+- upload backoff is honored without `--force`;
+- `delivery.max_attempts` exhaustion stops automatic publication retries and is reported as `attention`;
+- reused delivery reconciliation preserves verified-at metadata without another upload.
+
+Live acceptance remains a separate, operator-controlled step. It was not performed as part of this change.

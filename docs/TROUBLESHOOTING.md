@@ -318,6 +318,17 @@ agent-handoff dispatch inspect --task <task-id> --run <run-id> --json
 
 If the work must be repeated, submit a new issue. Do not edit the ledger to force a rerun.
 
+## A dispatcher run was interrupted
+
+An interrupt during a slow upload is safe. The durable record keeps the existing OpenCode session, task, and run identity; it normally remains `UPLOAD_PENDING` with capture complete. Do not submit a duplicate issue and do not delete the task directory. A later poll retries only the upload and publication:
+
+```bash
+agent-handoff dispatch status
+agent-handoff dispatch run --once --progress
+```
+
+If the status says `stalled` because the dispatcher process is gone, the same command reconciles persisted session output without re-executing OpenCode. Use `--json` for scripts; progress is written to stderr.
+
 ## Upload is pending but the report is readable on Drive
 
 A readable file is not upload verification. Check:
@@ -327,7 +338,7 @@ agent-handoff dispatch status --json
 agent-handoff dispatch inspect --task <task-id> --run <run-id> --json
 ```
 
-If local verification is missing, retry the upload only:
+`dispatch status` reports `health=retryable`, `phase=retry_upload`, the next retry time, and whether only the upload will run. If local verification is missing, retry the upload only:
 
 ```bash
 agent-handoff retry-upload --force --task <task-id> --run <run-id>
@@ -344,10 +355,18 @@ This creates and verifies `UPLOAD-RECEIPT.json`, re-uploads truthful verified `C
 
 ## GitHub publication failed
 
-The report is safe; only the comment failed. The record remains `UPLOAD_VERIFIED` and retries automatically with backoff. Force a retry with:
+The report is safe; only the comment failed. The record remains `UPLOAD_VERIFIED` and retries automatically with backoff. `dispatch status` reports `health=retryable`, `phase=retry_publication`, the verified report link, and the next retry. Force a retry with:
 
 ```bash
 agent-handoff dispatch run --once --force --json
+```
+
+Only the comment is retried; the verified upload is reused.
+
+If `dispatch status` reports `health=attention` with `phase=publication_exhausted`, `dispatch.delivery.max_attempts` was reached. The verified upload is still intact. Publish manually without re-running the agent:
+
+```bash
+agent-handoff dispatch deliver --task <task-id> --run <run-id> --issue <number> --repository owner/private-dispatch --json
 ```
 
 Before posting, the dispatcher checks for the delivery marker. A retry after an uncertain comment post does not create a duplicate link.

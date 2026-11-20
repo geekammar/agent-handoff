@@ -5,12 +5,15 @@ import os
 import signal
 import subprocess
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from ...util import ensure_dir, sanitize_error, utc_from_timestamp, utcnow_iso
 from .base import ExecutionRequest, ExecutionResult
+
+EXECUTION_HEARTBEAT_SECONDS = 10.0
 
 READ_ONLY_POLICY = {
     "share": "disabled",
@@ -99,6 +102,15 @@ class OpenCodeEventParser:
         return "; ".join(sanitize_error(item, 600) for item in self.errors[:5])
 
 
+def _notify(callback: Callable[[str, str], None] | None, stage: str, message: str) -> None:
+    if callback is None:
+        return
+    try:
+        callback(stage, message)
+    except Exception:
+        pass
+
+
 def _policy(profile: str, allow_write: bool) -> dict[str, Any]:
     if profile == "workspace_write":
         if not allow_write:
@@ -162,6 +174,8 @@ class OpenCodeAdapter:
         *,
         events_path: str,
         on_session: Callable[[str], None],
+        on_progress: Callable[[str, str], None] | None = None,
+        heartbeat_seconds: float | None = None,
     ) -> ExecutionResult:
         workspace = os.path.realpath(request.workspace)
         if not os.path.isdir(workspace):
@@ -206,6 +220,11 @@ class OpenCodeAdapter:
         timed_out = False
         exit_code: int | None = None
         process: subprocess.Popen | None = None
+        stdout_thread: threading.Thread | None = None
+        stderr_thread: threading.Thread | None = None
+        heartbeat = EXECUTION_HEARTBEAT_SECONDS if heartbeat_seconds is None else float(heartbeat_seconds)
+        wait_started = time.monotonic()
+        deadline = wait_started + request.timeout_seconds
         try:
             process = subprocess.Popen(
                 self._command(request),
@@ -222,31 +241,56 @@ class OpenCodeAdapter:
             stderr_thread = threading.Thread(target=read_stderr, args=(process.stderr,), daemon=True)
             stdout_thread.start()
             stderr_thread.start()
-            try:
-                exit_code = process.wait(timeout=request.timeout_seconds)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except OSError:
-                    process.terminate()
-                try:
-                    exit_code = process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
                     try:
-                        os.killpg(process.pid, signal.SIGKILL)
+                        os.killpg(process.pid, signal.SIGTERM)
                     except OSError:
-                        process.kill()
-                    exit_code = process.wait(timeout=10)
+                        process.terminate()
+                    try:
+                        exit_code = process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except OSError:
+                            process.kill()
+                        try:
+                            exit_code = process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            exit_code = None
+                    break
+                wait_for = remaining if heartbeat <= 0 else min(remaining, heartbeat)
+                try:
+                    exit_code = process.wait(timeout=wait_for)
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        continue
+                    elapsed = time.monotonic() - wait_started
+                    _notify(
+                        on_progress,
+                        "executing",
+                        f"OpenCode is still running after {elapsed:.0f}s "
+                        f"({parser.event_count} events; bounded timeout {request.timeout_seconds:g}s; no ETA)",
+                    )
             stdout_thread.join(timeout=10)
             stderr_thread.join(timeout=10)
         finally:
-            handle.close()
             if process is not None and process.poll() is None:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except OSError:
                     process.kill()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            for thread in (stdout_thread, stderr_thread):
+                if thread is not None and thread.is_alive():
+                    thread.join(timeout=5)
+            handle.close()
         finished_at = utcnow_iso()
         error_parts = []
         if parser.error_text():

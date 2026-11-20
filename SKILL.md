@@ -98,12 +98,14 @@ Reject `session: same`; v1.1 does not support continuation. Never derive a path 
 ## Recovery
 
 ```bash
+agent-handoff dispatch status                     # health, links, next action
 agent-handoff dispatch status --json
 agent-handoff dispatch inspect --task <task-id> --run <run-id> --json
 agent-handoff dispatch deliver --task <task-id> --run <run-id> \
   --issue <number> --repository owner/private-dispatch --json
 ```
 
+- An interrupt during upload is safe: the existing task/run/session identity is reused. Do not submit a duplicate issue.
 - Upload failure: retry upload only.
 - GitHub publication failure: retry publication only.
 - Crash after claim/start: never rerun automatically. Recover persisted session output if present; otherwise mark `NEEDS_ATTENTION`.

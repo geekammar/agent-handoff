@@ -8,9 +8,11 @@ import json
 import os
 import re
 import secrets
+import signal
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 import unicodedata
 from datetime import datetime, timezone
@@ -378,3 +380,22 @@ def temporary_umask(mask: int = 0o077) -> Iterator[None]:
         yield
     finally:
         os.umask(old)
+
+
+@contextlib.contextmanager
+def graceful_sigterm(exit_code: int = 143) -> Iterator[None]:
+    """Turn SIGTERM into orderly unwinding so child processes are cleaned up."""
+
+    if not hasattr(signal, "SIGTERM") or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def stop(signum: int, frame: Any) -> None:
+        raise SystemExit(exit_code)
+
+    signal.signal(signal.SIGTERM, stop)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)

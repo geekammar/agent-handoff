@@ -23,15 +23,23 @@ from .config import (
 )
 from .adapters import agy_hook, auto_complete, git_info, integration_log, normalize_outcome, normalize_status, spawn_upload
 from .dispatch.config import DispatchConfigError, validate_core_config, validate_dispatch_config
-from .dispatch.delivery import diagnose_historical_run, delivery_marker, reconcile_verified_delivery
+from .dispatch.delivery import (
+    diagnose_historical_run,
+    delivery_marker,
+    merged_upload_attempts,
+    reconcile_verified_delivery,
+)
 from .dispatch.github import GithubError, GithubTransport
-from .dispatch.ledger import Ledger, safe_record_summary
+from .dispatch.ledger import Ledger
+from .dispatch.progress import ProgressReporter
 from .dispatch.runner import DispatchRunner
+from .dispatch.status import GROUP_ORDER, format_status_view, record_status_view, status_group
 from .report import manual_report
 from .store import Store
 from .upload import Uploader
 from .util import (
     atomic_write_text,
+    graceful_sigterm,
     new_id,
     read_json,
     read_text,
@@ -973,15 +981,27 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
     return 0 if data["ok"] else 1
 
 
-def _emit_dispatch_result(result: dict[str, Any], as_json: bool) -> None:
+def _dispatch_reporter(args: argparse.Namespace) -> ProgressReporter:
+    quiet = bool(getattr(args, "quiet", False))
+    enabled = not quiet and (bool(getattr(args, "progress", False)) or sys.stderr.isatty())
+    return ProgressReporter(enabled=enabled)
+
+
+def _emit_dispatch_result(result: dict[str, Any], as_json: bool, *, quiet: bool = False) -> None:
     if as_json:
         emit(result)
+        return
+    if quiet:
+        for error in result.get("errors") or []:
+            print(f"[ERROR] {error}", file=sys.stderr)
         return
     if result.get("busy"):
         print("Another dispatcher process is already running.")
         return
+    elapsed = result.get("elapsed_seconds")
+    elapsed_text = f" in {elapsed:g}s" if isinstance(elapsed, (int, float)) else ""
     print(
-        "Dispatch poll: "
+        f"Dispatch poll{elapsed_text}: "
         f"executed={result.get('executed', 0)} uploaded={result.get('uploaded', 0)} "
         f"published={result.get('published', 0)} rejected={result.get('rejected', 0)} "
         f"needs_attention={result.get('needs_attention', 0)}"
@@ -1000,22 +1020,27 @@ def cmd_dispatch_run(args: argparse.Namespace) -> int:
         raise ValueError(str(exc))
     if errors:
         raise ValueError("dispatcher configuration is invalid: " + "; ".join(errors))
-    runner = DispatchRunner(config, resolved)
-    if not args.watch:
-        result = runner.run_once(force=args.force)
-        _emit_dispatch_result(result, args.json)
-        return 0 if result.get("ok") else 1
-    try:
-        while True:
+    reporter = _dispatch_reporter(args)
+    runner = DispatchRunner(config, resolved, progress=reporter)
+    with graceful_sigterm():
+        if not args.watch:
             result = runner.run_once(force=args.force)
-            _emit_dispatch_result(result, args.json)
-            sys.stdout.flush()
-            if not result.get("ok") and args.stop_on_error:
-                return 1
-            time.sleep(max(5, int(resolved.get("poll_interval_seconds", 30))))
-    except KeyboardInterrupt:
-        print("dispatcher stopped", file=sys.stderr)
-        return 130
+            _emit_dispatch_result(result, args.json, quiet=args.quiet)
+            return 0 if result.get("ok") else 1
+        try:
+            while True:
+                result = runner.run_once(force=args.force)
+                if args.json:
+                    print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+                else:
+                    _emit_dispatch_result(result, args.json, quiet=args.quiet)
+                sys.stdout.flush()
+                if not result.get("ok") and args.stop_on_error:
+                    return 1
+                time.sleep(max(5, int(resolved.get("poll_interval_seconds", 30))))
+        except KeyboardInterrupt:
+            print("dispatcher stopped", file=sys.stderr)
+            return 130
 
 
 def cmd_dispatch_status(args: argparse.Namespace) -> int:
@@ -1024,23 +1049,32 @@ def cmd_dispatch_status(args: argparse.Namespace) -> int:
     records = ledger.all()
     if args.issue is not None:
         records = [record for record in records if int(record.get("issue_number", -1)) == int(args.issue)]
-    summaries = [safe_record_summary(record) for record in records]
+    dispatch_cfg = config.get("dispatch") or {}
+    views = [record_status_view(record, dispatch_cfg) for record in records]
     if args.json:
-        emit({"ok": True, "count": len(summaries), "records": summaries})
+        counts: dict[str, int] = {}
+        for item in views:
+            group = status_group(item)
+            counts[group] = counts.get(group, 0) + 1
+        emit({"ok": True, "count": len(views), "counts": counts, "records": views})
         return 0
-    if not summaries:
+    if not views:
         print("No dispatch records.")
         return 0
-    print(f"{'Issue':7} {'Status':18} {'Task':30} {'Run':30} {'Upload':10} {'Publication':12} Project")
-    for item in summaries:
-        print(
-            f"{str(item.get('issue_number')):7} {str(item.get('status'))[:18]:18} "
-            f"{str((item.get('capture') or {}).get('task_id'))[:30]:30} "
-            f"{str((item.get('capture') or {}).get('run_id'))[:30]:30} "
-            f"{str((item.get('upload') or {}).get('status'))[:10]:10} "
-            f"{str((item.get('publication') or {}).get('status'))[:12]:12} "
-            f"{item.get('project') or '-'}"
-        )
+    counts = {}
+    for item in views:
+        group = status_group(item)
+        counts[group] = counts.get(group, 0) + 1
+    summary_text = ", ".join(f"{label.lower()}={counts[group]}" for group, label in GROUP_ORDER if counts.get(group))
+    print(f"Dispatch records: {len(views)} ({summary_text})")
+    for group, label in GROUP_ORDER:
+        items = [item for item in views if status_group(item) == group]
+        if not items:
+            continue
+        print(f"\n{label} ({len(items)})")
+        for item in items:
+            for line in format_status_view(item):
+                print(line)
     return 0
 
 
@@ -1081,7 +1115,13 @@ def cmd_dispatch_inspect(args: argparse.Namespace) -> int:
 
 
 def cmd_dispatch_deliver(args: argparse.Namespace) -> int:
+    with graceful_sigterm():
+        return _cmd_dispatch_deliver(args)
+
+
+def _cmd_dispatch_deliver(args: argparse.Namespace) -> int:
     config = load_config()
+    reporter = _dispatch_reporter(args)
     store = Store(config)
     project = _find_run_project(config, store, args.task, args.project)
     uploader = Uploader(config, store)
@@ -1100,6 +1140,7 @@ def cmd_dispatch_deliver(args: argparse.Namespace) -> int:
             "github": {"command": ((dispatch_cfg.get("github") or {}).get("command") or "gh"), "require_private": True},
         }
     )
+    reporter.emit("discovering", f"verifying the private issue inbox and issue #{issue_number}")
     inbox = transport.verify_repository()
     issue = transport.get_issue(issue_number)
     author = str(((issue.get("user") or {}).get("login")) or "").lower()
@@ -1107,6 +1148,7 @@ def cmd_dispatch_deliver(args: argparse.Namespace) -> int:
     allowed.add(str(inbox.get("user") or "").lower())
     if author not in allowed:
         raise ValueError("the issue author is not the authenticated user and is not in dispatch.allowed_users")
+    reporter.emit("verifying", "reconciling the existing run; this never invokes OpenCode")
     result = reconcile_verified_delivery(
         config,
         store,
@@ -1115,6 +1157,7 @@ def cmd_dispatch_deliver(args: argparse.Namespace) -> int:
         args.task,
         args.run,
         force=True,
+        on_progress=lambda stage, message: reporter.emit(stage, message),
     )
     if not result.get("ok"):
         raise ValueError(result.get("error") or "verified upload reconciliation failed")
@@ -1175,6 +1218,7 @@ def cmd_dispatch_deliver(args: argparse.Namespace) -> int:
             "report_url": result.get("report_url"),
             "receipt_remote_path": result.get("receipt_remote_path"),
             "receipt_url": result.get("receipt_url"),
+            "attempts": merged_upload_attempts(item.get("upload"), result),
             "last_error": None,
         }
         item["execution"] = {
@@ -1189,6 +1233,7 @@ def cmd_dispatch_deliver(args: argparse.Namespace) -> int:
         item["status"] = "UPLOAD_VERIFIED"
     record = ledger.update(repository, issue_number, apply_reconcile, note="verified upload metadata reconciled")
     marker = delivery_marker(args.run)
+    reporter.emit("publishing", "checking for an existing idempotent delivery comment")
     existing_comment = transport.find_comment(issue_number, marker)
     comment_url = (existing_comment or {}).get("html_url")
     if not existing_comment:
@@ -1208,7 +1253,9 @@ def cmd_dispatch_deliver(args: argparse.Namespace) -> int:
                 "published_at": published_at,
                 "comment_url": comment_url,
                 "last_error": None,
-            }
+                "next_attempt_at": None,
+            },
+            "attention_reason": None,
         },
     )
     data = {
@@ -1222,9 +1269,10 @@ def cmd_dispatch_deliver(args: argparse.Namespace) -> int:
         "receipt_url": result.get("receipt_url"),
         "opencode_executed": False,
     }
+    reporter.emit("completed", "verified report delivery reconciled without re-executing OpenCode")
     if args.json:
         emit(data)
-    else:
+    elif not args.quiet:
         print(f"Verified report: {data['report_url']}")
         print(f"Upload receipt: {data['receipt_url']}")
         print(f"Issue: {data['issue_url']}")
@@ -1379,6 +1427,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--watch", action="store_true", help="poll continuously")
     p.add_argument("--force", action="store_true", help="ignore upload/publication backoff")
     p.add_argument("--stop-on-error", action="store_true", help="stop watch mode after a fatal poll")
+    p.add_argument("--progress", action="store_true", help="write human progress to stderr even when stderr is not a TTY")
+    p.add_argument("--quiet", action="store_true", help="suppress human progress and summary; JSON stdout is unchanged")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_dispatch_run)
     p = dispatch_sub.add_parser("status", help="show durable dispatch records without running agents")
@@ -1397,6 +1447,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--project")
     p.add_argument("--issue", type=int)
     p.add_argument("--repository", help="owner/name (inferred from an existing dispatch record when omitted)")
+    p.add_argument("--progress", action="store_true", help="write human progress to stderr even when stderr is not a TTY")
+    p.add_argument("--quiet", action="store_true", help="suppress human progress and output; JSON stdout is unchanged")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_dispatch_deliver)
 

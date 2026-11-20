@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(os.environ.get("FAKE_DRIVE_ROOT", "/tmp/fake-drive")).resolve()
@@ -73,6 +74,9 @@ def command_lsd(argv: list[str]) -> int:
 
 
 def command_lsf(argv: list[str]) -> int:
+    delay = float(os.environ.get("FAKE_SLOW_LSF_SECONDS", "0") or 0)
+    if delay:
+        time.sleep(delay)
     folder_id, path = parse_remote(argv[1])
     if folder_id is None:
         return 0
@@ -113,6 +117,9 @@ def command_copyto(argv: list[str]) -> int:
         maybe_fail_once()
     except RuntimeError as exc:
         return fail(str(exc))
+    delay = float(os.environ.get("FAKE_SLOW_SECONDS", "0") or 0)
+    if delay:
+        time.sleep(delay)
     if len(argv) < 3:
         return fail("copyto requires source and destination")
     source = argv[1]

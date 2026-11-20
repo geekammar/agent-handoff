@@ -2,13 +2,22 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
 from ..store import Store
 from ..upload import Uploader
 from ..util import atomic_write_json, sanitize_error, utcnow, utcnow_iso
 
 RECEIPT_NAME = "UPLOAD-RECEIPT.json"
+
+
+def _notify(callback: Callable[[str, str], None] | None, stage: str, message: str) -> None:
+    if callback is None:
+        return
+    try:
+        callback(stage, message)
+    except Exception:
+        pass
 
 
 def delivery_marker(run_id: str) -> str:
@@ -22,6 +31,24 @@ def rejection_marker(issue_number: int, body_sha256: str) -> str:
 def _complete_upload(complete: dict[str, Any]) -> dict[str, Any]:
     upload = complete.get("upload")
     return upload if isinstance(upload, dict) else {}
+
+
+def upload_attempts(upload: dict[str, Any] | None) -> int:
+    """Return the completed upload-attempt count recorded by the core uploader."""
+
+    try:
+        return max(0, int((upload or {}).get("attempts") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def merged_upload_attempts(current: dict[str, Any] | None, result: dict[str, Any] | None) -> int:
+    """Keep historical ledger attempts while adopting a newer truthful count."""
+
+    existing = upload_attempts(current)
+    if not isinstance(result, dict) or "attempts" not in result:
+        return existing
+    return max(existing, upload_attempts({"attempts": result.get("attempts")}))
 
 
 def _report_remote_path(complete: dict[str, Any]) -> str | None:
@@ -87,6 +114,7 @@ def reconcile_verified_delivery(
     run_id: str,
     *,
     force: bool = False,
+    on_progress: Callable[[str, str], None] | None = None,
 ) -> dict[str, Any]:
     """Ensure a run is upload-verified and produce a truthful receipt with a direct URL.
 
@@ -100,6 +128,7 @@ def reconcile_verified_delivery(
 
     upload = _complete_upload(complete)
     if not upload.get("verified"):
+        _notify(on_progress, "uploading", "uploading report files and verifying each transfer")
         with store.lock():
             store.queue_run(project, task_path, meta, run_path, run_id)
         result = uploader.process_queue(
@@ -108,9 +137,14 @@ def reconcile_verified_delivery(
             only_run=run_id,
             time_budget=120.0,
             reconcile=False,
+            on_progress=on_progress,
         )
         if result.get("busy"):
-            return {"ok": False, "error": "another upload worker is already running"}
+            return {
+                "ok": False,
+                "error": "another upload worker is already running",
+                "attempts": upload_attempts(upload),
+            }
         try:
             _, task_path, meta, run_path, complete = store.run_record(project, task_id, run_id)
         except Exception as exc:
@@ -122,11 +156,12 @@ def reconcile_verified_delivery(
                 "ok": False,
                 "error": sanitize_error("; ".join(str(item) for item in errors) or upload.get("last_error") or "upload is not verified"),
                 "upload": upload,
+                "attempts": upload_attempts(upload),
             }
 
     report_remote_path = _report_remote_path(complete)
     if not report_remote_path:
-        return {"ok": False, "error": "run has no remote report path"}
+        return {"ok": False, "error": "run has no remote report path", "attempts": upload_attempts(upload)}
 
     receipt_path = run_path / RECEIPT_NAME
     existing = upload.get("report_url") and upload.get("receipt_url") and upload.get("reconciled_at") and receipt_path.is_file()
@@ -140,11 +175,18 @@ def reconcile_verified_delivery(
             "receipt_remote_path": upload.get("receipt_remote_path"),
             "report_file_id": upload.get("report_file_id"),
             "receipt_file_id": upload.get("receipt_file_id"),
+            "verified_at": upload.get("verified_at"),
+            "attempts": upload_attempts(upload),
         }
 
-    report_file = uploader.remote_file_id(report_remote_path, project)
+    _notify(on_progress, "verifying", "resolving the verified report Drive file id")
+    report_file = uploader.remote_file_id(report_remote_path, project, on_progress=on_progress)
     if not report_file.get("ok"):
-        return {"ok": False, "error": report_file.get("error") or "cannot resolve the report Drive file id"}
+        return {
+            "ok": False,
+            "error": report_file.get("error") or "cannot resolve the report Drive file id",
+            "attempts": upload_attempts(upload),
+        }
 
     receipt = build_receipt(
         project=project,
@@ -158,12 +200,21 @@ def reconcile_verified_delivery(
     atomic_write_json(receipt_path, receipt)
     remote_dir = f"TASKS/{meta['task_folder']}/RUNS/{run_id}"
     receipt_remote_path = f"{remote_dir}/{RECEIPT_NAME}"
-    receipt_upload = uploader.upload_file(receipt_path, receipt_remote_path, project)
+    _notify(on_progress, "receipt", "uploading and verifying UPLOAD-RECEIPT.json")
+    receipt_upload = uploader.upload_file(receipt_path, receipt_remote_path, project, on_progress=on_progress)
     if not receipt_upload.get("ok"):
-        return {"ok": False, "error": receipt_upload.get("error") or "upload receipt failed"}
-    receipt_file = uploader.remote_file_id(receipt_remote_path, project)
+        return {
+            "ok": False,
+            "error": receipt_upload.get("error") or "upload receipt failed",
+            "attempts": upload_attempts(upload),
+        }
+    receipt_file = uploader.remote_file_id(receipt_remote_path, project, on_progress=on_progress)
     if not receipt_file.get("ok"):
-        return {"ok": False, "error": receipt_file.get("error") or "cannot resolve the receipt Drive file id"}
+        return {
+            "ok": False,
+            "error": receipt_file.get("error") or "cannot resolve the receipt Drive file id",
+            "attempts": upload_attempts(upload),
+        }
 
     updates = {
         "report_remote_path": report_remote_path,
@@ -178,9 +229,14 @@ def reconcile_verified_delivery(
     with store.lock():
         store.update_complete(run_path, {"upload": updates, "report": {"remote_url": report_file.get("url")}})
     complete_path = run_path / "COMPLETE.json"
-    complete_upload = uploader.upload_file(complete_path, f"{remote_dir}/COMPLETE.json", project)
+    _notify(on_progress, "reconciling", "re-uploading COMPLETE.json with verified upload metadata")
+    complete_upload = uploader.upload_file(complete_path, f"{remote_dir}/COMPLETE.json", project, on_progress=on_progress)
     if not complete_upload.get("ok"):
-        return {"ok": False, "error": complete_upload.get("error") or "remote COMPLETE.json reconciliation failed"}
+        return {
+            "ok": False,
+            "error": complete_upload.get("error") or "remote COMPLETE.json reconciliation failed",
+            "attempts": upload_attempts(upload),
+        }
     with store.lock():
         store.update_complete(
             run_path,
@@ -201,6 +257,7 @@ def reconcile_verified_delivery(
         "report_file_id": report_file.get("id"),
         "receipt_file_id": receipt_file.get("id"),
         "verified_at": upload.get("verified_at"),
+        "attempts": upload_attempts(upload),
     }
 
 
@@ -240,16 +297,25 @@ def publication_backoff(attempts: int, retry_seconds: int) -> str:
     return (utcnow() + timedelta(seconds=delay)).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def publication_due(record: dict[str, Any], force: bool = False) -> bool:
-    if force:
-        return True
-    next_at = (record.get("publication") or {}).get("next_attempt_at")
-    if not next_at:
+def upload_backoff(attempts: int, retry_seconds: int = 60) -> str:
+    return publication_backoff(attempts, retry_seconds)
+
+
+def _retry_due(next_at: str | None, force: bool) -> bool:
+    if force or not next_at:
         return True
     try:
         return datetime.fromisoformat(str(next_at).replace("Z", "+00:00")) <= utcnow()
     except ValueError:
         return True
+
+
+def publication_due(record: dict[str, Any], force: bool = False) -> bool:
+    return _retry_due((record.get("publication") or {}).get("next_attempt_at"), force)
+
+
+def upload_due(record: dict[str, Any], force: bool = False) -> bool:
+    return _retry_due((record.get("upload") or {}).get("next_attempt_at"), force)
 
 
 def diagnose_historical_run(config: dict[str, Any], project: dict[str, Any], task_id: str, run_id: str) -> dict[str, Any]:

@@ -234,6 +234,7 @@ def safe_record_summary(record: dict[str, Any]) -> dict[str, Any]:
             "receipt_url": upload.get("receipt_url"),
             "attempts": upload.get("attempts", 0),
             "last_error": upload.get("last_error"),
+            "next_attempt_at": upload.get("next_attempt_at"),
         },
         "publication": {
             "status": publication.get("status"),
