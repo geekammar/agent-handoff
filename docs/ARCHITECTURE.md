@@ -41,6 +41,14 @@ The installer applies one source-selection policy to Git and non-Git checkouts. 
 - `adapters/base.py`: small execution-adapter protocol so a future CLI adapter can be added without changing the ledger, GitHub transport, project routing, upload, or delivery.
 - `adapters/opencode.py`: the only v1.1 execution adapter. Sets both `cwd` and `PWD` to the canonical workspace, uses `--pure`, applies a read-only or explicitly enabled write permission policy, streams JSON events to a mode-600 session file, preserves the session ID as soon as it appears, emits bounded execution heartbeats without prompt content, and terminates its process group on timeout or orderly shutdown.
 
+### Optional notifications (`lib/agent_handoff/notify`)
+
+- `config.py`: validates the disabled-by-default Telegram section and reads the bot token from a named environment variable without ever returning it in validation errors.
+- `store.py`: durable notification outbox, stable notification identity, atomic JSON state, `flock`, bounded retry state, and ambiguous-send detection.
+- `transport.py`: standard-library Telegram Bot API `sendMessage` client with bounded timeout, HTTP/`ok=false` handling, `retry_after`, and token redaction.
+- `messages.py`: HTML-escaped Arabic-aware completion, attention, and delayed messages with the exact verified report URL and a selectable copy-ready ChatGPT prompt.
+- `service.py`: enqueue/drain/retry orchestration. Notification failure is isolated from the dispatcher ledger and never changes execution, verification, upload, or publication state.
+
 ### OpenCode capture integration
 
 The active capture integration is the installed OpenCode plugin `~/.config/opencode/plugin/agent-handoff.js`; source copy lives in `integrations/opencode/agent-handoff.js`.
@@ -101,7 +109,14 @@ Drive file ID -> direct URL -> UPLOAD-RECEIPT.json -> verified COMPLETE.json
         |
         v
 idempotent GitHub comment: marker + direct URL -> ISSUE_UPDATED
+        |
+        +--> optional notification outbox (independent failure domain)
+                    |
+                    v
+             Telegram Bot API sendMessage -> SENT / RETRY_WAIT / NEEDS_ATTENTION
 ```
+
+Report delivery and notification delivery are separate commit points. The dispatcher records `ISSUE_UPDATED` before a notification exists. A Telegram failure cannot roll that state back, rerun OpenCode, re-upload a verified report, or post a second Issue comment.
 
 ## Dispatcher state model
 
@@ -122,6 +137,14 @@ NEW -> CLAIMED -> RUNNING -> EXECUTION_COMPLETED
 ```
 
 `REJECTED` and `NEEDS_ATTENTION` are terminal/exceptional outcomes. A record that reached `CLAIMED` or later is never automatically executed again.
+
+## Notification outbox
+
+Notification identity is project + task + run + kind. Each identity has one durable JSON record under `state/dispatch/notifications/records/`; a `flock` protects mutations. States are `PENDING`, `SENDING`, `SENT`, `RETRY_WAIT`, and `NEEDS_ATTENTION`.
+
+`DELIVERY_COMPLETED` is enqueued only at an `ISSUE_UPDATED` transition that also has `upload.verified`, a direct report URL, a verified receipt URL, and `publication.status=PUBLISHED`. `NEEDS_ATTENTION` is enqueued at durable attention/exhaustion transitions. `DELIVERY_DELAYED` is enqueued once per task/run after a documented attempt threshold.
+
+The outbox is drained after each dispatcher poll. Pending records survive restart. A durable `activated_at` marker bounds reconciliation: records newer than it are rechecked for a missing completion/attention/delay intent, while older historical `ISSUE_UPDATED` records are never backfilled. Sends use a bounded timeout and bounded attempts with backoff; Telegram `retry_after` is honored when present. A `SENDING` record whose process disappeared is not silently resent: it is marked `NEEDS_ATTENTION` with an explicit ambiguous-outcome warning.
 
 ## Upload, delivery, and historical reconciliation
 

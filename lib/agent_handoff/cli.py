@@ -34,6 +34,8 @@ from .dispatch.ledger import Ledger
 from .dispatch.progress import ProgressReporter
 from .dispatch.runner import DispatchRunner
 from .dispatch.status import GROUP_ORDER, format_status_view, record_status_view, status_group
+from .notify.config import NotificationConfigError, validate_notification_config
+from .notify.service import NotificationService
 from .report import manual_report
 from .store import Store
 from .upload import Uploader
@@ -239,6 +241,25 @@ def collect_doctor(config: dict[str, Any], strict: bool = False) -> dict[str, An
                 _check(checks, "dispatcher warning", "WARN", warning)
         except DispatchConfigError as exc:
             _check(checks, "dispatcher", "FAIL", sanitize_error(str(exc)))
+    notifications_raw = config.get("notifications")
+    notification_raw = notifications_raw.get("telegram") if isinstance(notifications_raw, dict) else None
+    if notifications_raw is not None and not isinstance(notifications_raw, dict):
+        _check(checks, "Telegram notifications", "FAIL", "notifications configuration must be an object")
+    elif notification_raw is not None and not isinstance(notification_raw, dict):
+        _check(checks, "Telegram notifications", "FAIL", "notifications.telegram configuration must be an object")
+    elif not isinstance(notification_raw, dict) or not notification_raw.get("enabled"):
+        _check(checks, "Telegram notifications", "PASS", "disabled (optional)")
+    else:
+        try:
+            _notification_resolved, notification_errors, _notification_warnings = validate_notification_config(config)
+            _check(
+                checks,
+                "Telegram notifications",
+                "PASS" if not notification_errors else "FAIL",
+                "telegram enabled" if not notification_errors else "; ".join(notification_errors),
+            )
+        except NotificationConfigError as exc:
+            _check(checks, "Telegram notifications", "FAIL", sanitize_error(str(exc)))
     _check(checks, "GitHub CLI", "PASS" if versions.get("gh") else "WARN", versions.get("gh") or "gh not found (required only for dispatch)")
 
     nonzero = [c for c in checks if c["status"] == "FAIL"]
@@ -946,8 +967,15 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
         resolved = {}
         dispatch_errors = [str(exc)]
         dispatch_warnings = []
-    errors = core_errors + dispatch_errors
-    warnings = core_warnings + dispatch_warnings
+    try:
+        notification_resolved, notification_errors, notification_warnings = validate_notification_config(config)
+    except NotificationConfigError as exc:
+        notification_resolved = {}
+        notification_errors = [str(exc)]
+        notification_warnings = []
+    errors = core_errors + dispatch_errors + notification_errors
+    warnings = core_warnings + dispatch_warnings + notification_warnings
+    token_env = notification_resolved.get("token_env") or ""
     data = {
         "ok": not errors and not (args.strict and warnings),
         "errors": errors,
@@ -960,6 +988,16 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
             "models": sorted((resolved.get("models") or {}).keys()),
             "transport": resolved.get("transport"),
         },
+        "notifications": {
+            "enabled": bool(notification_resolved.get("enabled")),
+            "chat_id_configured": bool(notification_resolved.get("chat_id")),
+            "token_env": token_env or None,
+            "token_present": bool(notification_resolved.get("token")),
+            "timeout_seconds": notification_resolved.get("timeout_seconds"),
+            "retry_seconds": notification_resolved.get("retry_seconds"),
+            "max_attempts": notification_resolved.get("max_attempts"),
+            "delayed_after_attempts": notification_resolved.get("delayed_after_attempts"),
+        },
     }
     if args.json:
         emit(data)
@@ -968,6 +1006,12 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
         print(f"Dispatcher: {'enabled' if data['dispatch']['enabled'] else 'disabled'}")
         if data["dispatch"]["repository"]:
             print(f"Repository: {data['dispatch']['repository']}")
+        print(f"Telegram notifications: {'enabled' if data['notifications']['enabled'] else 'disabled'}")
+        if data["notifications"]["enabled"]:
+            print(
+                f"Telegram chat configured: {data['notifications']['chat_id_configured']} · "
+                f"token source: {data['notifications']['token_env']}"
+            )
         for warning in warnings:
             print(f"[WARN] {warning}")
         for error in errors:
@@ -1006,6 +1050,14 @@ def _emit_dispatch_result(result: dict[str, Any], as_json: bool, *, quiet: bool 
         f"published={result.get('published', 0)} rejected={result.get('rejected', 0)} "
         f"needs_attention={result.get('needs_attention', 0)}"
     )
+    notifications = result.get("notifications") or {}
+    if notifications.get("enabled"):
+        print(
+            f"Telegram notifications: sent={notifications.get('sent', 0)} "
+            f"failed={notifications.get('failed', 0)} "
+            f"pending={sum((notifications.get('counts') or {}).get(key, 0) for key in ('PENDING', 'RETRY_WAIT', 'SENDING'))} "
+            f"needs_attention={(notifications.get('counts') or {}).get('NEEDS_ATTENTION', 0)}"
+        )
     for warning in result.get("warnings") or []:
         print(f"[WARN] {warning}")
     for error in result.get("errors") or []:
@@ -1050,16 +1102,44 @@ def cmd_dispatch_status(args: argparse.Namespace) -> int:
     if args.issue is not None:
         records = [record for record in records if int(record.get("issue_number", -1)) == int(args.issue)]
     dispatch_cfg = config.get("dispatch") or {}
-    views = [record_status_view(record, dispatch_cfg) for record in records]
+    notifier = NotificationService(config)
+    notifications_by_issue: dict[tuple[Any, Any], list[dict[str, Any]]] = {}
+    for item in notifier.list_records(include_sent=True):
+        key = (item.get("repository"), item.get("issue_number"))
+        notifications_by_issue.setdefault(key, []).append(item)
+    views = [
+        record_status_view(
+            record,
+            dispatch_cfg,
+            notifications=notifications_by_issue.get((record.get("repository"), record.get("issue_number")), []),
+        )
+        for record in records
+    ]
+    notification_summary = {
+        "enabled": notifier.enabled,
+        "configured_enabled": notifier.configured_enabled,
+        "configuration_error": "; ".join(notifier.config_errors) if notifier.config_errors else None,
+        "counts": notifier.counts(),
+        "next_action": notifier.overall_next_action(),
+    }
     if args.json:
         counts: dict[str, int] = {}
         for item in views:
             group = status_group(item)
             counts[group] = counts.get(group, 0) + 1
-        emit({"ok": True, "count": len(views), "counts": counts, "records": views})
+        emit(
+            {
+                "ok": True,
+                "count": len(views),
+                "counts": counts,
+                "notifications": notification_summary,
+                "records": views,
+            }
+        )
         return 0
     if not views:
         print("No dispatch records.")
+        _print_notification_summary(notification_summary)
         return 0
     counts = {}
     for item in views:
@@ -1075,6 +1155,106 @@ def cmd_dispatch_status(args: argparse.Namespace) -> int:
         for item in items:
             for line in format_status_view(item):
                 print(line)
+    _print_notification_summary(notification_summary)
+    return 0
+
+
+def _print_notification_summary(summary: dict[str, Any]) -> None:
+    counts = summary.get("counts") or {}
+    if not summary.get("configured_enabled"):
+        print("\nTelegram notifications: disabled (optional).")
+        if counts:
+            print(
+                f"  stored: sent={counts.get('SENT', 0)} "
+                f"pending={sum(counts.get(key, 0) for key in ('PENDING', 'SENDING'))} "
+                f"retry_wait={counts.get('RETRY_WAIT', 0)} needs_attention={counts.get('NEEDS_ATTENTION', 0)}"
+            )
+        return
+    print(
+        "\nTelegram notifications: "
+        f"{'enabled' if summary.get('enabled') else 'configuration error'} · "
+        f"sent={counts.get('SENT', 0)} pending={sum(counts.get(key, 0) for key in ('PENDING', 'SENDING'))} "
+        f"retry_wait={counts.get('RETRY_WAIT', 0)} needs_attention={counts.get('NEEDS_ATTENTION', 0)}"
+    )
+    if summary.get("configuration_error"):
+        print(f"  configuration: {summary['configuration_error']}")
+    if summary.get("next_action") and summary["next_action"] != "None.":
+        print(f"  next action: {summary['next_action']}")
+
+
+def cmd_dispatch_notify(args: argparse.Namespace) -> int:
+    config = load_config()
+    notifier = NotificationService(config)
+    if args.retry:
+        result = notifier.retry(task_id=args.task, run_id=args.run)
+        if args.json:
+            emit(result)
+        elif not notifier.enabled:
+            print(result.get("error") or "Telegram notifications are disabled or invalid.")
+            if result.get("configuration_error"):
+                print(f"configuration: {result['configuration_error']}", file=sys.stderr)
+        else:
+            print(
+                f"Notification retry: retried={result.get('retried', 0)} "
+                f"sent={result.get('sent', 0)} failed={result.get('failed', 0)}"
+            )
+            for error in result.get("errors") or []:
+                print(f"[WARN] {error}", file=sys.stderr)
+            counts = result.get("counts") or {}
+            print(
+                f"Outbox: sent={counts.get('SENT', 0)} pending={sum(counts.get(key, 0) for key in ('PENDING', 'SENDING'))} "
+                f"retry_wait={counts.get('RETRY_WAIT', 0)} needs_attention={counts.get('NEEDS_ATTENTION', 0)}"
+            )
+        return 0 if result.get("ok") else 1
+    records = notifier.list_records(task_id=args.task, run_id=args.run, include_sent=args.all)
+    counts = notifier.counts()
+    data = {
+        "ok": True,
+        "enabled": notifier.enabled,
+        "configured_enabled": notifier.configured_enabled,
+        "configuration_error": "; ".join(notifier.config_errors) if notifier.config_errors else None,
+        "counts": counts,
+        "count": len(records),
+        "records": records,
+        "next_action": notifier.overall_next_action(),
+    }
+    if args.json:
+        emit(data)
+        return 0
+    if not notifier.configured_enabled:
+        print("Telegram notifications: disabled (optional).")
+        if counts:
+            print(
+                f"stored: sent={counts.get('SENT', 0)} "
+                f"pending={sum(counts.get(key, 0) for key in ('PENDING', 'SENDING'))} "
+                f"retry_wait={counts.get('RETRY_WAIT', 0)} needs_attention={counts.get('NEEDS_ATTENTION', 0)}"
+            )
+            print("These records will not be sent until notifications.telegram.enabled is true.")
+        return 0
+    print(
+        f"Telegram notifications: {'enabled' if notifier.enabled else 'configuration error'} · "
+        f"sent={counts.get('SENT', 0)} pending={sum(counts.get(key, 0) for key in ('PENDING', 'SENDING'))} "
+        f"retry_wait={counts.get('RETRY_WAIT', 0)} needs_attention={counts.get('NEEDS_ATTENTION', 0)}"
+    )
+    if data["configuration_error"]:
+        print(f"configuration: {data['configuration_error']}")
+    for item in records:
+        line = (
+            f"  [{item.get('state')}] {item.get('kind')} · project={item.get('project')} "
+            f"task={item.get('task_id')} run={item.get('run_id')} attempts={item.get('attempts', 0)}"
+        )
+        print(line)
+        if item.get("sent_at"):
+            print(f"      sent: {item['sent_at']} · telegram_message_id={item.get('telegram_message_id')}")
+        if item.get("next_attempt_at"):
+            print(f"      next retry: {item['next_attempt_at']}")
+        if item.get("last_error"):
+            print(f"      last error: {item['last_error']}")
+        print(f"      next action: {item.get('next_action')}")
+    if not records:
+        print("  No notification records.")
+    if data["next_action"] != "None.":
+        print(f"next action: {data['next_action']}")
     return 0
 
 
@@ -1242,7 +1422,8 @@ def _cmd_dispatch_deliver(args: argparse.Namespace) -> int:
         response = transport.comment(issue_number, build_issue_comment(record))
         comment_url = response.get("url")
     published_at = (existing_comment or {}).get("created_at") or utcnow_iso()
-    ledger.set_status(
+    notifier = NotificationService(config, log=lambda message: reporter.emit("notifying", message))
+    final_record = ledger.set_status(
         repository,
         issue_number,
         "ISSUE_UPDATED",
@@ -1258,6 +1439,30 @@ def _cmd_dispatch_deliver(args: argparse.Namespace) -> int:
             "attention_reason": None,
         },
     )
+    notification_data: dict[str, Any] = {
+        "enabled": notifier.enabled,
+        "configured_enabled": notifier.configured_enabled,
+        "configuration_error": "; ".join(notifier.config_errors) if notifier.config_errors else None,
+    }
+    try:
+        queued = notifier.enqueue_completed(final_record)
+        if queued:
+            notification_id = str(queued.get("notification_id"))
+            drain = notifier.drain(force=True, limit=1, allowed_ids={notification_id})
+            current = notifier.store.get(notification_id) or queued
+            notification_data.update(
+                {
+                    "kind": current.get("kind"),
+                    "state": current.get("state"),
+                    "attempts": current.get("attempts", 0),
+                    "sent": current.get("state") == "SENT",
+                    "last_error": current.get("last_error"),
+                }
+            )
+            if drain.get("errors"):
+                reporter.emit("retryable", f"Telegram notification failed independently: {drain['errors'][0]}")
+    except Exception as exc:
+        notification_data["error"] = sanitize_error(str(exc))
     data = {
         "ok": True,
         "reused_comment": bool(existing_comment),
@@ -1268,6 +1473,7 @@ def _cmd_dispatch_deliver(args: argparse.Namespace) -> int:
         "report_url": result.get("report_url"),
         "receipt_url": result.get("receipt_url"),
         "opencode_executed": False,
+        "notification": notification_data,
     }
     reporter.emit("completed", "verified report delivery reconciled without re-executing OpenCode")
     if args.json:
@@ -1277,6 +1483,14 @@ def _cmd_dispatch_deliver(args: argparse.Namespace) -> int:
         print(f"Upload receipt: {data['receipt_url']}")
         print(f"Issue: {data['issue_url']}")
         print(f"Publication: {'reused existing comment' if data['reused_comment'] else 'posted once'}")
+        notification = data.get("notification") or {}
+        if notification.get("configured_enabled"):
+            if notification.get("state") == "SENT":
+                print("Telegram notification: sent")
+            elif notification.get("state"):
+                print(f"Telegram notification: {notification.get('state')} (report delivery is unaffected)")
+            elif notification.get("error"):
+                print(f"Telegram notification: skipped ({notification.get('error')})")
     return 0
 
 
@@ -1435,6 +1649,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--issue", type=int)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_dispatch_status)
+    p = dispatch_sub.add_parser("notify", help="inspect or safely retry Telegram notifications without running agents")
+    p.add_argument("--retry", action="store_true", help="requeue failed/pending notifications and send them now")
+    p.add_argument("--all", action="store_true", help="include already sent notifications in the listing")
+    p.add_argument("--task", help="limit to one Agent Handoff task id")
+    p.add_argument("--run", help="limit to one Agent Handoff run id")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_dispatch_notify)
     p = dispatch_sub.add_parser("inspect", help="read local and remote metadata for one run without changing anything")
     p.add_argument("--task", required=True)
     p.add_argument("--run", required=True)

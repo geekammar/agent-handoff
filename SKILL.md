@@ -13,6 +13,7 @@ This file is reusable guidance for any assistant that supports a skill-style ent
 - A user wants to install Agent Handoff on their own Linux machine or VPS.
 - A user wants a private GitHub Issue to run OpenCode in one explicit local project.
 - A user needs to diagnose a pending report upload, a stale remote `COMPLETE.json`, or a missing issue delivery.
+- A user wants an optional Telegram notification with a verified report link and a copy-ready Arabic ChatGPT handoff prompt.
 
 ## Do not use this skill to
 
@@ -98,11 +99,13 @@ Reject `session: same`; v1.1 does not support continuation. Never derive a path 
 ## Recovery
 
 ```bash
-agent-handoff dispatch status                     # health, links, next action
+agent-handoff dispatch status                     # health, links, notification state, next action
 agent-handoff dispatch status --json
 agent-handoff dispatch inspect --task <task-id> --run <run-id> --json
 agent-handoff dispatch deliver --task <task-id> --run <run-id> \
   --issue <number> --repository owner/private-dispatch --json
+agent-handoff dispatch notify --json              # notification outbox (no agent execution)
+agent-handoff dispatch notify --retry --json      # retry Telegram only (no agent execution)
 ```
 
 - An interrupt during upload is safe: the existing task/run/session identity is reused. Do not submit a duplicate issue.
@@ -110,6 +113,30 @@ agent-handoff dispatch deliver --task <task-id> --run <run-id> \
 - GitHub publication failure: retry publication only.
 - Crash after claim/start: never rerun automatically. Recover persisted session output if present; otherwise mark `NEEDS_ATTENTION`.
 - Stale remote `COMPLETE.json`: run `dispatch deliver`; it re-uploads truthful verified metadata and a receipt without rerunning the agent.
+
+## Optional Telegram notifications
+
+Notifications are disabled by default and must never affect report delivery. Configure only the environment variable name in runtime config, never the token itself:
+
+```json
+{
+  "notifications": {
+    "telegram": {
+      "enabled": true,
+      "chat_id": "-1001234567890",
+      "token_env": "AGENT_HANDOFF_TELEGRAM_TOKEN",
+      "timeout_seconds": 10,
+      "retry_seconds": 60,
+      "max_attempts": 5,
+      "delayed_after_attempts": 3
+    }
+  }
+}
+```
+
+Export the real token in the dispatcher environment; do not paste it into chat, config examples, Issue bodies, reports, or logs. Verify with `agent-handoff config validate` before enabling the service.
+
+`DELIVERY_COMPLETED` requires `ISSUE_UPDATED` plus a verified upload, verified receipt, and confirmed GitHub publication. `NEEDS_ATTENTION` and one-per-task `DELIVERY_DELAYED` states are separate. Telegram has no universal exactly-once transaction with local files: delivery is best-effort at-least-once with local deduplication, and an interrupted send is flagged for review. Never describe notification delivery as proof that the coding task, tests, or deployment succeeded.
 
 ## Boundaries
 

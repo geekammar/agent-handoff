@@ -52,6 +52,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "include_pending_local": True,
         "max_open_issues": 20,
     },
+    "notifications": {
+        "telegram": {
+            "enabled": False,
+            "chat_id": "",
+            "token_env": "AGENT_HANDOFF_TELEGRAM_TOKEN",
+            "timeout_seconds": 10,
+            "retry_seconds": 60,
+            "max_attempts": 5,
+            "delayed_after_attempts": 3,
+        }
+    },
 }
 
 

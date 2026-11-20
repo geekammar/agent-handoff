@@ -7,6 +7,7 @@ This is the neutral first entrypoint for coding agents working on or with Agent 
 - `agent-handoff`: a small Python CLI that records structured task/run reports, uploads them to Google Drive with `rclone`, and verifies uploads using MD5/read-back.
 - Capture integrations for OpenCode (plugin) and AGY (Stop hook).
 - An optional v1.1 dispatcher that polls a private GitHub Issue inbox, validates explicit project/model/session requests, runs OpenCode in the configured workspace, captures the report through the core, verifies the Drive upload, and publishes the direct report URL to the originating issue.
+- An optional v1.2 P1 Telegram notification outbox that reports verified delivery, attention states, and a copy-ready Arabic ChatGPT prompt without coupling notification failure to report delivery.
 - No database server, web dashboard, inbound public service, SaaS hosting, or mandatory cloud account.
 
 ## Sources of truth
@@ -30,6 +31,7 @@ Do not invent commands, config fields, model IDs, or guarantees. If documentatio
 - Local, upload-verified report capture for OpenCode and AGY.
 - Explicit multi-project mapping.
 - Optional GitHub Issue dispatch with durable execution, upload, and publication reconciliation.
+- Optional, disabled-by-default Telegram notifications with a durable local outbox; notification failure never changes verified delivery.
 - Read-only OpenCode execution by default.
 - Repeatable install, upgrade, rollback, doctor, and config validation.
 - Deterministic tests with fake GitHub, fake OpenCode, and fake rclone.
@@ -42,6 +44,7 @@ Do not invent commands, config fields, model IDs, or guarantees. If documentatio
 - No automatic project inference or automatic model selection.
 - No public HTTP API, dashboard, database server, containers, or SaaS hosting.
 - No automatic deployment of unrelated applications.
+- No generic notification platform, bot provisioning, Telegram login, or guaranteed exactly-once Telegram delivery.
 
 ## Safe setup sequence
 
@@ -100,6 +103,7 @@ Task instructions go here.
 - Do not modify project source code during a read-only smoke test.
 - Do not weaken `read_only` permissions unless the user deliberately configures `workspace_write` and `allow_write`.
 - Do not run persistent background processes or enable systemd services during tests.
+- Keep Telegram disabled unless deliberately configured. The bot token belongs only in the environment variable named by `notifications.telegram.token_env`; never in config, reports, logs, or Issues.
 
 ## Tests
 
