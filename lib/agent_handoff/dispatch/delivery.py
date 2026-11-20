@@ -2,13 +2,22 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
 from ..store import Store
 from ..upload import Uploader
 from ..util import atomic_write_json, sanitize_error, utcnow, utcnow_iso
 
 RECEIPT_NAME = "UPLOAD-RECEIPT.json"
+
+
+def _notify(callback: Callable[[str, str], None] | None, stage: str, message: str) -> None:
+    if callback is None:
+        return
+    try:
+        callback(stage, message)
+    except Exception:
+        pass
 
 
 def delivery_marker(run_id: str) -> str:
@@ -87,6 +96,7 @@ def reconcile_verified_delivery(
     run_id: str,
     *,
     force: bool = False,
+    on_progress: Callable[[str, str], None] | None = None,
 ) -> dict[str, Any]:
     """Ensure a run is upload-verified and produce a truthful receipt with a direct URL.
 
@@ -100,6 +110,7 @@ def reconcile_verified_delivery(
 
     upload = _complete_upload(complete)
     if not upload.get("verified"):
+        _notify(on_progress, "uploading", "uploading report files and verifying each transfer")
         with store.lock():
             store.queue_run(project, task_path, meta, run_path, run_id)
         result = uploader.process_queue(
@@ -108,6 +119,7 @@ def reconcile_verified_delivery(
             only_run=run_id,
             time_budget=120.0,
             reconcile=False,
+            on_progress=on_progress,
         )
         if result.get("busy"):
             return {"ok": False, "error": "another upload worker is already running"}
@@ -142,6 +154,7 @@ def reconcile_verified_delivery(
             "receipt_file_id": upload.get("receipt_file_id"),
         }
 
+    _notify(on_progress, "verifying", "resolving the verified report Drive file id")
     report_file = uploader.remote_file_id(report_remote_path, project)
     if not report_file.get("ok"):
         return {"ok": False, "error": report_file.get("error") or "cannot resolve the report Drive file id"}
@@ -158,7 +171,8 @@ def reconcile_verified_delivery(
     atomic_write_json(receipt_path, receipt)
     remote_dir = f"TASKS/{meta['task_folder']}/RUNS/{run_id}"
     receipt_remote_path = f"{remote_dir}/{RECEIPT_NAME}"
-    receipt_upload = uploader.upload_file(receipt_path, receipt_remote_path, project)
+    _notify(on_progress, "receipt", "uploading and verifying UPLOAD-RECEIPT.json")
+    receipt_upload = uploader.upload_file(receipt_path, receipt_remote_path, project, on_progress=on_progress)
     if not receipt_upload.get("ok"):
         return {"ok": False, "error": receipt_upload.get("error") or "upload receipt failed"}
     receipt_file = uploader.remote_file_id(receipt_remote_path, project)
@@ -178,7 +192,8 @@ def reconcile_verified_delivery(
     with store.lock():
         store.update_complete(run_path, {"upload": updates, "report": {"remote_url": report_file.get("url")}})
     complete_path = run_path / "COMPLETE.json"
-    complete_upload = uploader.upload_file(complete_path, f"{remote_dir}/COMPLETE.json", project)
+    _notify(on_progress, "reconciling", "re-uploading COMPLETE.json with verified upload metadata")
+    complete_upload = uploader.upload_file(complete_path, f"{remote_dir}/COMPLETE.json", project, on_progress=on_progress)
     if not complete_upload.get("ok"):
         return {"ok": False, "error": complete_upload.get("error") or "remote COMPLETE.json reconciliation failed"}
     with store.lock():
@@ -238,6 +253,10 @@ def build_issue_comment(record: dict[str, Any]) -> str:
 def publication_backoff(attempts: int, retry_seconds: int) -> str:
     delay = min(3600, max(5, retry_seconds) * (2 ** min(max(attempts - 1, 0), 6)))
     return (utcnow() + timedelta(seconds=delay)).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def upload_backoff(attempts: int, retry_seconds: int = 60) -> str:
+    return publication_backoff(attempts, retry_seconds)
 
 
 def publication_due(record: dict[str, Any], force: bool = False) -> bool:

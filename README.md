@@ -217,13 +217,16 @@ A claimed or started request is never automatically executed again after a resta
 An upload is considered verified only after every uploaded file passes MD5 or read-back verification. The dispatcher then resolves the actual Drive file ID, writes an `UPLOAD-RECEIPT.json`, re-uploads `COMPLETE.json` with truthful verified metadata, and only then publishes the direct report URL. A stale remote `COMPLETE.json` from an older upload is corrected; it is never treated as proof of verification by itself.
 
 ```bash
-agent-handoff dispatch status
+agent-handoff dispatch run --once                 # interactive: progress on stderr
+agent-handoff dispatch run --once --json          # stdout remains valid JSON
+agent-handoff dispatch run --once --progress      # force progress on non-TTY stderr
+agent-handoff dispatch status                     # health, links, next actions
 agent-handoff dispatch inspect --task <task-id> --run <run-id>
 agent-handoff dispatch deliver --task <task-id> --run <run-id> \
   --issue <number> --repository owner/private-dispatch
 ```
 
-`dispatch deliver` reconciles an existing run and publishes its verified URL. It never invokes an agent.
+Progress reports discovered, validated, executing, captured, uploading, verifying, receipt reconciliation, publishing, and completion stages with elapsed time. It never prints Issue instructions, prompt text, tokens, or local workspace paths. `--quiet` suppresses human progress without changing JSON stdout. `dispatch deliver` reconciles an existing run and publishes its verified URL. It never invokes an agent.
 
 See [docs/DISPATCH.md](docs/DISPATCH.md) for the state machine, trust model, exact commands, systemd user-service example, and recovery procedures.
 

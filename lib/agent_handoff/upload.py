@@ -9,7 +9,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import all_projects, load_config, project_by_name
 from .store import Store
@@ -26,6 +26,15 @@ from .util import (
 )
 
 REMOTE_TIMEOUT = 120.0
+
+
+def _notify(callback: Callable[[str, str], None] | None, stage: str, message: str) -> None:
+    if callback is None:
+        return
+    try:
+        callback(stage, message)
+    except Exception:
+        pass
 
 
 def _md5_hex(value: str) -> bool:
@@ -304,7 +313,14 @@ class Uploader:
             except OSError:
                 pass
 
-    def upload_file(self, local_path: str | Path, remote_rel: str, project: dict[str, Any], timeout: float = REMOTE_TIMEOUT) -> dict[str, Any]:
+    def upload_file(
+        self,
+        local_path: str | Path,
+        remote_rel: str,
+        project: dict[str, Any],
+        timeout: float = REMOTE_TIMEOUT,
+        on_progress: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
         local = Path(local_path)
         if not local.exists() or not local.is_file():
             return {"ok": False, "error": f"local file missing: {local}", "redactions": 0}
@@ -313,6 +329,7 @@ class Uploader:
         remote_rel = (remote_rel or "").strip().lstrip("/")
         if not remote_rel or remote_rel.startswith("..") or "/../" in remote_rel:
             return {"ok": False, "error": f"invalid remote path: {remote_rel!r}", "redactions": 0}
+        _notify(on_progress, "uploading", f"transferring {remote_rel} (bounded timeout {timeout:g}s, no total ETA)")
         parent = str(Path(remote_rel).parent)
         mkdir_key = f"{project['drive_folder_id']}:{parent}"
         if parent and parent != "." and mkdir_key not in self._mkdir_cache:
@@ -329,6 +346,7 @@ class Uploader:
             )
             if transfer.returncode != 0:
                 return {"ok": False, "error": sanitize_error(transfer.stderr or transfer.stdout), "redactions": redactions}
+            _notify(on_progress, "verifying", f"verifying {remote_rel} with MD5/read-back (bounded timeout {timeout:g}s)")
             verification = self.verify_remote_file(remote_rel, sanitized, project, timeout=timeout)
             if not verification.get("verified"):
                 return {
@@ -464,6 +482,7 @@ class Uploader:
         only_run: str | None = None,
         time_budget: float = 300.0,
         reconcile: bool = True,
+        on_progress: Callable[[str, str], None] | None = None,
     ) -> dict[str, Any]:
         lock = self.store.worker_lock()
         if not lock.acquire():
@@ -530,7 +549,7 @@ class Uploader:
                     summary["errors"].append(verification.get("error") or "project folder verification failed")
                     continue
                 if data.get("kind") == "run":
-                    result = self._process_run(project, item)
+                    result = self._process_run(project, item, on_progress=on_progress)
                 elif data.get("kind") == "index":
                     result = self._process_index(project, item)
                 else:
@@ -553,7 +572,13 @@ class Uploader:
         finally:
             lock.release()
 
-    def _process_run(self, project: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    def _process_run(
+        self,
+        project: dict[str, Any],
+        item: dict[str, Any],
+        *,
+        on_progress: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
         data = item["data"]
         task_id = data.get("task_id")
         run_id = data.get("run_id")
@@ -574,7 +599,7 @@ class Uploader:
         verified_files = []
         total_redactions = 0
         for file_item in files:
-            result = self.upload_file(file_item["local"], file_item["remote"], project)
+            result = self.upload_file(file_item["local"], file_item["remote"], project, on_progress=on_progress)
             if not result.get("ok"):
                 return {"ok": False, "error": result.get("error") or "upload failed"}
             total_redactions += int(result.get("redactions") or 0)

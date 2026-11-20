@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -13,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "lib") not in sys.path:
     sys.path.insert(0, str(ROOT / "lib"))
 
-from support import Harness  # noqa: E402
+from support import BIN, Harness  # noqa: E402
 
 from agent_handoff.dispatch.ledger import Ledger, new_dispatch_record  # noqa: E402
 
@@ -325,6 +327,12 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(record["status"], "UPLOAD_PENDING")
         self.assertEqual(record["capture"]["status"], "CAPTURED")
         self.assertFalse(record["upload"]["verified"])
+        status = self.h.jrun(["dispatch", "status", "--json"])
+        failed = status["records"][0]
+        self.assertEqual(failed["health"], "retryable")
+        self.assertEqual(failed["phase"], "retry_upload")
+        self.assertIn("upload only", failed["next_action"].lower())
+        self.assertTrue(failed["next_attempt_at"])
         second = self.h.dispatch("--force")
         self.assertEqual(second["executed"], 0)
         self.assertEqual(second["uploaded"], 1)
@@ -343,6 +351,11 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(record["status"], "UPLOAD_VERIFIED")
         self.assertEqual(record["publication"]["status"], "FAILED")
         self.assertTrue(record["upload"]["verified"])
+        status = self.h.jrun(["dispatch", "status", "--json"])
+        failed = status["records"][0]
+        self.assertEqual(failed["health"], "retryable")
+        self.assertEqual(failed["phase"], "retry_publication")
+        self.assertIn("publication only", failed["next_action"].lower())
         second = self.h.dispatch("--force")
         self.assertEqual(second["executed"], 0)
         self.assertEqual(second["published"], 1)
@@ -484,6 +497,158 @@ class DispatchTests(unittest.TestCase):
             ]
         )
         self.assertTrue(again["reused_comment"])
+        self.assertEqual(len(self.h.comments(1)), 1)
+
+    def test_progress_is_visible_before_slow_upload_and_stdout_stays_json(self) -> None:
+        self.h.add_issue(number=1, body=request_body())
+        env = self.h.env({"FAKE_SLOW_SECONDS": "0.4"})
+        process = subprocess.Popen(
+            [sys.executable, str(BIN), "dispatch", "run", "--once", "--json", "--progress"],
+            cwd=str(self.h.root),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        saw_uploading = False
+        stderr_lines: list[str] = []
+        deadline = time.monotonic() + 30
+        try:
+            while time.monotonic() < deadline:
+                line = process.stderr.readline() if process.stderr else ""
+                if not line:
+                    break
+                stderr_lines.append(line)
+                if "uploading:" in line:
+                    saw_uploading = True
+                    self.assertIsNone(process.poll(), "progress must be printed while the upload is still running")
+                    break
+            stdout, rest = process.communicate(timeout=60)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGINT)
+                process.communicate(timeout=10)
+        self.assertTrue(saw_uploading, "".join(stderr_lines))
+        data = json.loads(stdout)
+        self.assertTrue(data["ok"], data)
+        stderr = "".join(stderr_lines) + (rest or "")
+        for stage in ("discovered", "validated", "executing", "captured", "uploading", "verifying", "receipt", "reconciling", "publishing", "completed"):
+            self.assertIn(stage + ":", stderr)
+        self.assertRegex(stderr, r"\[\s*\d+\.\d+s\]")
+        self.assertNotIn("Do not edit files", stderr)
+        self.assertNotIn(str(self.h.project_path), stderr)
+        self.assertNotIn("FAKE_OPENCODE_OK", stderr)
+        self.assertEqual(len(self.h.opencode_calls()), 1)
+        self.assertEqual(len(self.h.comments(1)), 1)
+
+    def test_progress_is_opt_in_and_quiet_suppresses_it_without_changing_json(self) -> None:
+        self.h.add_issue(number=1, body=request_body())
+        plain = self.h.run(["dispatch", "run", "--once", "--json"])
+        self.assertTrue(json.loads(plain.stdout)["ok"])
+        self.assertEqual(plain.stderr.strip(), "")
+        self.h.add_issue(number=2, body=request_body(instructions="Second quiet task"))
+        quiet = self.h.run(["dispatch", "run", "--once", "--json", "--progress", "--quiet"])
+        self.assertTrue(json.loads(quiet.stdout)["ok"])
+        self.assertEqual(quiet.stderr.strip(), "")
+        self.assertEqual(len(self.h.opencode_calls()), 2)
+
+    def test_status_explains_delivered_runs_and_dead_execution(self) -> None:
+        self.h.add_issue(number=1, body=request_body())
+        result = self.h.dispatch("--force")
+        self.assertTrue(result["ok"], result)
+        status = self.h.jrun(["dispatch", "status", "--json"])
+        delivered = status["records"][0]
+        self.assertEqual(delivered["health"], "delivered")
+        self.assertTrue(delivered["upload"]["report_url"].startswith("https://drive.google.com/file/d/"))
+        self.assertTrue(delivered["publication"]["comment_url"])
+        self.assertIn("None.", delivered["next_action"])
+        human = self.h.run(["dispatch", "status"]).stdout
+        self.assertIn("Delivered", human)
+        self.assertIn(delivered["upload"]["report_url"], human)
+        self.assertIn("next action", human)
+
+        issue = self.h.add_issue(number=2, body=request_body(instructions="Stalled task"))
+        ledger = Ledger(self.h.config)
+        record = new_dispatch_record(
+            repository=GH_REPO,
+            issue=issue,
+            project={
+                "name": "Alpha",
+                "core_key": "alpha",
+                "core_name": "Alpha",
+                "workspace": str(self.h.project_path.resolve()),
+                "drive_folder_id": "alpha_folder_0001",
+            },
+            agent="opencode",
+            model="provider/model-fast",
+            request={"version": "1", "instructions": "stored request"},
+        )
+        ledger.create(record)
+        ledger.set_status(
+            GH_REPO,
+            2,
+            "RUNNING",
+            note="simulated dead dispatcher",
+            updates={
+                "execution": {
+                    "status": "RUNNING",
+                    "started_at": record["created_at"],
+                    "runner_pid": 2147483646,
+                }
+            },
+        )
+        stalled = self.h.jrun(["dispatch", "status", "--issue", "2", "--json"])["records"][0]
+        self.assertEqual(stalled["health"], "stalled")
+        self.assertTrue(stalled["stalled"])
+        self.assertIn("no longer alive", stalled["next_action"])
+        self.assertEqual(len(self.h.opencode_calls()), 1)
+
+    def test_interrupted_upload_restart_keeps_identity_and_does_not_rerun(self) -> None:
+        self.h.add_issue(number=1, body=request_body())
+        env = self.h.env({"FAKE_SLOW_SECONDS": "5"})
+        process = subprocess.Popen(
+            [sys.executable, str(BIN), "dispatch", "run", "--once", "--json"],
+            cwd=str(self.h.root),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        ledger = Ledger(self.h.config)
+        record = None
+        deadline = time.monotonic() + 30
+        try:
+            while time.monotonic() < deadline:
+                record = ledger.get(GH_REPO, 1)
+                if record and record.get("status") == "UPLOAD_PENDING":
+                    break
+                if process.poll() is not None:
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(record)
+            self.assertEqual(record.get("status"), "UPLOAD_PENDING")
+            self.assertEqual(record["capture"]["status"], "CAPTURED")
+            session_id = record["session"]["id"]
+            self.assertEqual(len(self.h.opencode_calls()), 1)
+            os.killpg(process.pid, signal.SIGINT)
+            process.communicate(timeout=15)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=5)
+        self.assertNotEqual(process.returncode, 0)
+
+        restarted = self.h.dispatch("--force")
+        self.assertTrue(restarted["ok"], restarted)
+        self.assertEqual(restarted["executed"], 0)
+        self.assertEqual(restarted["uploaded"], 1)
+        self.assertEqual(restarted["published"], 1)
+        final = self.h.record(1)
+        self.assertEqual(final["session"]["id"], session_id)
+        self.assertEqual(final["status"], "ISSUE_UPDATED")
+        self.assertEqual(len(self.h.opencode_calls()), 1)
         self.assertEqual(len(self.h.comments(1)), 1)
 
     def test_write_mode_requires_explicit_permission_pair(self) -> None:

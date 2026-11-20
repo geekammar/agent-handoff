@@ -1,4 +1,6 @@
-# Dispatcher (v1.1)
+# Dispatcher (v1.1, v1.2 P0 progress)
+
+v1.2 P0 adds observable progress, actionable `dispatch status`, and safe interruption/restart reporting. The durable ledger, request contract, upload verification, and issue publication rules below are unchanged.
 
 The dispatcher is an optional process on the user's own Linux machine or VPS. It polls a private GitHub Issue inbox, validates a versioned request, runs OpenCode in one explicitly configured project workspace, captures the result through Agent Handoff, verifies the Drive upload, and publishes the direct report URL back to the originating issue.
 
@@ -188,6 +190,8 @@ Writes are atomic; ledger mutations use `flock`. Only one dispatcher runner lock
 
 `dispatch deliver` reconciles an existing run manually and never invokes an agent.
 
+An interrupted command (for example Ctrl-C during a slow upload) leaves the durable record `UPLOAD_PENDING` with capture already complete. A later `dispatch run` retries the upload with the same task/run identity and session. It does not start another OpenCode session, and an existing delivery marker prevents a duplicate issue comment.
+
 ## Upload verification and direct URLs
 
 The core upload contract is unchanged:
@@ -216,7 +220,14 @@ agent-handoff dispatch run --once --json
 # Continuous polling (foreground; use a service manager for persistence)
 agent-handoff dispatch run --watch
 
-# Inspect durable records
+# Human progress on stderr even when stderr is not a TTY
+agent-handoff dispatch run --once --progress
+
+# Suppress human progress/summary; JSON stdout is unchanged
+agent-handoff dispatch run --once --json --progress --quiet
+
+# Inspect durable records with health, links, retries, and next actions
+agent-handoff dispatch status
 agent-handoff dispatch status --json
 
 # Read local + remote metadata for one run without changes
@@ -228,6 +239,29 @@ agent-handoff dispatch deliver --task <task-id> --run <run-id> \
 ```
 
 `dispatch run` refuses to start when `dispatch.enabled` is false. `config validate` validates core and dispatch configuration without contacting GitHub or Drive.
+
+## Progress and machine output (v1.2 P0)
+
+Ordinary interactive use writes short, elapsed-time progress lines to **stderr**. `--json` stdout remains a single valid JSON object even when progress is enabled. Progress is opt-in for non-interactive stderr via `--progress`; `--quiet` suppresses human progress and summaries. `dispatch deliver` supports the same two flags.
+
+Progress stages describe observed work, not guesses:
+
+```text
+discovering -> discovered -> validated -> claimed -> executing -> executed
+-> capturing -> captured -> uploading -> verifying -> receipt
+-> reconciling -> publishing -> completed
+```
+
+- Long operations say they are bounded and cite the configured timeout; no total ETA is invented.
+- Failures add a `retryable` stage with the next retry time and state whether only the upload or only the publication is retried.
+- Progress never includes Issue instructions, prompt text, environment contents, tokens, or local workspace paths. Local paths in error text are replaced with `<local>` before printing.
+- The final poll summary includes `elapsed_seconds`. In watch mode, elapsed time resets for each poll.
+
+In `--watch --json` mode, each poll writes one compact JSON object per line (newline-delimited JSON); `--once --json` writes one pretty-printed object. Progress remains on stderr.
+
+`dispatch status` groups records as executing/current, stalled, needs attention, retryable, pending, or delivered. Each entry shows the Issue link, a verified report link when one exists, the delivery comment, the next retry when known, and one concrete next action. The JSON form preserves the previous record fields and adds `health`, `phase`, `stalled`, `age_seconds`, `elapsed_seconds`, `next_action`, `next_attempt_at`, and `last_error`.
+
+Stalled detection uses the recorded runner PID when present. A `RUNNING` or `CLAIMED` record whose dispatcher process is gone is reported as stalled; the next `dispatch run` reconciles persisted session output or marks the request `NEEDS_ATTENTION` without re-executing OpenCode.
 
 ## systemd user service (optional)
 
@@ -277,8 +311,8 @@ The service runs as the user who owns `gh` and rclone credentials. It does not r
 agent-handoff dispatch status --json
 ```
 
-- `UPLOAD_PENDING`: Drive unavailable or verification failed. Retry upload only.
-- `UPLOAD_VERIFIED`: publication pending/failed. Retry comment only.
+- `UPLOAD_PENDING`: Drive unavailable or verification failed. Retry upload only. `dispatch status` shows the next retry and the exact action.
+- `UPLOAD_VERIFIED`: publication pending/failed. Retry comment only. The verified upload is reused.
 - `NEEDS_ATTENTION`: an execution was uncertain and no recoverable output exists. Inspect the host and session evidence; do not blindly rerun. Submit a new issue if the work must be repeated.
 - `REJECTED`: malformed or unauthorized request. A new, corrected issue is required; editing an old rejected issue does not automatically execute it.
 

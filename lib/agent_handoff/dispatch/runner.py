@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any
 
 from ..adapters.common import git_info
-from ..config import project_by_name
+from ..config import all_projects, project_by_name
 from ..report import auto_report
 from ..store import Store
 from ..upload import Uploader
@@ -19,14 +20,16 @@ from .delivery import (
     publication_due,
     reconcile_verified_delivery,
     rejection_marker,
+    upload_backoff,
 )
 from .github import GithubError, GithubTransport
 from .ledger import Ledger, new_dispatch_record
+from .progress import ProgressReporter
 from .requests import RequestError, detect_request, parse_issue_request, resolve_request
 
 
 class DispatchRunner:
-    def __init__(self, config: dict[str, Any], dispatch: dict[str, Any]):
+    def __init__(self, config: dict[str, Any], dispatch: dict[str, Any], *, progress: ProgressReporter | None = None):
         self.config = config
         self.dispatch = dispatch
         self.store = Store(config)
@@ -35,7 +38,36 @@ class DispatchRunner:
         self.adapter = OpenCodeAdapter(dispatch.get("execution") or {})
         self.uploader = Uploader(config, self.store)
         self.log_path = self.store.logs_root / "dispatch.log"
+        self.progress = progress
         self.summary: dict[str, Any] = {}
+        self._started_at = time.monotonic()
+        if self.progress is not None:
+            paths = [
+                str(self.store.data_root),
+                str(self.store.queue_root),
+                str(self.store.state_root),
+                str(self.store.locks_root),
+                str(self.store.logs_root),
+                str(self.store.tmp_root),
+                str(Path.home()),
+            ]
+            for project in all_projects(config):
+                paths.extend(str(path) for path in (project.get("paths") or []))
+            for item in (dispatch.get("projects") or {}).values():
+                if isinstance(item, dict) and item.get("workspace"):
+                    paths.append(str(item["workspace"]))
+            self.progress.add_redactions(paths)
+
+    def _progress(self, stage: str, message: str, record: dict[str, Any] | None = None) -> None:
+        if self.progress is None:
+            return
+        issue = None
+        if record is not None:
+            try:
+                issue = int(record["issue_number"])
+            except (KeyError, TypeError, ValueError):
+                issue = None
+        self.progress.emit(stage, message, issue=issue)
 
     def _log(self, message: str) -> None:
         try:
@@ -53,7 +85,11 @@ class DispatchRunner:
     def run_once(self, *, force: bool = False) -> dict[str, Any]:
         lock = self.runner_lock()
         if not lock.acquire():
+            self._progress("busy", "another dispatcher process already holds the runner lock; nothing was started")
             return {"ok": True, "busy": True, "executed": 0, "published": 0, "errors": []}
+        self._started_at = time.monotonic()
+        if self.progress is not None:
+            self.progress.reset()
         self.summary = {
             "ok": True,
             "busy": False,
@@ -66,6 +102,7 @@ class DispatchRunner:
             "warnings": [],
         }
         try:
+            self._progress("discovering", "verifying the private issue inbox and dispatcher authorization")
             try:
                 inbox = self.transport.verify_inbox()
             except GithubError as exc:
@@ -73,14 +110,17 @@ class DispatchRunner:
                 self.summary["errors"].append(sanitize_error(str(exc)))
                 return self.summary
             self._log(f"poll start repository={inbox.get('repository')} user={inbox.get('user')}")
+            self._progress("discovering", "inbox verified; recovering durable records without re-execution")
             self._recover_inflight(force=force)
             self._advance_all(force=force)
+            self._progress("discovering", "listing open issue requests")
             try:
                 issues = self.transport.list_open_issues()
             except GithubError as exc:
                 self.summary["ok"] = False
                 self.summary["errors"].append(sanitize_error(str(exc)))
                 return self.summary
+            self._progress("discovering", f"found {len(issues)} open issue(s) to inspect")
             for issue in issues:
                 try:
                     self._process_issue(issue, force=force)
@@ -92,6 +132,13 @@ class DispatchRunner:
             self.summary["records"] = len(self.ledger.all())
             return self.summary
         finally:
+            self.summary["elapsed_seconds"] = round(max(0.0, time.monotonic() - self._started_at), 2)
+            self._progress(
+                "finished",
+                f"poll finished executed={self.summary.get('executed', 0)} "
+                f"uploaded={self.summary.get('uploaded', 0)} published={self.summary.get('published', 0)} "
+                f"needs_attention={self.summary.get('needs_attention', 0)}",
+            )
             lock.release()
 
     def _recover_inflight(self, *, force: bool) -> None:
@@ -106,6 +153,11 @@ class DispatchRunner:
         session = record.get("session") or {}
         events_path = session.get("events_path")
         if session.get("id") and events_path and Path(events_path).is_file():
+            self._progress(
+                "recovering",
+                "existing session output found; capturing and delivering it without re-running OpenCode",
+                record,
+            )
             result = self.adapter.recover(events_path)
             if result:
                 self._log(f"recovered session output for issue #{record.get('issue_number')} without re-execution")
@@ -129,15 +181,18 @@ class DispatchRunner:
         )
         self.summary["needs_attention"] += 1
         self.summary["ok"] = False
+        self._progress("needs_attention", reason, record)
         self._log(f"issue #{record.get('issue_number')} needs attention: {reason}")
 
     def _recover_capture(self, record: dict[str, Any], *, force: bool) -> None:
         capture = record.get("capture") or {}
         if capture.get("status") == "CAPTURED":
+            self._progress("recovering", "existing report capture found; continuing upload/publication only", record)
             self._upload_and_publish(record, force=force)
             return
         session = record.get("session") or {}
         events_path = session.get("events_path")
+        self._progress("recovering", "rebuilding report capture from persisted session events", record)
         result = self.adapter.recover(events_path) if events_path else None
         if not result:
             reason = "execution finished but no session output was persisted; operator review required"
@@ -150,6 +205,7 @@ class DispatchRunner:
             )
             self.summary["needs_attention"] += 1
             self.summary["ok"] = False
+            self._progress("needs_attention", reason, record)
             return
         self._capture(record, result, force=force)
         self._upload_and_publish(record, force=force)
@@ -174,20 +230,34 @@ class DispatchRunner:
             return
         number = int(issue["number"])
         repository = self.dispatch["repository"]
+        self._progress("discovered", "versioned request marker found", {"issue_number": number})
         try:
             request = parse_issue_request(body)
             if request is None:
                 return
             resolved = resolve_request(request, self.dispatch)
         except RequestError as exc:
+            self._progress("rejected", "validation failed; no agent session was started", {"issue_number": number})
             self._reject(issue, str(exc), comment=self.transport.issue_author_allowed(issue))
             return
         if not self.transport.issue_author_allowed(issue):
+            self._progress("rejected", "issue author is not authorized; no agent session was started", {"issue_number": number})
             self._record_rejection(issue, "issue author is not authorized in dispatch.allowed_users", comment=False)
             return
+        self._progress(
+            "validated",
+            f"project={resolved.project.get('name')} agent={request.agent} "
+            f"model={resolved.model} session={request.session}",
+            {"issue_number": number},
+        )
 
         existing = self.ledger.get(repository, number)
         if existing:
+            self._progress(
+                "resumed",
+                f"durable record already exists with status={existing.get('status')}; no duplicate session will be started",
+                existing,
+            )
             if existing.get("status") == "NEW":
                 self._execute(existing, force=force)
             return
@@ -215,6 +285,7 @@ class DispatchRunner:
             if record.get("status") == "NEW":
                 self._execute(record, force=force)
             return
+        self._progress("claimed", "durable claim persisted before execution", record)
         self._log(f"claimed issue #{number} project={resolved.project.get('name')} model={resolved.model}")
         self._execute(record, force=force)
 
@@ -280,7 +351,7 @@ class DispatchRunner:
             number,
             "CLAIMED",
             note="claimed before execution",
-            updates={"execution": {"status": "CLAIMED"}},
+            updates={"execution": {"status": "CLAIMED", "runner_pid": os.getpid()}},
         )
         stamp = utcnow_iso().replace(":", "").replace("-", "")
         events_path = str(self.ledger.event_path(repository, number, stamp))
@@ -290,9 +361,17 @@ class DispatchRunner:
             "RUNNING",
             note="opencode execution started",
             updates={
-                "execution": {"status": "RUNNING", "started_at": utcnow_iso(), "last_error": None},
+                "execution": {"status": "RUNNING", "started_at": utcnow_iso(), "last_error": None, "runner_pid": os.getpid()},
                 "session": {"events_path": events_path},
             },
+        )
+        timeout_seconds = float((self.dispatch.get("execution") or {}).get("timeout_seconds", 1200))
+        profile = str((self.dispatch.get("execution") or {}).get("permission_profile", "read_only"))
+        self._progress(
+            "executing",
+            f"OpenCode started with model={record.get('model')} profile={profile} "
+            f"(bounded timeout {timeout_seconds:g}s; no total ETA)",
+            record,
         )
         title = safe_title(f"Agent Handoff issue #{number}: {record.get('issue_title') or record.get('project', {}).get('name', '')}")
         try:
@@ -304,7 +383,7 @@ class DispatchRunner:
                     instructions=str(request_data.get("instructions") or ""),
                     permission_profile=str((self.dispatch.get("execution") or {}).get("permission_profile", "read_only")),
                     allow_write=bool((self.dispatch.get("execution") or {}).get("allow_write", False)),
-                    timeout_seconds=float((self.dispatch.get("execution") or {}).get("timeout_seconds", 1200)),
+                    timeout_seconds=timeout_seconds,
                 ),
                 events_path=events_path,
                 on_session=lambda session_id: self.ledger.update(
@@ -338,9 +417,16 @@ class DispatchRunner:
             )
             self.summary["needs_attention"] += 1
             self.summary["ok"] = False
+            self._progress("needs_attention", "execution failed without recoverable output; the agent will not be re-run", current)
             self._log(f"issue #{number} execution failed: {error}")
             return
         self.summary["executed"] += 1
+        self._progress(
+            "executed",
+            f"execution finished outcome={result.outcome} exit={result.exit_code} "
+            f"events={result.event_count} session={'captured' if result.session_id else 'not captured'}",
+            record,
+        )
         self._log(
             f"issue #{number} execution finished outcome={result.outcome} exit={result.exit_code} "
             f"session={result.session_id or 'none'} events={result.event_count}"
@@ -366,6 +452,7 @@ class DispatchRunner:
                     "outcome": result.outcome,
                     "termination_reason": result.termination_reason,
                     "last_error": result.error,
+                    "runner_pid": None,
                 },
                 "session": {"id": result.session_id, "events_path": result.events_path},
             },
@@ -386,6 +473,7 @@ class DispatchRunner:
         capture = current.get("capture") or {}
         if capture.get("status") == "CAPTURED":
             return True
+        self._progress("capturing", "creating the local structured report and upload queue item", current)
         project = self._project_for(current)
         if not project:
             reason = "Agent Handoff project is no longer configured"
@@ -398,6 +486,7 @@ class DispatchRunner:
             )
             self.summary["needs_attention"] += 1
             self.summary["ok"] = False
+            self._progress("needs_attention", "report capture failed because the Agent Handoff project is not configured", current)
             return False
         task_id = capture.get("task_id") or new_id("t-")
         run_id = capture.get("run_id") or new_id("r-")
@@ -537,6 +626,7 @@ class DispatchRunner:
                     updates={"capture": {"status": "FAILED", "last_error": error}},
                 )
                 self.summary["ok"] = False
+                self._progress("retryable", "report capture failed; the next poll retries capture without re-running OpenCode", current)
                 self._log(f"issue #{number} capture failed: {error}")
                 return False
         self.ledger.set_status(
@@ -556,6 +646,7 @@ class DispatchRunner:
                 "upload": {"status": "PENDING"},
             },
         )
+        self._progress("captured", f"report captured as task={task_id} run={run_id}; upload is pending", current)
         return True
 
     def _upload_and_publish(self, record: dict[str, Any], *, force: bool) -> None:
@@ -577,9 +668,21 @@ class DispatchRunner:
             )
             self.summary["needs_attention"] += 1
             self.summary["ok"] = False
+            self._progress("needs_attention", reason, current)
             return
         task_id = str(capture.get("task_id"))
         run_id = str(capture.get("run_id"))
+        attempts = int((current.get("upload") or {}).get("attempts", 0)) + 1
+        self._progress(
+            "uploading",
+            f"starting verified upload attempt {attempts} "
+            f"(bounded external operations; no total ETA)",
+            current,
+        )
+
+        def upload_progress(stage: str, message: str) -> None:
+            self._progress(stage, message, current)
+
         result = reconcile_verified_delivery(
             self.config,
             self.store,
@@ -588,10 +691,11 @@ class DispatchRunner:
             task_id,
             run_id,
             force=force,
+            on_progress=upload_progress,
         )
         if not result.get("ok"):
-            attempts = int((current.get("upload") or {}).get("attempts", 0)) + 1
             error = sanitize_error(result.get("error") or "upload reconciliation failed")
+            next_attempt_at = upload_backoff(attempts)
             self.ledger.set_status(
                 current["repository"],
                 int(current["issue_number"]),
@@ -603,11 +707,18 @@ class DispatchRunner:
                         "verified": False,
                         "attempts": attempts,
                         "last_error": error,
+                        "next_attempt_at": next_attempt_at,
                     }
                 },
             )
             self.summary["ok"] = False
             self.summary["errors"].append(f"issue #{current['issue_number']}: {error}")
+            self._progress(
+                "retryable",
+                f"upload attempt {attempts} failed; retry scheduled for {next_attempt_at}. "
+                "The claimed session will not be re-executed (retry upload only).",
+                current,
+            )
             self._log(f"issue #{current['issue_number']} upload failed: {error}")
             return
         self.ledger.set_status(
@@ -625,11 +736,13 @@ class DispatchRunner:
                     "receipt_remote_path": result.get("receipt_remote_path"),
                     "receipt_url": result.get("receipt_url"),
                     "last_error": None,
+                    "next_attempt_at": None,
                 }
             },
         )
         self.summary["uploaded"] += 1
         current = self.ledger.get(current["repository"], int(current["issue_number"])) or current
+        self._progress("verified", "report upload and receipt passed MD5/read-back verification", current)
         self._publish(current, force=force)
 
     def _publish(self, record: dict[str, Any], *, force: bool) -> None:
@@ -645,6 +758,9 @@ class DispatchRunner:
         if not (current.get("upload") or {}).get("report_url") and capture.get("status") == "CAPTURED":
             project = self._project_for(current)
             if project:
+                def hydrate_progress(stage: str, message: str) -> None:
+                    self._progress(stage, message, current)
+
                 reconciled = reconcile_verified_delivery(
                     self.config,
                     self.store,
@@ -653,6 +769,7 @@ class DispatchRunner:
                     str(capture.get("task_id")),
                     str(capture.get("run_id")),
                     force=force,
+                    on_progress=hydrate_progress,
                 )
                 if reconciled.get("ok"):
                     current = self.ledger.update(
@@ -668,6 +785,7 @@ class DispatchRunner:
                                 "receipt_remote_path": reconciled.get("receipt_remote_path"),
                                 "receipt_url": reconciled.get("receipt_url"),
                                 "last_error": None,
+                                "next_attempt_at": None,
                             }
                         ),
                         note="hydrated verified upload metadata before publication",
@@ -687,6 +805,11 @@ class DispatchRunner:
                     return
         run_id = str(capture.get("run_id") or current.get("dispatch_id"))
         marker = delivery_marker(run_id)
+        self._progress(
+            "publishing",
+            "checking for an existing idempotent delivery comment, then publishing the verified report link",
+            current,
+        )
         try:
             existing = self.transport.find_comment(int(current["issue_number"]), marker)
             if existing:
@@ -701,9 +824,11 @@ class DispatchRunner:
                             "published_at": existing.get("created_at") or utcnow_iso(),
                             "comment_url": existing.get("html_url"),
                             "last_error": None,
+                            "next_attempt_at": None,
                         }
                     },
                 )
+                self._progress("completed", "existing delivery comment was already present; no duplicate was posted", current)
                 return
             response = self.transport.comment(int(current["issue_number"]), build_issue_comment(current))
             self.ledger.set_status(
@@ -717,10 +842,12 @@ class DispatchRunner:
                         "published_at": utcnow_iso(),
                         "comment_url": response.get("url"),
                         "last_error": None,
+                        "next_attempt_at": None,
                     }
                 },
             )
             self.summary["published"] += 1
+            self._progress("completed", "verified report URL published to the originating issue", current)
             self._log(f"issue #{current['issue_number']} verified report published")
         except GithubError as exc:
             attempts = int(publication.get("attempts", 0)) + 1
@@ -746,4 +873,11 @@ class DispatchRunner:
             )
             self.summary["ok"] = False
             self.summary["errors"].append(f"issue #{current['issue_number']} publication: {error}")
+            next_at = publication_backoff(attempts, int((self.dispatch.get("delivery") or {}).get("retry_seconds", 60)))
+            self._progress(
+                "retryable",
+                f"GitHub publication failed; retry scheduled for {next_at}. "
+                "Only the comment is retried; the verified upload is reused.",
+                current,
+            )
             self._log(f"issue #{current['issue_number']} publication failed: {error}")
