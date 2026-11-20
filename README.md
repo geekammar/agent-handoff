@@ -6,6 +6,7 @@ It has two layers:
 
 1. **Core capture (always available):** records structured reports for OpenCode and AGY sessions, stores them locally, uploads them to a Google Drive reports subtree with `rclone`, and verifies the upload using MD5 or read-back.
 2. **Optional GitHub Issue dispatcher (v1.1):** a separate process on your own Linux machine claims explicitly configured tasks from a private GitHub Issue, runs a local OpenCode model in a fixed project workspace, captures the report through Agent Handoff, uploads it, verifies it, and publishes the direct Drive report URL back to the originating issue.
+3. **Optional Telegram notifications (v1.2 P1):** after the durable dispatcher record reaches `ISSUE_UPDATED`, a small local outbox sends one concise Telegram message with the verified Drive report URL, the original Issue URL, and a copy-ready Arabic ChatGPT handoff prompt. Telegram failures never change report delivery.
 
 The runtime is deliberately small: Python standard library, `rclone`, and (for the optional dispatcher) the GitHub CLI `gh` plus OpenCode. There is no database server, web dashboard, inbound public port, SaaS dependency, or mandatory cloud service.
 
@@ -230,6 +231,79 @@ Progress reports discovered, validated, executing, captured, uploading, verifyin
 
 See [docs/DISPATCH.md](docs/DISPATCH.md) for the state machine, trust model, exact commands, systemd user-service example, and recovery procedures.
 
+## Optional Telegram notifications
+
+Telegram notifications are **disabled by default** and are independent of task execution and report delivery. A missing token, an invalid chat ID, a Telegram outage, or a failed send never changes a delivered report, reruns OpenCode, re-uploads the report, or reposts the GitHub comment.
+
+Add a `notifications` section to the runtime config and keep only the environment variable **name** in JSON:
+
+```json
+{
+  "notifications": {
+    "telegram": {
+      "enabled": true,
+      "chat_id": "-1001234567890",
+      "token_env": "AGENT_HANDOFF_TELEGRAM_TOKEN",
+      "timeout_seconds": 10,
+      "retry_seconds": 60,
+      "max_attempts": 5,
+      "delayed_after_attempts": 3
+    }
+  }
+}
+```
+
+Export the actual bot token in the dispatcher service environment. Never put it in the repository, the runtime JSON file, an Issue, a report, or a chat message:
+
+```bash
+export AGENT_HANDOFF_TELEGRAM_TOKEN='<bot-token>'
+agent-handoff config validate
+agent-handoff dispatch run --once
+```
+
+Restart a running dispatcher service after changing notification configuration so the new settings and activation boundary take effect.
+
+The owner must create the bot with Telegram's BotFather and obtain the recipient chat ID. The tool does not create bots, log in to Telegram, or alter Drive sharing. A private Drive report URL is usable only by a Telegram recipient who can already access that Drive file.
+
+A successful delivery notification contains the project, the Issue title, the literal `Verified & Delivered` delivery status, the execution outcome, the direct Google Drive `REPORT.md` URL, the original Issue URL, and a short Arabic prompt:
+
+```text
+تم الانتهاء من مهمة ProjectA — Fix login redirect.
+اقرأ تقرير التنفيذ:
+https://drive.google.com/file/d/<verified-file-id>/view
+وراجع الكود والاختبارات، ثم أخبرني بالنتيجة
+والإصلاحات والمتبقي والخطوة التالية.
+```
+
+The prompt is a normal selectable text block. Inline `View Report` and `View GitHub Issue` buttons are provided; there is no native Telegram copy button. The prompt does not claim that ChatGPT has already read the report.
+
+Notification kinds:
+
+| Kind | When |
+| --- | --- |
+| `DELIVERY_COMPLETED` | Only after `ISSUE_UPDATED`, a verified upload, a verified upload receipt, and confirmed GitHub publication. |
+| `NEEDS_ATTENTION` | Uncertain execution, capture failure requiring review, or exhausted GitHub publication retries. Never described as successful delivery. |
+| `DELIVERY_DELAYED` | A captured task whose upload is still failing, or a verified task whose GitHub publication is still failing. It states which situation is current and never calls an unverified upload a verified report. Thresholded by `delayed_after_attempts`; it does not fire on every poll. |
+
+Notifications are stored in a durable local outbox under `state/dispatch/notifications/`. A stable identity of project + task + run + kind prevents repeated completion messages on later polls. Pending notifications survive a dispatcher restart without rerunning OpenCode or republishing the Issue. Before a queued message is sent, its durable dispatch record is rechecked; if the task recovered or the attention condition was resolved, the obsolete notification becomes `SUPERSEDED` instead of being sent. The audit record is retained, not deleted. Telegram has no universal end-to-end exactly-once transaction with the local filesystem, so delivery is best-effort at-least-once with local deduplication; an interrupted send is flagged for review rather than silently resent.
+
+Old already-delivered records are never backfilled. Reconciliation is bounded by the real lifecycle transition timestamp (for example `publication.published_at` for completion, or the recorded attention transition), not by a generic `updated_at` change. Enabling notifications therefore does not flood the owner with historical reports, while genuinely new transitions after enablement can still be recovered.
+
+The Telegram client always targets the official `https://api.telegram.org` Bot API. It does not read a runtime environment variable for an alternate API host; deterministic tests inject a fake transport explicitly.
+
+```bash
+agent-handoff dispatch status                 # includes notification counts and per-task state
+agent-handoff dispatch notify                 # inspect pending/failed notifications
+agent-handoff dispatch notify --json
+agent-handoff dispatch notify --retry         # retry confirmed failures only; never runs agents
+agent-handoff dispatch notify --retry --task <task-id> --run <run-id> --json
+agent-handoff dispatch notify --retry --notification <id> --acknowledge-duplicate --json
+```
+
+A generic `--retry` never resends an ambiguous interrupted send, because that could deliver a duplicate. After reviewing the Telegram chat, an operator may retry one specific notification with `--notification` and `--acknowledge-duplicate`.
+
+See [docs/DISPATCH.md](docs/DISPATCH.md) for the outbox state machine and [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for notification recovery.
+
 ## AI-native onboarding
 
 Share the repository URL with a tool-enabled AI assistant and point it at [AGENTS.md](AGENTS.md) or [docs/AI-QUICKSTART.md](docs/AI-QUICKSTART.md).
@@ -272,6 +346,8 @@ Upgrade snapshots the installed code and restores it automatically if installati
 - The dispatcher never derives filesystem paths or shell commands from issue content.
 - The default execution policy is read-only (`plan` agent, denied writes, denied env reads). This is an OpenCode tool-permission policy, not an OS-level sandbox; see the security limitations in `docs/DISPATCH.md`.
 - Logs and uploaded reports are sanitized of obvious secrets; local report copies remain intact for audit.
+- The Telegram bot token is read from an environment variable named in config. It is never written to the repository, reports, notification records, logs, or error messages.
+- Telegram messages contain only project, task title, status/outcome, verified URLs, and a sanitized reason. They never include Issue instructions, prompts, transcripts, local paths, or credentials.
 - Uploaded receipts contain identities and hashes, not local filesystem paths or credentials.
 - Runtime config and data are mode `600`/`700` and intentionally outside Git.
 
@@ -286,6 +362,8 @@ agent-handoff/
     dispatch/                  # optional v1.1 dispatcher
       config.py, requests.py, ledger.py, github.py, runner.py, delivery.py
       adapters/base.py, adapters/opencode.py
+    notify/                    # optional Telegram outbox and transport
+      config.py, messages.py, service.py, store.py, transport.py
   integrations/                # installed capture integrations
   setup/                       # installer, upgrade, rollback, auth helper
   tests/                       # deterministic tests + fake backends
@@ -303,6 +381,8 @@ agent-handoff/
 - Automatic reports cannot independently verify code changes, tests, or deployments.
 - The rclone OAuth token can expire or be revoked.
 - The dispatcher runs on your own host; it does not provide a hosted service or public API.
+- Telegram delivery is best-effort at-least-once with local deduplication, not a mathematically guaranteed exactly-once transaction. An interrupted send may have an ambiguous outcome and is flagged for review; a generic retry excludes it.
+- Telegram notifications do not create bots, authenticate Telegram accounts, alter Drive permissions, or replay historical deliveries on first enablement.
 - Google Drive folder IDs must remain stable; renaming a project in config does not rename the Drive folder.
 
 ## More documentation

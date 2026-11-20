@@ -76,6 +76,7 @@ def record_status_view(
     dispatch: dict[str, Any] | None = None,
     *,
     now: datetime | None = None,
+    notifications: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Extend the stable machine summary with local, actionable health fields."""
 
@@ -210,6 +211,7 @@ def record_status_view(
                 400,
             )
             or None,
+            "notifications": list(notifications or []),
         }
     )
     return view
@@ -245,5 +247,48 @@ def format_status_view(view: dict[str, Any]) -> list[str]:
         lines.append(f"      next retry: {view['next_attempt_at']}")
     if view.get("last_error"):
         lines.append(f"      last error: {view['last_error']}")
+    for notification in view.get("notifications") or []:
+        detail = (
+            f"      notification: {notification.get('kind')} {notification.get('state')}"
+            f" · attempts={notification.get('attempts', 0)}"
+        )
+        if notification.get("telegram_message_id") is not None:
+            detail += f" · telegram_message_id={notification.get('telegram_message_id')}"
+        if notification.get("next_attempt_at"):
+            detail += f" · next retry {notification.get('next_attempt_at')}"
+        lines.append(detail)
+        if notification.get("superseded_reason"):
+            lines.append(f"        notification superseded: {notification.get('superseded_reason')}")
+        if notification.get("last_error"):
+            lines.append(f"        notification error: {notification.get('last_error')}")
+        state = notification.get("state")
+        if state == "SUPERSEDED":
+            lines.append(
+                "        notification note: the task condition changed before this message was sent; "
+                "the record is retained without sending"
+            )
+        elif state == "PENDING":
+            lines.append("        notification note: the next dispatcher poll will send it; report delivery is unaffected")
+        elif state == "RETRY_WAIT":
+            lines.append(
+                "        notification note: automatic retry is scheduled; use "
+                "agent-handoff dispatch notify --retry for an immediate retry. Report delivery is unaffected"
+            )
+        elif state == "NEEDS_ATTENTION" and notification.get("ambiguous"):
+            lines.append(
+                "        notification note: the interrupted send may already have arrived. Generic --retry "
+                "excludes it; review Telegram, then use a targeted --notification <id> "
+                "--acknowledge-duplicate only if a duplicate is acceptable"
+            )
+        elif state == "NEEDS_ATTENTION" and notification.get("unresolved"):
+            lines.append(
+                "        notification note: the related dispatch record is unavailable, so nothing was sent. "
+                "Inspect the durable state, then use agent-handoff dispatch notify --retry"
+            )
+        elif state == "NEEDS_ATTENTION":
+            lines.append(
+                "        notification note: fix the Telegram cause, then use "
+                "agent-handoff dispatch notify --retry. Report delivery is unaffected"
+            )
     lines.append(f"      next action: {view.get('next_action')}")
     return lines

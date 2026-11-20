@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..config import storage_path
-from ..util import FileLock, atomic_write_json, ensure_dir, read_json, utcnow_iso
+from ..util import FileLock, atomic_write_json, ensure_dir, read_json, utcnow_iso, utcnow_iso_precise
 
 SCHEMA = 1
 TERMINAL_STATUSES = {"ISSUE_UPDATED", "REJECTED", "NEEDS_ATTENTION"}
@@ -110,7 +110,12 @@ class Ledger:
         updates: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         def apply(record: dict[str, Any]) -> None:
+            previous = record.get("status")
             record["status"] = status
+            if status == "NEEDS_ATTENTION" and previous != status:
+                record["attention_since"] = utcnow_iso_precise()
+            elif status != "NEEDS_ATTENTION":
+                record["attention_since"] = None
             for key, value in (updates or {}).items():
                 if isinstance(value, dict) and isinstance(record.get(key), dict):
                     record[key].update(value)

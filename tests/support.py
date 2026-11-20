@@ -27,6 +27,7 @@ class Harness:
         self.drive = root / "fake-drive"
         self.fake_bin = root / "fake-bin"
         self.rclone_config = root / "rclone.conf"
+        self.bin = BIN
         self.project_path = self.workspace / "alpha"
         self.home.mkdir(parents=True)
         self.project_path.mkdir(parents=True)
@@ -120,7 +121,7 @@ class Harness:
         timeout: float = 120.0,
     ) -> subprocess.CompletedProcess:
         result = subprocess.run(
-            [sys.executable, str(BIN), *args],
+            [sys.executable, str(self.bin), *args],
             cwd=str(self.root),
             env=self.env(extra_env),
             input=input_text,

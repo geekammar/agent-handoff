@@ -16,6 +16,7 @@ logs/upload.log
 queue/*.json
 state/sessions.json
 state/index_upload.json
+state/dispatch/notifications/records/*.json
 config/config.json
 ```
 
@@ -375,10 +376,90 @@ Before posting, the dispatcher checks for the delivery marker. A retry after an 
 
 Confirm the record's `comment_url` and open the issue in the authenticated browser session. Private repository visibility is required. A comment URL is publication evidence, not upload verification.
 
+## Telegram notifications are disabled
+
+That is the default and does not affect capture or dispatch. To enable them, add the `notifications` section to the runtime config, keep the token in an environment variable named by `token_env`, then validate:
+
+```bash
+agent-handoff config validate
+agent-handoff doctor
+```
+
+Do not put the bot token in `config.json`, an Issue, a report, a chat, or a log. Do not paste it into a terminal transcript.
+
+A disabled configuration never creates a Telegram transport and never makes a network request.
+
+## Telegram configuration is rejected
+
+Common causes:
+
+- `notifications.telegram.enabled` is true but `chat_id` is empty;
+- the environment variable named by `token_env` is unset or empty;
+- the value does not look like a bot token;
+- the chat id is neither numeric (negative for groups/channels) nor `@channelusername`;
+- a retry/timeout/attempt value is outside its bounded range.
+
+Fix the config or environment and rerun:
+
+```bash
+agent-handoff config validate --json
+```
+
+Validation errors name the environment variable, never its value. The token is never printed.
+
+## Task is delivered but the Telegram notification is pending
+
+The report is safe. `dispatch status` keeps the task at `health=delivered` and shows the separate notification state. `RETRY_WAIT` retries automatically with backoff. Inspect without sending:
+
+```bash
+agent-handoff dispatch notify --json
+agent-handoff dispatch notify --all --json
+```
+
+After fixing the cause, retry confirmed notification failures only:
+
+```bash
+agent-handoff dispatch notify --retry --json
+agent-handoff dispatch notify --retry --task <task-id> --run <run-id> --json
+```
+
+A generic retry deliberately excludes ambiguous interrupted sends. This never reruns OpenCode, re-uploads a verified report, or reposts the GitHub comment.
+
+## Telegram notification needs attention
+
+`NEEDS_ATTENTION` means notification attempts were exhausted, the related dispatch record is unavailable, or an interrupted send has an ambiguous outcome. The task/report delivery is still valid. Read the safe error:
+
+```bash
+agent-handoff dispatch notify --json
+agent-handoff dispatch status --json
+```
+
+For a confirmed token/chat/network/rate-limit failure, fix the cause and run `dispatch notify --retry`. For an ambiguous outcome, review the Telegram chat first; a targeted retry requires both the notification id and explicit acknowledgement of the duplicate risk:
+
+```bash
+agent-handoff dispatch notify --retry --notification <notification-id> --acknowledge-duplicate --json
+```
+
+The outbox does not pretend to offer mathematically guaranteed exactly-once delivery.
+
+## Telegram send was interrupted
+
+A send is persisted as `SENDING` before the HTTP request. If the process stops during the request, a later poll does not silently resend it. After the stale timeout it becomes `NEEDS_ATTENTION` with `ambiguous=true` and a warning that Telegram may or may not have accepted the message. Review the Telegram chat, then either ignore it or explicitly retry that one notification with `--notification <id> --acknowledge-duplicate`. A generic `dispatch notify --retry` will not resend it.
+
+## Old reports were not sent when notifications were enabled
+
+This is intentional. Notification enqueue happens at lifecycle transitions observed after enablement. Historical `ISSUE_UPDATED` records are never scanned or backfilled, even if a later metadata update changes their generic `updated_at`; reconciliation uses the real publication/attention/failure transition timestamp. This prevents a flood of old reports. Records that genuinely publish or enter attention after enablement may legitimately notify.
+
+An unsent notification whose task condition later recovers is marked `SUPERSEDED` with a reason and timestamp, not sent and not deleted. If a historical record has no trustworthy transition timestamp, recovery fails closed rather than guessing.
+
+## Telegram recipient cannot open the report link
+
+The bot does not change Google Drive sharing. Private Drive files are visible only to accounts that already have access. The Telegram message contains a link; it is not a copy of the report and does not grant permissions.
+
 ## Tests and live checks
 
 ```bash
 PYTHONPATH=lib python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-Deterministic tests do not need Drive or provider credentials. Live dispatch testing requires real `gh`, OpenCode provider auth, and Drive auth; if any are unavailable, report the limitation instead of claiming a pass.
+Deterministic tests do not need Drive, provider, or Telegram credentials. They use fake GitHub, OpenCode, rclone, and a local fake Bot API. Live dispatch testing requires real `gh`, OpenCode provider auth, Drive auth, and (only for notification acceptance) an owner-provided bot token/chat id; if any are unavailable, report the limitation instead of claiming a pass.

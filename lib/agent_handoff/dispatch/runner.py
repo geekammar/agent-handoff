@@ -10,7 +10,7 @@ from ..config import all_projects, project_by_name
 from ..report import auto_report
 from ..store import Store
 from ..upload import Uploader
-from ..util import FileLock, new_id, safe_title, sanitize_error, utcnow_iso
+from ..util import FileLock, new_id, safe_title, sanitize_error, utcnow_iso, utcnow_iso_precise
 from .adapters.base import ExecutionRequest, ExecutionResult
 from .adapters.opencode import OpenCodeAdapter
 from .delivery import (
@@ -27,6 +27,7 @@ from .delivery import (
 from .github import GithubError, GithubTransport
 from .ledger import Ledger, new_dispatch_record
 from .progress import ProgressReporter
+from ..notify.service import NotificationService
 from .requests import RequestError, detect_request, parse_issue_request, resolve_request
 
 
@@ -41,6 +42,12 @@ class DispatchRunner:
         self.uploader = Uploader(config, self.store)
         self.log_path = self.store.logs_root / "dispatch.log"
         self.progress = progress
+        try:
+            self.notifications: NotificationService | None = NotificationService(config, log=self._log)
+            self._notification_init_error: str | None = None
+        except Exception as exc:
+            self.notifications = None
+            self._notification_init_error = sanitize_error(str(exc))
         self.summary: dict[str, Any] = {}
         self._started_at = time.monotonic()
         if self.progress is not None:
@@ -80,6 +87,69 @@ class DispatchRunner:
             os.chmod(self.log_path, 0o600)
         except OSError:
             pass
+
+    def _notify_completed(self, record: dict[str, Any]) -> None:
+        if self.notifications is None:
+            return
+        try:
+            queued = self.notifications.enqueue_completed(record)
+            if queued:
+                self._progress("notifying", "verified delivery notification queued", record)
+        except Exception as exc:
+            self._log(f"notification enqueue failed: {exc}")
+
+    def _notify_attention(self, record: dict[str, Any], reason: str, next_action: str) -> None:
+        if self.notifications is None:
+            return
+        try:
+            queued = self.notifications.enqueue_needs_attention(record, reason, next_action)
+            if queued:
+                self._progress("notifying", "operator attention notification queued", record)
+        except Exception as exc:
+            self._log(f"notification enqueue failed: {exc}")
+
+    def _notify_delayed(self, record: dict[str, Any], *, reason: str, stage: str, attempts: int) -> None:
+        if self.notifications is None:
+            return
+        try:
+            queued = self.notifications.enqueue_delivery_delayed(
+                record, reason=reason, stage=stage, attempts=attempts
+            )
+            if queued:
+                self._progress("notifying", "delivery delay notification queued", record)
+        except Exception as exc:
+            self._log(f"notification enqueue failed: {exc}")
+
+    def _reconcile_notifications(self) -> None:
+        if self.notifications is None:
+            return
+        try:
+            result = self.notifications.reconcile(self.ledger.all())
+        except Exception as exc:
+            self.summary["warnings"].append(
+                f"notification recovery failed independently: {sanitize_error(str(exc))}"
+            )
+            return
+        if result.get("queued"):
+            self._progress("notifying", f"recovered {result['queued']} notification intent(s) after restart")
+
+    def _drain_notifications(self) -> None:
+        if self.notifications is None:
+            if self._notification_init_error:
+                self.summary["warnings"].append(
+                    f"notification delivery failed independently: {self._notification_init_error}"
+                )
+            return
+        try:
+            result = self.notifications.drain()
+        except Exception as exc:
+            self.summary["warnings"].append(f"notification delivery failed independently: {sanitize_error(str(exc))}")
+            return
+        self.summary["notifications"] = result
+        if result.get("sent"):
+            self._progress("notified", f"sent {result.get('sent')} Telegram notification(s)")
+        for error in result.get("errors") or []:
+            self.summary["warnings"].append(f"notification: {error}")
 
     def runner_lock(self) -> FileLock:
         return FileLock(self.ledger.root / "runner.lock", blocking=False, timeout=0)
@@ -134,14 +204,20 @@ class DispatchRunner:
             self.summary["records"] = len(self.ledger.all())
             return self.summary
         finally:
-            self.summary["elapsed_seconds"] = round(max(0.0, time.monotonic() - self._started_at), 2)
-            self._progress(
-                "finished",
-                f"poll finished executed={self.summary.get('executed', 0)} "
-                f"uploaded={self.summary.get('uploaded', 0)} published={self.summary.get('published', 0)} "
-                f"needs_attention={self.summary.get('needs_attention', 0)}",
-            )
-            lock.release()
+            try:
+                self._reconcile_notifications()
+            finally:
+                lock.release()
+            try:
+                self._drain_notifications()
+            finally:
+                self.summary["elapsed_seconds"] = round(max(0.0, time.monotonic() - self._started_at), 2)
+                self._progress(
+                    "finished",
+                    f"poll finished executed={self.summary.get('executed', 0)} "
+                    f"uploaded={self.summary.get('uploaded', 0)} published={self.summary.get('published', 0)} "
+                    f"needs_attention={self.summary.get('needs_attention', 0)}",
+                )
 
     def _recover_inflight(self, *, force: bool) -> None:
         for record in self.ledger.all():
@@ -171,7 +247,7 @@ class DispatchRunner:
             "process restarted after claim/start without recoverable session output; "
             "the agent was not re-run. Inspect the host and submit a new issue if needed."
         )
-        self.ledger.set_status(
+        updated = self.ledger.set_status(
             record["repository"],
             record["issue_number"],
             "NEEDS_ATTENTION",
@@ -180,6 +256,11 @@ class DispatchRunner:
                 "attention_reason": reason,
                 "execution": {"status": "UNCERTAIN", "last_error": reason},
             },
+        )
+        self._notify_attention(
+            updated,
+            reason,
+            "Inspect the host and persisted session evidence. Do not rerun automatically; submit a new issue if the work must be repeated.",
         )
         self.summary["needs_attention"] += 1
         self.summary["ok"] = False
@@ -198,12 +279,17 @@ class DispatchRunner:
         result = self.adapter.recover(events_path) if events_path else None
         if not result:
             reason = "execution finished but no session output was persisted; operator review required"
-            self.ledger.set_status(
+            updated = self.ledger.set_status(
                 record["repository"],
                 record["issue_number"],
                 "NEEDS_ATTENTION",
                 note="capture recovery failed",
                 updates={"attention_reason": reason, "execution": {"status": "EXECUTION_COMPLETED", "last_error": reason}},
+            )
+            self._notify_attention(
+                updated,
+                reason,
+                "Inspect the host and persisted session evidence. The agent will not be rerun automatically.",
             )
             self.summary["needs_attention"] += 1
             self.summary["ok"] = False
@@ -408,7 +494,7 @@ class DispatchRunner:
                 self._capture(current, recovered, force=force)
                 self._upload_and_publish(current, force=force)
                 return
-            self.ledger.set_status(
+            updated = self.ledger.set_status(
                 repository,
                 number,
                 "NEEDS_ATTENTION",
@@ -417,6 +503,11 @@ class DispatchRunner:
                     "attention_reason": error,
                     "execution": {"status": "FAILED", "last_error": error, "finished_at": utcnow_iso()},
                 },
+            )
+            self._notify_attention(
+                updated,
+                error,
+                "Inspect the host and session evidence. The agent will not be rerun automatically.",
             )
             self.summary["needs_attention"] += 1
             self.summary["ok"] = False
@@ -480,12 +571,17 @@ class DispatchRunner:
         project = self._project_for(current)
         if not project:
             reason = "Agent Handoff project is no longer configured"
-            self.ledger.set_status(
+            updated = self.ledger.set_status(
                 repository,
                 number,
                 "NEEDS_ATTENTION",
                 note="capture failed",
                 updates={"attention_reason": reason, "capture": {"status": "FAILED", "last_error": reason}},
+            )
+            self._notify_attention(
+                updated,
+                reason,
+                "Restore the Agent Handoff project configuration, then inspect the run manually.",
             )
             self.summary["needs_attention"] += 1
             self.summary["ok"] = False
@@ -670,12 +766,17 @@ class DispatchRunner:
         project = self._project_for(current)
         if not project:
             reason = "Agent Handoff project is no longer configured"
-            self.ledger.set_status(
+            updated = self.ledger.set_status(
                 current["repository"],
                 int(current["issue_number"]),
                 "NEEDS_ATTENTION",
                 note="upload failed: missing project",
                 updates={"attention_reason": reason, "upload": {"status": "FAILED", "last_error": reason}},
+            )
+            self._notify_attention(
+                updated,
+                reason,
+                "Restore the Agent Handoff project configuration; the captured report is preserved.",
             )
             self.summary["needs_attention"] += 1
             self.summary["ok"] = False
@@ -709,7 +810,7 @@ class DispatchRunner:
             error = sanitize_error(result.get("error") or "upload reconciliation failed")
             recorded_attempts = merged_upload_attempts(upload_state, result)
             next_attempt_at = upload_backoff(max(attempts, recorded_attempts))
-            self.ledger.set_status(
+            updated = self.ledger.set_status(
                 current["repository"],
                 int(current["issue_number"]),
                 "UPLOAD_PENDING",
@@ -720,9 +821,16 @@ class DispatchRunner:
                         "verified": False,
                         "attempts": recorded_attempts,
                         "last_error": error,
+                        "last_failed_at": utcnow_iso_precise(),
                         "next_attempt_at": next_attempt_at,
                     }
                 },
+            )
+            self._notify_delayed(
+                updated,
+                reason=error,
+                stage="upload",
+                attempts=recorded_attempts,
             )
             self.summary["ok"] = False
             self.summary["errors"].append(f"issue #{current['issue_number']}: {error}")
@@ -751,6 +859,7 @@ class DispatchRunner:
                     "receipt_url": result.get("receipt_url"),
                     "attempts": recorded_attempts,
                     "last_error": None,
+                    "last_failed_at": None,
                     "next_attempt_at": None,
                 },
                 "attention_reason": None,
@@ -832,7 +941,7 @@ class DispatchRunner:
         try:
             existing = self.transport.find_comment(int(current["issue_number"]), marker)
             if existing:
-                self.ledger.set_status(
+                updated = self.ledger.set_status(
                     current["repository"],
                     int(current["issue_number"]),
                     "ISSUE_UPDATED",
@@ -840,19 +949,22 @@ class DispatchRunner:
                     updates={
                         "publication": {
                             "status": "PUBLISHED",
-                            "published_at": existing.get("created_at") or utcnow_iso(),
+                            "published_at": existing.get("created_at") or utcnow_iso_precise(),
                             "comment_url": existing.get("html_url"),
                             "last_error": None,
+                            "last_failed_at": None,
+                            "exhausted_at": None,
                             "next_attempt_at": None,
                         },
                         "attention_reason": None,
                     },
                 )
+                self._notify_completed(updated)
                 self._progress("completed", "existing delivery comment was already present; no duplicate was posted", current)
                 return
             self._progress("publishing", "no existing delivery marker; posting one verified report comment", current)
             response = self.transport.comment(int(current["issue_number"]), build_issue_comment(current))
-            self.ledger.set_status(
+            updated = self.ledger.set_status(
                 current["repository"],
                 int(current["issue_number"]),
                 "ISSUE_UPDATED",
@@ -860,14 +972,17 @@ class DispatchRunner:
                 updates={
                     "publication": {
                         "status": "PUBLISHED",
-                        "published_at": utcnow_iso(),
+                        "published_at": utcnow_iso_precise(),
                         "comment_url": response.get("url"),
                         "last_error": None,
+                        "last_failed_at": None,
+                        "exhausted_at": None,
                         "next_attempt_at": None,
                     },
                     "attention_reason": None,
                 },
             )
+            self._notify_completed(updated)
             self.summary["published"] += 1
             self._progress("completed", "verified report URL published to the originating issue", current)
             self._log(f"issue #{current['issue_number']} verified report published")
@@ -880,7 +995,7 @@ class DispatchRunner:
             next_at = None if exhausted else publication_backoff(
                 attempts, int((self.dispatch.get("delivery") or {}).get("retry_seconds", 60))
             )
-            self.ledger.set_status(
+            updated = self.ledger.set_status(
                 current["repository"],
                 int(current["issue_number"]),
                 "UPLOAD_VERIFIED",
@@ -892,11 +1007,27 @@ class DispatchRunner:
                         "status": "EXHAUSTED" if exhausted else "FAILED",
                         "attempts": attempts,
                         "last_error": error,
+                        "last_failed_at": utcnow_iso_precise(),
+                        "exhausted_at": utcnow_iso_precise() if exhausted and not was_exhausted else publication.get("exhausted_at"),
                         "next_attempt_at": next_at,
                     },
                     "attention_reason": error if exhausted else current.get("attention_reason"),
                 },
             )
+            if exhausted and not was_exhausted:
+                self._notify_attention(
+                    updated,
+                    error,
+                    "Use `agent-handoff dispatch deliver` to publish the verified report manually; "
+                    "the upload is reused and the agent is not re-executed.",
+                )
+            elif not exhausted:
+                self._notify_delayed(
+                    updated,
+                    reason=error,
+                    stage="publication",
+                    attempts=attempts,
+                )
             self.summary["ok"] = False
             self.summary["errors"].append(f"issue #{current['issue_number']} publication: {error}")
             if exhausted and not was_exhausted:
