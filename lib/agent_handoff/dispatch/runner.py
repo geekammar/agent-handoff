@@ -16,6 +16,7 @@ from .adapters.opencode import OpenCodeAdapter
 from .delivery import (
     build_issue_comment,
     delivery_marker,
+    merged_upload_attempts,
     publication_backoff,
     publication_due,
     reconcile_verified_delivery,
@@ -682,7 +683,8 @@ class DispatchRunner:
             return
         task_id = str(capture.get("task_id"))
         run_id = str(capture.get("run_id"))
-        attempts = int((current.get("upload") or {}).get("attempts", 0)) + 1
+        upload_state = current.get("upload") or {}
+        attempts = int(upload_state.get("attempts", 0) or 0) + 1
         self._progress(
             "uploading",
             f"starting verified upload attempt {attempts} "
@@ -705,7 +707,8 @@ class DispatchRunner:
         )
         if not result.get("ok"):
             error = sanitize_error(result.get("error") or "upload reconciliation failed")
-            next_attempt_at = upload_backoff(attempts)
+            recorded_attempts = merged_upload_attempts(upload_state, result)
+            next_attempt_at = upload_backoff(max(attempts, recorded_attempts))
             self.ledger.set_status(
                 current["repository"],
                 int(current["issue_number"]),
@@ -715,7 +718,7 @@ class DispatchRunner:
                     "upload": {
                         "status": "FAILED",
                         "verified": False,
-                        "attempts": attempts,
+                        "attempts": recorded_attempts,
                         "last_error": error,
                         "next_attempt_at": next_attempt_at,
                     }
@@ -731,6 +734,7 @@ class DispatchRunner:
             )
             self._log(f"issue #{current['issue_number']} upload failed: {error}")
             return
+        recorded_attempts = merged_upload_attempts(upload_state, result)
         self.ledger.set_status(
             current["repository"],
             int(current["issue_number"]),
@@ -745,6 +749,7 @@ class DispatchRunner:
                     "report_url": result.get("report_url"),
                     "receipt_remote_path": result.get("receipt_remote_path"),
                     "receipt_url": result.get("receipt_url"),
+                    "attempts": recorded_attempts,
                     "last_error": None,
                     "next_attempt_at": None,
                 },
@@ -797,6 +802,7 @@ class DispatchRunner:
                                 "report_url": reconciled.get("report_url"),
                                 "receipt_remote_path": reconciled.get("receipt_remote_path"),
                                 "receipt_url": reconciled.get("receipt_url"),
+                                "attempts": merged_upload_attempts(item.get("upload"), reconciled),
                                 "last_error": None,
                                 "next_attempt_at": None,
                             }
@@ -867,6 +873,7 @@ class DispatchRunner:
             self._log(f"issue #{current['issue_number']} verified report published")
         except GithubError as exc:
             attempts = int(publication.get("attempts", 0)) + 1
+            was_exhausted = publication.get("status") == "EXHAUSTED"
             error = sanitize_error(str(exc))
             max_attempts = int((self.dispatch.get("delivery") or {}).get("max_attempts", 0))
             exhausted = bool(max_attempts and attempts >= max_attempts)
@@ -892,6 +899,8 @@ class DispatchRunner:
             )
             self.summary["ok"] = False
             self.summary["errors"].append(f"issue #{current['issue_number']} publication: {error}")
+            if exhausted and not was_exhausted:
+                self.summary["needs_attention"] += 1
             if exhausted:
                 self._progress(
                     "needs_attention",

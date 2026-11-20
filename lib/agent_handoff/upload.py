@@ -571,14 +571,18 @@ class Uploader:
     def _mark_run_failure(self, project: dict[str, Any], task_id: str, run_id: str, error: str, attempts: int) -> None:
         try:
             with self.store.lock():
-                _, task_path, _, run_path, _ = self.store.run_record(project, task_id, run_id)
+                _, task_path, _, run_path, complete = self.store.run_record(project, task_id, run_id)
+                try:
+                    previous = max(0, int((complete.get("upload") or {}).get("attempts") or 0))
+                except (TypeError, ValueError):
+                    previous = 0
                 self.store.update_complete(
                     run_path,
                     {
                         "upload": {
                             "status": "pending",
                             "verified": False,
-                            "attempts": attempts,
+                            "attempts": max(previous + 1, attempts),
                             "last_error": sanitize_error(error),
                         }
                     },
@@ -736,7 +740,15 @@ class Uploader:
                 return {"ok": False, "error": result.get("error") or "upload failed"}
             total_redactions += int(result.get("redactions") or 0)
             verified_files.append({"remote": result.get("remote"), "size": result.get("size"), "verification": result.get("verification", {}).get("method")})
-        attempts = int(data.get("attempts", 0)) + 1
+        try:
+            queue_attempts = max(0, int(data.get("attempts") or 0))
+        except (TypeError, ValueError):
+            queue_attempts = 0
+        try:
+            recorded_attempts = max(0, int((complete.get("upload") or {}).get("attempts") or 0))
+        except (TypeError, ValueError):
+            recorded_attempts = 0
+        attempts = max(queue_attempts, recorded_attempts) + 1
         with self.store.lock():
             self.store.update_complete(
                 run_path,

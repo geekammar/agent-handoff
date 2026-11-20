@@ -23,7 +23,12 @@ from .config import (
 )
 from .adapters import agy_hook, auto_complete, git_info, integration_log, normalize_outcome, normalize_status, spawn_upload
 from .dispatch.config import DispatchConfigError, validate_core_config, validate_dispatch_config
-from .dispatch.delivery import diagnose_historical_run, delivery_marker, reconcile_verified_delivery
+from .dispatch.delivery import (
+    diagnose_historical_run,
+    delivery_marker,
+    merged_upload_attempts,
+    reconcile_verified_delivery,
+)
 from .dispatch.github import GithubError, GithubTransport
 from .dispatch.ledger import Ledger
 from .dispatch.progress import ProgressReporter
@@ -1213,6 +1218,7 @@ def _cmd_dispatch_deliver(args: argparse.Namespace) -> int:
             "report_url": result.get("report_url"),
             "receipt_remote_path": result.get("receipt_remote_path"),
             "receipt_url": result.get("receipt_url"),
+            "attempts": merged_upload_attempts(item.get("upload"), result),
             "last_error": None,
         }
         item["execution"] = {

@@ -211,6 +211,7 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(first["executed"], 1)
         self.assertEqual(first["uploaded"], 1)
         self.assertEqual(first["published"], 1)
+        self.assertEqual(first["needs_attention"], 0)
         calls = self.h.opencode_calls()
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["cwd"], str(self.h.project_path.resolve()))
@@ -234,6 +235,8 @@ class DispatchTests(unittest.TestCase):
         self.assertNotIn("- Repository: `dev/private-dispatch`", report_text)
         self.assertIsNone(complete["repository"])
         self.assertTrue(complete["upload"]["verified"])
+        self.assertEqual(complete["upload"]["attempts"], 1)
+        self.assertEqual(record["upload"]["attempts"], 1)
         self.assertTrue(complete["upload"]["report_url"].startswith("https://drive.google.com/file/d/"))
         receipt = self.h.task_dir_for("Alpha", task_id) / "RUNS" / run_id / "UPLOAD-RECEIPT.json"
         self.assertTrue(receipt.exists())
@@ -252,6 +255,8 @@ class DispatchTests(unittest.TestCase):
 
         second = self.h.dispatch("--force")
         self.assertEqual(second["executed"], 0)
+        self.assertEqual(second["needs_attention"], 0)
+        self.assertEqual(self.h.record(1)["upload"]["attempts"], 1)
         self.assertEqual(len(self.h.opencode_calls()), 1)
         self.assertEqual(len(self.h.comments(1)), 1)
 
@@ -327,6 +332,9 @@ class DispatchTests(unittest.TestCase):
         next_at = record["upload"]["next_attempt_at"]
         self.assertTrue(next_at)
         attempts = record["upload"]["attempts"]
+        self.assertEqual(attempts, 1)
+        complete = self.h.read_complete(record["capture"]["task_id"], record["capture"]["run_id"])
+        self.assertEqual(complete["upload"]["attempts"], attempts)
         skipped = self.h.dispatch()
         self.assertEqual(skipped["uploaded"], 0)
         self.assertEqual(skipped["executed"], 0)
@@ -338,6 +346,11 @@ class DispatchTests(unittest.TestCase):
         forced = self.h.dispatch("--force")
         self.assertEqual(forced["uploaded"], 1)
         self.assertEqual(forced["published"], 1)
+        self.assertEqual(self.h.record(1)["upload"]["attempts"], 2)
+        self.assertEqual(
+            self.h.read_complete(record["capture"]["task_id"], record["capture"]["run_id"])["upload"]["attempts"],
+            2,
+        )
         self.assertEqual(len(self.h.opencode_calls()), 1)
 
     def test_publication_max_attempts_stops_automatic_retry(self) -> None:
@@ -349,11 +362,13 @@ class DispatchTests(unittest.TestCase):
         first = self.h.dispatch(extra_env={"FAKE_GH_FAIL_COMMENT_FILE": str(marker)}, check=False)
         self.assertEqual(first["executed"], 1)
         self.assertEqual(first["published"], 0)
+        self.assertEqual(first["needs_attention"], 1)
         record = self.h.record(1)
         self.assertEqual(record["status"], "UPLOAD_VERIFIED")
         self.assertEqual(record["publication"]["status"], "EXHAUSTED")
         self.assertIsNone(record["publication"]["next_attempt_at"])
         self.assertTrue(record["attention_reason"])
+        self.assertEqual(record["upload"]["attempts"], 1)
         status = self.h.jrun(["dispatch", "status", "--json"])["records"][0]
         self.assertEqual(status["health"], "attention")
         self.assertEqual(status["phase"], "publication_exhausted")
@@ -361,14 +376,59 @@ class DispatchTests(unittest.TestCase):
         comment_calls = [call for call in self.h.gh_calls() if call[:2] == ["issue", "comment"]]
         skipped = self.h.dispatch()
         self.assertEqual(skipped["published"], 0)
+        self.assertEqual(skipped["needs_attention"], 0)
         self.assertEqual(
             len([call for call in self.h.gh_calls() if call[:2] == ["issue", "comment"]]),
             len(comment_calls),
         )
         forced = self.h.dispatch("--force")
         self.assertEqual(forced["published"], 1)
+        self.assertEqual(forced["needs_attention"], 0)
         self.assertEqual(len(self.h.comments(1)), 1)
         self.assertEqual(self.h.record(1)["status"], "ISSUE_UPDATED")
+        self.assertEqual(self.h.record(1)["upload"]["attempts"], 1)
+        self.assertEqual(
+            self.h.read_complete(record["capture"]["task_id"], record["capture"]["run_id"])["upload"]["attempts"],
+            1,
+        )
+
+    def test_publication_exhaustion_manual_delivery_reuses_verified_upload(self) -> None:
+        self.h.config["dispatch"]["delivery"]["max_attempts"] = 1
+        self.h.write_config()
+        self.h.add_issue(number=1, body=request_body())
+        marker = self.root / "fail-comment-manual-deliver"
+        marker.write_text("1", encoding="utf-8")
+        first = self.h.dispatch(extra_env={"FAKE_GH_FAIL_COMMENT_FILE": str(marker)}, check=False)
+        self.assertEqual(first["needs_attention"], 1)
+        record = self.h.record(1)
+        self.assertEqual(record["publication"]["status"], "EXHAUSTED")
+        self.assertTrue(record["upload"]["verified"])
+        task_id = record["capture"]["task_id"]
+        run_id = record["capture"]["run_id"]
+        delivered = self.h.jrun(
+            [
+                "dispatch",
+                "deliver",
+                "--task",
+                task_id,
+                "--run",
+                run_id,
+                "--issue",
+                "1",
+                "--repository",
+                GH_REPO,
+                "--json",
+            ]
+        )
+        self.assertTrue(delivered["ok"], delivered)
+        self.assertFalse(delivered["opencode_executed"])
+        self.assertEqual(len(self.h.opencode_calls()), 1)
+        self.assertEqual(len(self.h.comments(1)), 1)
+        final = self.h.record(1)
+        self.assertEqual(final["status"], "ISSUE_UPDATED")
+        self.assertEqual(final["publication"]["status"], "PUBLISHED")
+        self.assertEqual(final["upload"]["attempts"], 1)
+        self.assertEqual(self.h.read_complete(task_id, run_id)["upload"]["attempts"], 1)
 
     def test_long_execution_emits_heartbeat_without_prompt_or_path(self) -> None:
         from agent_handoff.dispatch.adapters.base import ExecutionRequest
@@ -521,17 +581,54 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(record["status"], "UPLOAD_PENDING")
         self.assertEqual(record["capture"]["status"], "CAPTURED")
         self.assertFalse(record["upload"]["verified"])
+        self.assertEqual(record["upload"]["attempts"], 1)
+        self.assertEqual(
+            self.h.read_complete(record["capture"]["task_id"], record["capture"]["run_id"])["upload"]["attempts"],
+            1,
+        )
         status = self.h.jrun(["dispatch", "status", "--json"])
         failed = status["records"][0]
         self.assertEqual(failed["health"], "retryable")
         self.assertEqual(failed["phase"], "retry_upload")
         self.assertIn("upload only", failed["next_action"].lower())
         self.assertTrue(failed["next_attempt_at"])
+        self.assertEqual(first["needs_attention"], 0)
         second = self.h.dispatch("--force")
         self.assertEqual(second["executed"], 0)
         self.assertEqual(second["uploaded"], 1)
         self.assertEqual(len(self.h.opencode_calls()), 1)
         self.assertTrue(self.h.record(1)["upload"]["verified"])
+        self.assertEqual(self.h.record(1)["upload"]["attempts"], 2)
+        self.assertEqual(
+            self.h.read_complete(record["capture"]["task_id"], record["capture"]["run_id"])["upload"]["attempts"],
+            2,
+        )
+
+    def test_multiple_upload_failures_count_each_attempt(self) -> None:
+        self.h.add_issue(number=1, body=request_body())
+        first_marker = self.root / "fail-upload-twice-first"
+        second_marker = self.root / "fail-upload-twice-second"
+        first_marker.write_text("1", encoding="utf-8")
+        first = self.h.dispatch(extra_env={"FAKE_FAIL_ONCE_FILE": str(first_marker)}, check=False)
+        self.assertEqual(first["uploaded"], 0)
+        record = self.h.record(1)
+        task_id = record["capture"]["task_id"]
+        run_id = record["capture"]["run_id"]
+        self.assertEqual(record["upload"]["attempts"], 1)
+        self.assertEqual(self.h.read_complete(task_id, run_id)["upload"]["attempts"], 1)
+        second_marker.write_text("1", encoding="utf-8")
+        second = self.h.dispatch(
+            "--force",
+            extra_env={"FAKE_FAIL_ONCE_FILE": str(second_marker)},
+            check=False,
+        )
+        self.assertEqual(second["executed"], 0)
+        self.assertEqual(second["uploaded"], 1)
+        self.assertEqual(second["published"], 1)
+        self.assertEqual(self.h.record(1)["upload"]["attempts"], 3)
+        self.assertEqual(self.h.read_complete(task_id, run_id)["upload"]["attempts"], 3)
+        self.assertEqual(len(self.h.opencode_calls()), 1)
+        self.assertEqual(len(self.h.comments(1)), 1)
 
     def test_github_publication_failure_retries_without_reexecution_or_duplicate(self) -> None:
         self.h.add_issue(number=1, body=request_body())
@@ -540,11 +637,13 @@ class DispatchTests(unittest.TestCase):
         first = self.h.dispatch(extra_env={"FAKE_GH_FAIL_COMMENT_FILE": str(marker)}, check=False)
         self.assertEqual(first["executed"], 1)
         self.assertEqual(first["published"], 0)
+        self.assertEqual(first["needs_attention"], 0)
         self.assertEqual(len(self.h.opencode_calls()), 1)
         record = self.h.record(1)
         self.assertEqual(record["status"], "UPLOAD_VERIFIED")
         self.assertEqual(record["publication"]["status"], "FAILED")
         self.assertTrue(record["upload"]["verified"])
+        self.assertEqual(record["upload"]["attempts"], 1)
         status = self.h.jrun(["dispatch", "status", "--json"])
         failed = status["records"][0]
         self.assertEqual(failed["health"], "retryable")
@@ -553,8 +652,14 @@ class DispatchTests(unittest.TestCase):
         second = self.h.dispatch("--force")
         self.assertEqual(second["executed"], 0)
         self.assertEqual(second["published"], 1)
+        self.assertEqual(second["needs_attention"], 0)
         self.assertEqual(len(self.h.opencode_calls()), 1)
         self.assertEqual(len(self.h.comments(1)), 1)
+        self.assertEqual(self.h.record(1)["upload"]["attempts"], 1)
+        self.assertEqual(
+            self.h.read_complete(record["capture"]["task_id"], record["capture"]["run_id"])["upload"]["attempts"],
+            1,
+        )
         third = self.h.dispatch("--force")
         self.assertEqual(third["executed"], 0)
         self.assertEqual(len(self.h.comments(1)), 1)
@@ -623,6 +728,9 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(result["published"], 1)
         self.assertEqual(self.h.opencode_calls(), [])
         self.assertEqual(len(self.h.comments(1)), 1)
+        final = self.h.record(1)
+        self.assertEqual(final["upload"]["attempts"], complete["upload"]["attempts"])
+        self.assertEqual(final["upload"]["attempts"], 1)
 
     def test_deliver_progress_stays_on_stderr_and_json_stdout_stays_valid(self) -> None:
         item = self.h.create_run("opencode", "Deliver progress", "PRIVATE-PROMPT-MARKER", "Deliver progress report.")
@@ -700,6 +808,8 @@ class DispatchTests(unittest.TestCase):
         updated = self.h.read_complete(task_id, run_id)
         self.assertEqual(updated["upload"]["report_url"], result["report_url"])
         self.assertTrue(updated["upload"]["receipt_verified"])
+        self.assertEqual(updated["upload"]["attempts"], 1)
+        self.assertEqual(self.h.record(1)["upload"]["attempts"], 1)
         remote_complete = json.loads(self.h.remote("TASKS", remote_dir, "RUNS", run_id, "COMPLETE.json").read_text())
         self.assertTrue(remote_complete["upload"]["verified"])
         self.assertEqual(remote_complete["upload"]["report_url"], result["report_url"])
@@ -725,6 +835,8 @@ class DispatchTests(unittest.TestCase):
         )
         self.assertTrue(again["reused_comment"])
         self.assertEqual(len(self.h.comments(1)), 1)
+        self.assertEqual(self.h.record(1)["upload"]["attempts"], 1)
+        self.assertEqual(self.h.read_complete(task_id, run_id)["upload"]["attempts"], 1)
         from agent_handoff.dispatch.delivery import reconcile_verified_delivery
         from agent_handoff.store import Store
         from agent_handoff.upload import Uploader
@@ -742,6 +854,82 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(reused["reused"])
         self.assertTrue(reused["verified_at"])
         self.assertEqual(reused["report_url"], result["report_url"])
+        self.assertEqual(reused["attempts"], 1)
+        self.assertEqual(self.h.read_complete(task_id, run_id)["upload"]["attempts"], 1)
+
+    def test_status_reads_and_verified_reuse_do_not_increment_upload_attempts(self) -> None:
+        self.h.add_issue(number=1, body=request_body())
+        result = self.h.dispatch("--force")
+        self.assertTrue(result["ok"], result)
+        record = self.h.record(1)
+        task_id = record["capture"]["task_id"]
+        run_id = record["capture"]["run_id"]
+        self.assertEqual(record["upload"]["attempts"], 1)
+        self.assertEqual(self.h.read_complete(task_id, run_id)["upload"]["attempts"], 1)
+        for _ in range(2):
+            status = self.h.jrun(["dispatch", "status", "--json"])
+            self.assertEqual(status["records"][0]["upload"]["attempts"], 1)
+        self.assertEqual(self.h.record(1)["upload"]["attempts"], 1)
+        self.assertEqual(self.h.read_complete(task_id, run_id)["upload"]["attempts"], 1)
+        delivered = self.h.jrun(
+            [
+                "dispatch",
+                "deliver",
+                "--task",
+                task_id,
+                "--run",
+                run_id,
+                "--issue",
+                "1",
+                "--repository",
+                GH_REPO,
+                "--json",
+            ]
+        )
+        self.assertTrue(delivered["ok"], delivered)
+        self.assertTrue(delivered["reused_comment"])
+        self.assertEqual(self.h.record(1)["upload"]["attempts"], 1)
+        self.assertEqual(self.h.read_complete(task_id, run_id)["upload"]["attempts"], 1)
+        self.assertEqual(len(self.h.opencode_calls()), 1)
+        self.assertEqual(len(self.h.comments(1)), 1)
+
+    def test_legacy_ledger_without_attempt_metadata_stays_readable(self) -> None:
+        self.h.add_issue(number=1, body=request_body())
+        result = self.h.dispatch("--force")
+        self.assertTrue(result["ok"], result)
+        record = self.h.record(1)
+        task_id = record["capture"]["task_id"]
+        run_id = record["capture"]["run_id"]
+        ledger = Ledger(self.h.config)
+
+        def drop_attempts(item: dict[str, Any]) -> None:
+            (item.get("upload") or {}).pop("attempts", None)
+            (item.get("publication") or {}).pop("attempts", None)
+
+        ledger.update(GH_REPO, 1, drop_attempts, note="simulated legacy record")
+        before = json.dumps(self.h.record(1), sort_keys=True)
+        status = self.h.jrun(["dispatch", "status", "--json"])
+        self.assertEqual(status["records"][0]["health"], "delivered")
+        self.assertEqual(status["records"][0]["upload"]["attempts"], 0)
+        self.assertEqual(json.dumps(self.h.record(1), sort_keys=True), before)
+        delivered = self.h.jrun(
+            [
+                "dispatch",
+                "deliver",
+                "--task",
+                task_id,
+                "--run",
+                run_id,
+                "--issue",
+                "1",
+                "--repository",
+                GH_REPO,
+                "--json",
+            ]
+        )
+        self.assertTrue(delivered["ok"], delivered)
+        self.assertEqual(self.h.record(1)["upload"]["attempts"], 1)
+        self.assertEqual(self.h.read_complete(task_id, run_id)["upload"]["attempts"], 1)
 
     def test_progress_is_visible_before_slow_upload_and_stdout_stays_json(self) -> None:
         self.h.add_issue(number=1, body=request_body())
@@ -995,6 +1183,10 @@ class DispatchTests(unittest.TestCase):
         final = self.h.record(1)
         self.assertEqual(final["session"]["id"], session_id)
         self.assertEqual(final["status"], "ISSUE_UPDATED")
+        complete = self.h.read_complete(final["capture"]["task_id"], final["capture"]["run_id"])
+        self.assertEqual(final["upload"]["attempts"], complete["upload"]["attempts"])
+        self.assertGreaterEqual(complete["upload"]["attempts"], 1)
+        self.assertLessEqual(complete["upload"]["attempts"], 2)
         self.assertEqual(len(self.h.opencode_calls()), 1)
         self.assertEqual(len(self.h.comments(1)), 1)
 

@@ -211,6 +211,8 @@ After verification the dispatcher:
 
 This corrects the historical failure mode where a remote `COMPLETE.json` still said `upload.status=pending` because it had been uploaded before local verification. The receipt and re-uploaded `COMPLETE.json` are the truthful reconciliation; the existence of a Drive folder is never treated as verification.
 
+`upload.attempts` in the dispatch ledger mirrors the uploader's counter in `COMPLETE.json`. It counts total upload attempts that reached a success or failure result, including the successful attempt: a first-attempt success is `1`, one failure followed by success is `2`, and two failures followed by success is `3`. Receipt or `COMPLETE.json` reconciliation, reuse of an already verified upload, publication retries, and status reads never increment it. Ledger updates copy the authoritative count and do not lower a previously recorded value. Legacy records without the field are read as `0` and are corrected when a verified `COMPLETE.json` provides the count.
+
 ## Commands
 
 ```bash
@@ -266,6 +268,10 @@ In `--watch --json` mode, each poll writes one compact JSON object per line (new
 `dispatch status` groups records as executing/current, stalled, needs attention, retryable, pending, or delivered. Each entry shows the Issue link, a verified report link when one exists, the delivery comment, the next retry when known, and one concrete next action. The JSON form preserves the previous record fields and adds `health`, `phase`, `stalled`, `age_seconds`, `elapsed_seconds`, `next_action`, `next_attempt_at`, and `last_error`.
 
 Stalled detection uses the recorded runner PID when present. A `RUNNING` or `CLAIMED` record whose dispatcher process is gone is reported as stalled; the next `dispatch run` reconciles persisted session output or marks the request `NEEDS_ATTENTION` without re-executing OpenCode.
+
+### Poll summary counters
+
+`needs_attention` in the final poll summary counts records that transitioned into an attention state during that poll. This includes execution or capture conditions that require review and a publication that first becomes `EXHAUSTED` because `dispatch.delivery.max_attempts` was reached. It does not recount records that were already in attention at the start of the poll, and a forced retry of an already exhausted publication does not increment it again. `rejected` remains a separate counter. `dispatch status` is authoritative for the current set of attention records.
 
 ## systemd user service (optional)
 
@@ -333,7 +339,9 @@ Deterministic tests use fake GitHub, fake OpenCode, and fake rclone. They cover:
 - cwd/PWD correctness;
 - execution → task/run attribution;
 - upload retry without model restart and upload backoff without `--force`;
+- upload attempt counts including the successful first attempt, multiple failures, restart, verified reuse, and legacy records without the field;
 - publication retry without duplicate links and `delivery.max_attempts` exhaustion;
+- publication exhaustion counted once in the poll summary and recovered by manual delivery without re-execution;
 - long OpenCode execution heartbeat with no prompt or path leakage;
 - execution timeout and dispatcher SIGTERM terminating the child process;
 - restart after claim and after verified upload;

@@ -33,6 +33,24 @@ def _complete_upload(complete: dict[str, Any]) -> dict[str, Any]:
     return upload if isinstance(upload, dict) else {}
 
 
+def upload_attempts(upload: dict[str, Any] | None) -> int:
+    """Return the completed upload-attempt count recorded by the core uploader."""
+
+    try:
+        return max(0, int((upload or {}).get("attempts") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def merged_upload_attempts(current: dict[str, Any] | None, result: dict[str, Any] | None) -> int:
+    """Keep historical ledger attempts while adopting a newer truthful count."""
+
+    existing = upload_attempts(current)
+    if not isinstance(result, dict) or "attempts" not in result:
+        return existing
+    return max(existing, upload_attempts({"attempts": result.get("attempts")}))
+
+
 def _report_remote_path(complete: dict[str, Any]) -> str | None:
     report = complete.get("report") if isinstance(complete.get("report"), dict) else {}
     upload = _complete_upload(complete)
@@ -122,7 +140,11 @@ def reconcile_verified_delivery(
             on_progress=on_progress,
         )
         if result.get("busy"):
-            return {"ok": False, "error": "another upload worker is already running"}
+            return {
+                "ok": False,
+                "error": "another upload worker is already running",
+                "attempts": upload_attempts(upload),
+            }
         try:
             _, task_path, meta, run_path, complete = store.run_record(project, task_id, run_id)
         except Exception as exc:
@@ -134,11 +156,12 @@ def reconcile_verified_delivery(
                 "ok": False,
                 "error": sanitize_error("; ".join(str(item) for item in errors) or upload.get("last_error") or "upload is not verified"),
                 "upload": upload,
+                "attempts": upload_attempts(upload),
             }
 
     report_remote_path = _report_remote_path(complete)
     if not report_remote_path:
-        return {"ok": False, "error": "run has no remote report path"}
+        return {"ok": False, "error": "run has no remote report path", "attempts": upload_attempts(upload)}
 
     receipt_path = run_path / RECEIPT_NAME
     existing = upload.get("report_url") and upload.get("receipt_url") and upload.get("reconciled_at") and receipt_path.is_file()
@@ -153,12 +176,17 @@ def reconcile_verified_delivery(
             "report_file_id": upload.get("report_file_id"),
             "receipt_file_id": upload.get("receipt_file_id"),
             "verified_at": upload.get("verified_at"),
+            "attempts": upload_attempts(upload),
         }
 
     _notify(on_progress, "verifying", "resolving the verified report Drive file id")
     report_file = uploader.remote_file_id(report_remote_path, project, on_progress=on_progress)
     if not report_file.get("ok"):
-        return {"ok": False, "error": report_file.get("error") or "cannot resolve the report Drive file id"}
+        return {
+            "ok": False,
+            "error": report_file.get("error") or "cannot resolve the report Drive file id",
+            "attempts": upload_attempts(upload),
+        }
 
     receipt = build_receipt(
         project=project,
@@ -175,10 +203,18 @@ def reconcile_verified_delivery(
     _notify(on_progress, "receipt", "uploading and verifying UPLOAD-RECEIPT.json")
     receipt_upload = uploader.upload_file(receipt_path, receipt_remote_path, project, on_progress=on_progress)
     if not receipt_upload.get("ok"):
-        return {"ok": False, "error": receipt_upload.get("error") or "upload receipt failed"}
+        return {
+            "ok": False,
+            "error": receipt_upload.get("error") or "upload receipt failed",
+            "attempts": upload_attempts(upload),
+        }
     receipt_file = uploader.remote_file_id(receipt_remote_path, project, on_progress=on_progress)
     if not receipt_file.get("ok"):
-        return {"ok": False, "error": receipt_file.get("error") or "cannot resolve the receipt Drive file id"}
+        return {
+            "ok": False,
+            "error": receipt_file.get("error") or "cannot resolve the receipt Drive file id",
+            "attempts": upload_attempts(upload),
+        }
 
     updates = {
         "report_remote_path": report_remote_path,
@@ -196,7 +232,11 @@ def reconcile_verified_delivery(
     _notify(on_progress, "reconciling", "re-uploading COMPLETE.json with verified upload metadata")
     complete_upload = uploader.upload_file(complete_path, f"{remote_dir}/COMPLETE.json", project, on_progress=on_progress)
     if not complete_upload.get("ok"):
-        return {"ok": False, "error": complete_upload.get("error") or "remote COMPLETE.json reconciliation failed"}
+        return {
+            "ok": False,
+            "error": complete_upload.get("error") or "remote COMPLETE.json reconciliation failed",
+            "attempts": upload_attempts(upload),
+        }
     with store.lock():
         store.update_complete(
             run_path,
@@ -217,6 +257,7 @@ def reconcile_verified_delivery(
         "report_file_id": report_file.get("id"),
         "receipt_file_id": receipt_file.get("id"),
         "verified_at": upload.get("verified_at"),
+        "attempts": upload_attempts(upload),
     }
 
 
