@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import socket
 import urllib.error
 import urllib.request
@@ -11,11 +10,6 @@ from ..util import redact_text
 
 DEFAULT_API_BASE = "https://api.telegram.org"
 MAX_RESPONSE_BYTES = 65536
-
-
-def _api_base() -> str:
-    value = os.environ.get("AGENT_HANDOFF_TELEGRAM_API_BASE", "").strip() or DEFAULT_API_BASE
-    return value.rstrip("/")
 
 
 def _safe_error(value: Any, token: str) -> str:
@@ -61,7 +55,7 @@ class TelegramTransport:
     def __init__(self, token: str, *, timeout_seconds: int = 10, api_base: str | None = None):
         self._token = token
         self.timeout_seconds = max(1, int(timeout_seconds))
-        self.api_base = (api_base or _api_base()).rstrip("/")
+        self.api_base = (api_base or DEFAULT_API_BASE).rstrip("/")
 
     def send_message(
         self,

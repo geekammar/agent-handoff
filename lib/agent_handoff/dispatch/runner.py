@@ -10,7 +10,7 @@ from ..config import all_projects, project_by_name
 from ..report import auto_report
 from ..store import Store
 from ..upload import Uploader
-from ..util import FileLock, new_id, safe_title, sanitize_error, utcnow_iso
+from ..util import FileLock, new_id, safe_title, sanitize_error, utcnow_iso, utcnow_iso_precise
 from .adapters.base import ExecutionRequest, ExecutionResult
 from .adapters.opencode import OpenCodeAdapter
 from .delivery import (
@@ -204,16 +204,20 @@ class DispatchRunner:
             self.summary["records"] = len(self.ledger.all())
             return self.summary
         finally:
-            self._reconcile_notifications()
-            self._drain_notifications()
-            self.summary["elapsed_seconds"] = round(max(0.0, time.monotonic() - self._started_at), 2)
-            self._progress(
-                "finished",
-                f"poll finished executed={self.summary.get('executed', 0)} "
-                f"uploaded={self.summary.get('uploaded', 0)} published={self.summary.get('published', 0)} "
-                f"needs_attention={self.summary.get('needs_attention', 0)}",
-            )
-            lock.release()
+            try:
+                self._reconcile_notifications()
+            finally:
+                lock.release()
+            try:
+                self._drain_notifications()
+            finally:
+                self.summary["elapsed_seconds"] = round(max(0.0, time.monotonic() - self._started_at), 2)
+                self._progress(
+                    "finished",
+                    f"poll finished executed={self.summary.get('executed', 0)} "
+                    f"uploaded={self.summary.get('uploaded', 0)} published={self.summary.get('published', 0)} "
+                    f"needs_attention={self.summary.get('needs_attention', 0)}",
+                )
 
     def _recover_inflight(self, *, force: bool) -> None:
         for record in self.ledger.all():
@@ -817,6 +821,7 @@ class DispatchRunner:
                         "verified": False,
                         "attempts": recorded_attempts,
                         "last_error": error,
+                        "last_failed_at": utcnow_iso_precise(),
                         "next_attempt_at": next_attempt_at,
                     }
                 },
@@ -854,6 +859,7 @@ class DispatchRunner:
                     "receipt_url": result.get("receipt_url"),
                     "attempts": recorded_attempts,
                     "last_error": None,
+                    "last_failed_at": None,
                     "next_attempt_at": None,
                 },
                 "attention_reason": None,
@@ -943,9 +949,11 @@ class DispatchRunner:
                     updates={
                         "publication": {
                             "status": "PUBLISHED",
-                            "published_at": existing.get("created_at") or utcnow_iso(),
+                            "published_at": existing.get("created_at") or utcnow_iso_precise(),
                             "comment_url": existing.get("html_url"),
                             "last_error": None,
+                            "last_failed_at": None,
+                            "exhausted_at": None,
                             "next_attempt_at": None,
                         },
                         "attention_reason": None,
@@ -964,9 +972,11 @@ class DispatchRunner:
                 updates={
                     "publication": {
                         "status": "PUBLISHED",
-                        "published_at": utcnow_iso(),
+                        "published_at": utcnow_iso_precise(),
                         "comment_url": response.get("url"),
                         "last_error": None,
+                        "last_failed_at": None,
+                        "exhausted_at": None,
                         "next_attempt_at": None,
                     },
                     "attention_reason": None,
@@ -997,6 +1007,8 @@ class DispatchRunner:
                         "status": "EXHAUSTED" if exhausted else "FAILED",
                         "attempts": attempts,
                         "last_error": error,
+                        "last_failed_at": utcnow_iso_precise(),
+                        "exhausted_at": utcnow_iso_precise() if exhausted and not was_exhausted else publication.get("exhausted_at"),
                         "next_attempt_at": next_at,
                     },
                     "attention_reason": error if exhausted else current.get("attention_reason"),

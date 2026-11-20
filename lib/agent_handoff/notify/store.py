@@ -116,6 +116,8 @@ class NotificationStore:
                 record["state"] = "NEEDS_ATTENTION"
                 record["sending_at"] = None
                 record["next_attempt_at"] = None
+                record["ambiguous"] = True
+                record["ambiguous_at"] = utcnow_iso()
                 record["last_error"] = (
                     "notification send was interrupted; Telegram may or may not have accepted the message. "
                     "Review before retrying to avoid a duplicate."
@@ -138,11 +140,14 @@ class NotificationStore:
         force: bool = False,
         allowed_ids: set[str] | None = None,
         excluded_ids: set[str] | None = None,
+        allow_ambiguous: bool = False,
     ) -> dict[str, Any] | None:
         with self.lock():
             for record in self.all():
                 state = record.get("state")
                 if state not in ("PENDING", "RETRY_WAIT"):
+                    continue
+                if record.get("ambiguous") and not allow_ambiguous:
                     continue
                 if allowed_ids is not None and record.get("notification_id") not in allowed_ids:
                     continue
@@ -173,6 +178,10 @@ class NotificationStore:
             record["next_attempt_at"] = None
             record["sending_at"] = None
             record["last_error"] = None
+            record["unresolved"] = False
+            if record.get("ambiguous"):
+                record["ambiguous"] = False
+                record["ambiguous_resolved_at"] = now
 
         return self.update(notification_id, apply, note="Telegram message sent")
 
@@ -189,7 +198,8 @@ class NotificationStore:
             attempts = int(record.get("attempts", 0) or 0)
             record["last_error"] = error
             record["sending_at"] = None
-            if attempts >= max_attempts:
+            record["unresolved"] = False
+            if record.get("ambiguous") or attempts >= max_attempts:
                 record["state"] = "NEEDS_ATTENTION"
                 record["next_attempt_at"] = None
             else:
@@ -209,6 +219,7 @@ class NotificationStore:
         task_id: str | None = None,
         run_id: str | None = None,
         notification_id: str | None = None,
+        allow_ambiguous: bool = False,
     ) -> list[dict[str, Any]]:
         changed = []
         with self.lock():
@@ -220,20 +231,54 @@ class NotificationStore:
                     continue
                 if run_id and identity.get("run_id") != run_id:
                     continue
-                if record.get("state") in ("SENT", "SENDING"):
+                if record.get("state") in ("SENT", "SENDING", "SUPERSEDED"):
+                    continue
+                if record.get("ambiguous") and not allow_ambiguous:
                     continue
                 record["state"] = "PENDING"
                 record["attempts"] = 0
                 record["next_attempt_at"] = None
                 record["sending_at"] = None
+                record["unresolved"] = False
                 record["updated_at"] = utcnow_iso()
+                note = "operator requested notification retry"
+                if record.get("ambiguous"):
+                    record["ambiguous_acknowledged_at"] = record["updated_at"]
+                    note = "operator acknowledged duplicate risk and requested targeted notification retry"
                 record.setdefault("history", []).append(
-                    {"at": record["updated_at"], "state": "PENDING", "note": "operator requested notification retry"}
+                    {"at": record["updated_at"], "state": "PENDING", "note": note}
                 )
                 record["history"] = record["history"][-40:]
                 atomic_write_json(self.path(record["notification_id"]), record)
                 changed.append(record)
         return changed
+
+    def mark_superseded(self, notification_id: str, reason: str) -> dict[str, Any]:
+        now = utcnow_iso()
+
+        def apply(record: dict[str, Any]) -> None:
+            if record.get("state") in ("SENT", "SUPERSEDED"):
+                return
+            record["state"] = "SUPERSEDED"
+            record["superseded_at"] = now
+            record["superseded_reason"] = reason[:300]
+            record["sending_at"] = None
+            record["next_attempt_at"] = None
+            record["unresolved"] = False
+
+        return self.update(notification_id, apply, note=f"notification superseded: {reason[:240]}")
+
+    def mark_unresolved(self, notification_id: str, reason: str) -> dict[str, Any]:
+        def apply(record: dict[str, Any]) -> None:
+            if record.get("state") in ("SENT", "SUPERSEDED"):
+                return
+            record["state"] = "NEEDS_ATTENTION"
+            record["unresolved"] = True
+            record["sending_at"] = None
+            record["next_attempt_at"] = None
+            record["last_error"] = reason[:400]
+
+        return self.update(notification_id, apply, note=f"notification preserved without sending: {reason[:240]}")
 
     def filter(
         self,

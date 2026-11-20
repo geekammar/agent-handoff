@@ -28,6 +28,10 @@ def utcnow_iso() -> str:
     return utcnow().isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def utcnow_iso_precise() -> str:
+    return utcnow().isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
 def utc_from_timestamp(value: float | int | None) -> str:
     if value is None:
         return utcnow_iso()

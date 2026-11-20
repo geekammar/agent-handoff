@@ -416,33 +416,41 @@ agent-handoff dispatch notify --json
 agent-handoff dispatch notify --all --json
 ```
 
-After fixing the cause, retry notifications only:
+After fixing the cause, retry confirmed notification failures only:
 
 ```bash
 agent-handoff dispatch notify --retry --json
 agent-handoff dispatch notify --retry --task <task-id> --run <run-id> --json
 ```
 
-This never reruns OpenCode, re-uploads a verified report, or reposts the GitHub comment.
+A generic retry deliberately excludes ambiguous interrupted sends. This never reruns OpenCode, re-uploads a verified report, or reposts the GitHub comment.
 
 ## Telegram notification needs attention
 
-`NEEDS_ATTENTION` means notification attempts were exhausted or an interrupted send has an ambiguous outcome. The task/report delivery is still valid. Read the safe error:
+`NEEDS_ATTENTION` means notification attempts were exhausted, the related dispatch record is unavailable, or an interrupted send has an ambiguous outcome. The task/report delivery is still valid. Read the safe error:
 
 ```bash
 agent-handoff dispatch notify --json
 agent-handoff dispatch status --json
 ```
 
-Fix the token, chat id, network, or rate limit, then run `dispatch notify --retry`. Retrying an ambiguous send may duplicate the Telegram message; the outbox does not pretend to offer mathematically guaranteed exactly-once delivery.
+For a confirmed token/chat/network/rate-limit failure, fix the cause and run `dispatch notify --retry`. For an ambiguous outcome, review the Telegram chat first; a targeted retry requires both the notification id and explicit acknowledgement of the duplicate risk:
+
+```bash
+agent-handoff dispatch notify --retry --notification <notification-id> --acknowledge-duplicate --json
+```
+
+The outbox does not pretend to offer mathematically guaranteed exactly-once delivery.
 
 ## Telegram send was interrupted
 
-A send is persisted as `SENDING` before the HTTP request. If the process stops during the request, a later poll does not silently resend it. After the stale timeout it becomes `NEEDS_ATTENTION` with a warning that Telegram may or may not have accepted the message. Review the Telegram chat, then either ignore it or explicitly retry with `dispatch notify --retry`.
+A send is persisted as `SENDING` before the HTTP request. If the process stops during the request, a later poll does not silently resend it. After the stale timeout it becomes `NEEDS_ATTENTION` with `ambiguous=true` and a warning that Telegram may or may not have accepted the message. Review the Telegram chat, then either ignore it or explicitly retry that one notification with `--notification <id> --acknowledge-duplicate`. A generic `dispatch notify --retry` will not resend it.
 
 ## Old reports were not sent when notifications were enabled
 
-This is intentional. Notification enqueue happens at lifecycle transitions observed after enablement. Historical `ISSUE_UPDATED` records are never scanned or backfilled, preventing a flood of old reports. Records still pending upload/publication may legitimately notify when they reach verified delivery.
+This is intentional. Notification enqueue happens at lifecycle transitions observed after enablement. Historical `ISSUE_UPDATED` records are never scanned or backfilled, even if a later metadata update changes their generic `updated_at`; reconciliation uses the real publication/attention/failure transition timestamp. This prevents a flood of old reports. Records that genuinely publish or enter attention after enablement may legitimately notify.
+
+An unsent notification whose task condition later recovers is marked `SUPERSEDED` with a reason and timestamp, not sent and not deleted. If a historical record has no trustworthy transition timestamp, recovery fails closed rather than guessing.
 
 ## Telegram recipient cannot open the report link
 

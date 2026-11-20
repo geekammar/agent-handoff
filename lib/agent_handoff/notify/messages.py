@@ -156,16 +156,41 @@ def _delayed(payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
     if attempts is not None:
         lines.append(f"Attempts: <b>{int(attempts)}</b>")
     lines.append(f"Reason: {reason}")
-    if report_url:
-        lines.extend(["", "Verified report:", _link(report_url)])
+    if stage == "upload":
+        lines.extend(
+            [
+                "",
+                "تم حفظ التقرير محليًا، لكن التسليم الموثّق إلى Drive غير متاح بعد.",
+            ]
+        )
+        closing = (
+            "سيُعاد المحاولة تلقائيًا. لن تُنفَّذ المهمة مرة أخرى، "
+            "والتقرير المحفوظ محليًا لم يُفقد."
+        )
+    elif stage == "publication" and report_url:
+        lines.extend(
+            [
+                "",
+                "التقرير موثّق ومرفوع إلى Drive، لكن النشر في GitHub لم يكتمل بعد.",
+                "",
+                "Verified report:",
+                _link(report_url),
+            ]
+        )
+        closing = "سيُعاد المحاولة تلقائيًا. لن تُنفَّذ المهمة مرة أخرى، والتقرير الموثّق لم يُفقد."
+    else:
+        lines.extend(
+            [
+                "",
+                "لا يمكن تأكيد رابط تقرير موثّق بعد، والتسليم لم يكتمل.",
+            ]
+        )
+        closing = "سيُعاد المحاولة تلقائيًا. لن تُنفَّذ المهمة مرة أخرى."
+        if report_url:
+            lines.extend(["", "Verified report:", _link(report_url)])
     if issue_url:
         lines.extend(["", "GitHub Issue:", _link(issue_url)])
-    lines.extend(
-        [
-            "",
-            "سيُعاد المحاولة تلقائيًا. المهمة لن تُنفَّذ مرة أخرى، وتقرير موثّق لم يُفقد.",
-        ]
-    )
+    lines.extend(["", closing])
     buttons = [
         [*_button("View Report", report_url)],
         [*_button("View GitHub Issue", issue_url)],

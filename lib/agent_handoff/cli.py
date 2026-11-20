@@ -1174,7 +1174,8 @@ def _print_notification_summary(summary: dict[str, Any]) -> None:
         "\nTelegram notifications: "
         f"{'enabled' if summary.get('enabled') else 'configuration error'} · "
         f"sent={counts.get('SENT', 0)} pending={sum(counts.get(key, 0) for key in ('PENDING', 'SENDING'))} "
-        f"retry_wait={counts.get('RETRY_WAIT', 0)} needs_attention={counts.get('NEEDS_ATTENTION', 0)}"
+        f"retry_wait={counts.get('RETRY_WAIT', 0)} needs_attention={counts.get('NEEDS_ATTENTION', 0)} "
+        f"superseded={counts.get('SUPERSEDED', 0)}"
     )
     if summary.get("configuration_error"):
         print(f"  configuration: {summary['configuration_error']}")
@@ -1186,24 +1187,35 @@ def cmd_dispatch_notify(args: argparse.Namespace) -> int:
     config = load_config()
     notifier = NotificationService(config)
     if args.retry:
-        result = notifier.retry(task_id=args.task, run_id=args.run)
+        result = notifier.retry(
+            task_id=args.task,
+            run_id=args.run,
+            notification_id=args.notification,
+            acknowledge_duplicate=args.acknowledge_duplicate,
+        )
         if args.json:
             emit(result)
         elif not notifier.enabled:
             print(result.get("error") or "Telegram notifications are disabled or invalid.")
             if result.get("configuration_error"):
                 print(f"configuration: {result['configuration_error']}", file=sys.stderr)
+        elif result.get("error"):
+            print(result.get("error"))
         else:
             print(
                 f"Notification retry: retried={result.get('retried', 0)} "
-                f"sent={result.get('sent', 0)} failed={result.get('failed', 0)}"
+                f"sent={result.get('sent', 0)} failed={result.get('failed', 0)} "
+                f"superseded={result.get('superseded', 0)} skipped_ambiguous={result.get('skipped_ambiguous', 0)}"
             )
             for error in result.get("errors") or []:
                 print(f"[WARN] {error}", file=sys.stderr)
+            if result.get("next_action"):
+                print(f"next action: {result['next_action']}")
             counts = result.get("counts") or {}
             print(
                 f"Outbox: sent={counts.get('SENT', 0)} pending={sum(counts.get(key, 0) for key in ('PENDING', 'SENDING'))} "
-                f"retry_wait={counts.get('RETRY_WAIT', 0)} needs_attention={counts.get('NEEDS_ATTENTION', 0)}"
+                f"retry_wait={counts.get('RETRY_WAIT', 0)} needs_attention={counts.get('NEEDS_ATTENTION', 0)} "
+                f"superseded={counts.get('SUPERSEDED', 0)}"
             )
         return 0 if result.get("ok") else 1
     records = notifier.list_records(task_id=args.task, run_id=args.run, include_sent=args.all)
@@ -1227,14 +1239,16 @@ def cmd_dispatch_notify(args: argparse.Namespace) -> int:
             print(
                 f"stored: sent={counts.get('SENT', 0)} "
                 f"pending={sum(counts.get(key, 0) for key in ('PENDING', 'SENDING'))} "
-                f"retry_wait={counts.get('RETRY_WAIT', 0)} needs_attention={counts.get('NEEDS_ATTENTION', 0)}"
+                f"retry_wait={counts.get('RETRY_WAIT', 0)} needs_attention={counts.get('NEEDS_ATTENTION', 0)} "
+                f"superseded={counts.get('SUPERSEDED', 0)}"
             )
             print("These records will not be sent until notifications.telegram.enabled is true.")
         return 0
     print(
         f"Telegram notifications: {'enabled' if notifier.enabled else 'configuration error'} · "
         f"sent={counts.get('SENT', 0)} pending={sum(counts.get(key, 0) for key in ('PENDING', 'SENDING'))} "
-        f"retry_wait={counts.get('RETRY_WAIT', 0)} needs_attention={counts.get('NEEDS_ATTENTION', 0)}"
+        f"retry_wait={counts.get('RETRY_WAIT', 0)} needs_attention={counts.get('NEEDS_ATTENTION', 0)} "
+        f"superseded={counts.get('SUPERSEDED', 0)}"
     )
     if data["configuration_error"]:
         print(f"configuration: {data['configuration_error']}")
@@ -1650,7 +1664,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_dispatch_status)
     p = dispatch_sub.add_parser("notify", help="inspect or safely retry Telegram notifications without running agents")
-    p.add_argument("--retry", action="store_true", help="requeue failed/pending notifications and send them now")
+    p.add_argument(
+        "--retry",
+        action="store_true",
+        help="requeue confirmed failed/pending notifications and send them now; ambiguous sends are excluded",
+    )
+    p.add_argument("--notification", help="target one notification id; required for an ambiguous send")
+    p.add_argument(
+        "--acknowledge-duplicate",
+        action="store_true",
+        help="with --notification, allow one retry when the earlier send may already have reached Telegram",
+    )
     p.add_argument("--all", action="store_true", help="include already sent notifications in the listing")
     p.add_argument("--task", help="limit to one Agent Handoff task id")
     p.add_argument("--run", help="limit to one Agent Handoff run id")

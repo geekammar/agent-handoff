@@ -44,10 +44,10 @@ The installer applies one source-selection policy to Git and non-Git checkouts. 
 ### Optional notifications (`lib/agent_handoff/notify`)
 
 - `config.py`: validates the disabled-by-default Telegram section and reads the bot token from a named environment variable without ever returning it in validation errors.
-- `store.py`: durable notification outbox, stable notification identity, atomic JSON state, `flock`, bounded retry state, and ambiguous-send detection.
-- `transport.py`: standard-library Telegram Bot API `sendMessage` client with bounded timeout, HTTP/`ok=false` handling, `retry_after`, and token redaction.
-- `messages.py`: HTML-escaped Arabic-aware completion, attention, and delayed messages with the exact verified report URL and a selectable copy-ready ChatGPT prompt.
-- `service.py`: enqueue/drain/retry orchestration. Notification failure is isolated from the dispatcher ledger and never changes execution, verification, upload, or publication state.
+- `store.py`: durable notification outbox, stable notification identity, atomic JSON state, `flock`, bounded retry state, ambiguous-send detection, and terminal `SUPERSEDED` audit records.
+- `transport.py`: standard-library Telegram Bot API `sendMessage` client fixed to the official HTTPS endpoint, with bounded timeout, HTTP/`ok=false` handling, `retry_after`, and token redaction. Test endpoints require explicit constructor injection.
+- `messages.py`: HTML-escaped Arabic-aware completion, attention, and truthful delayed messages. An unverified upload is never described as a verified report; the completion prompt always contains the exact verified report URL.
+- `service.py`: enqueue/drain/retry orchestration with current-condition revalidation before sending. Notification failure is isolated from the dispatcher ledger and never changes execution, verification, upload, or publication state.
 
 ### OpenCode capture integration
 
@@ -140,11 +140,13 @@ NEW -> CLAIMED -> RUNNING -> EXECUTION_COMPLETED
 
 ## Notification outbox
 
-Notification identity is project + task + run + kind. Each identity has one durable JSON record under `state/dispatch/notifications/records/`; a `flock` protects mutations. States are `PENDING`, `SENDING`, `SENT`, `RETRY_WAIT`, and `NEEDS_ATTENTION`.
+Notification identity is project + task + run + kind. Each identity has one durable JSON record under `state/dispatch/notifications/records/`; a `flock` protects mutations. States are `PENDING`, `SENDING`, `SENT`, `RETRY_WAIT`, `NEEDS_ATTENTION`, and `SUPERSEDED`.
+
+Before sending, the service resolves the related dispatch record and rechecks the current condition. A delayed message whose upload or publication recovered, or an attention message whose condition was resolved, becomes `SUPERSEDED` with a reason and timestamp. A missing or unreadable dispatch record is preserved as unresolved attention rather than guessed valid. `SUPERSEDED` and `SENT` records are never retried or deleted.
 
 `DELIVERY_COMPLETED` is enqueued only at an `ISSUE_UPDATED` transition that also has `upload.verified`, a direct report URL, a verified receipt URL, and `publication.status=PUBLISHED`. `NEEDS_ATTENTION` is enqueued at durable attention/exhaustion transitions. `DELIVERY_DELAYED` is enqueued once per task/run after a documented attempt threshold.
 
-The outbox is drained after each dispatcher poll. Pending records survive restart. A durable `activated_at` marker bounds reconciliation: records newer than it are rechecked for a missing completion/attention/delay intent, while older historical `ISSUE_UPDATED` records are never backfilled. Sends use a bounded timeout and bounded attempts with backoff; Telegram `retry_after` is honored when present. A `SENDING` record whose process disappeared is not silently resent: it is marked `NEEDS_ATTENTION` with an explicit ambiguous-outcome warning.
+The outbox is drained after each dispatcher poll, after the runner lock is released, so a slow Telegram endpoint does not block a new poll. Pending records survive restart. A durable `activated_at` marker bounds reconciliation: each notification kind uses its real lifecycle transition timestamp (`publication.published_at`, recorded attention transition, upload/publication failure, or exhaustion), not generic `updated_at`; older historical records are never backfilled, and a record without a trustworthy timestamp fails closed. Sends use a bounded timeout and bounded attempts with backoff; Telegram `retry_after` is honored when present. A `SENDING` record whose process disappeared is not silently resent: it is marked `NEEDS_ATTENTION` with an explicit ambiguous-outcome warning. Generic retry excludes those ambiguous records; a targeted retry requires a notification id and explicit duplicate-risk acknowledgement.
 
 ## Upload, delivery, and historical reconciliation
 

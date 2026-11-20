@@ -124,10 +124,36 @@ class NotificationTests(unittest.TestCase):
         self.h = DispatchHarness(self.root)
         self.server = FakeTelegramServer()
         self.server.start()
+        self.h.bin = self._write_test_launcher()
         self.env = {
             "AGENT_HANDOFF_TELEGRAM_TOKEN": TOKEN,
-            "AGENT_HANDOFF_TELEGRAM_API_BASE": self.server.base_url,
+            "AGENT_HANDOFF_TEST_TELEGRAM_API_BASE": self.server.base_url,
         }
+
+    def _write_test_launcher(self) -> Path:
+        launcher = self.root / "test-telegram-cli.py"
+        launcher.write_text(
+            "\n".join(
+                [
+                    "import os",
+                    "import sys",
+                    f"sys.path.insert(0, {str(ROOT / 'lib')!r})",
+                    "from agent_handoff.notify import service as notification_service",
+                    "_original_init = notification_service.NotificationService.__init__",
+                    "def _patched_init(self, config, *, log=None):",
+                    "    _original_init(self, config, log=log)",
+                    "    base = os.environ.get('AGENT_HANDOFF_TEST_TELEGRAM_API_BASE')",
+                    "    if base and self.transport is not None:",
+                    "        self.transport.api_base = base.rstrip('/')",
+                    "notification_service.NotificationService.__init__ = _patched_init",
+                    "from agent_handoff.cli import main",
+                    "raise SystemExit(main())",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return launcher
 
     def tearDown(self) -> None:
         self.server.stop()
@@ -673,6 +699,412 @@ class NotificationTests(unittest.TestCase):
             failed = TelegramTransport(token, timeout_seconds=1).send_message(CHAT_ID, "test")
         self.assertFalse(failed["ok"])
         self.assertNotIn(token, json.dumps(failed, ensure_ascii=False))
+
+    def test_stale_delayed_notification_is_superseded_after_upload_recovery(self) -> None:
+        self.server.mode = "unavailable"
+        self.enable_notifications(delayed_after_attempts=1)
+        self.h.add_issue(number=1, body=request_body())
+        marker = self.root / "notify-stale-upload"
+        marker.write_text("1", encoding="utf-8")
+        first = self.dispatch(extra_env={"FAKE_FAIL_ONCE_FILE": str(marker)}, check=False)
+        self.assertEqual(first["uploaded"], 0)
+        delayed = self.notification(DELIVERY_DELAYED)
+        self.assertEqual(delayed["state"], "RETRY_WAIT")
+        NotificationStore(self.h.config).update(
+            delayed["notification_id"],
+            lambda item: item.update({"next_attempt_at": "2020-01-01T00:00:00Z"}),
+        )
+
+        self.server.mode = "ok"
+        self.server.requests.clear()
+        second = self.dispatch("--force")
+        self.assertTrue(second["ok"], second)
+        self.assertEqual(self.h.record(1)["status"], "ISSUE_UPDATED")
+        delayed = self.notification(DELIVERY_DELAYED)
+        self.assertEqual(delayed["state"], "SUPERSEDED")
+        self.assertTrue(delayed.get("superseded_at"))
+        self.assertTrue(delayed.get("superseded_reason"))
+        self.assertEqual(self.notification(DELIVERY_COMPLETED)["state"], "SENT")
+        texts = [item["payload"]["text"] for item in self.server.requests]
+        self.assertEqual(len(texts), 1, texts)
+        self.assertIn("PROMPT FOR CHATGPT:", texts[0])
+        self.assertNotIn("تسليم التقرير متأخر", texts[0])
+        self.assertEqual(len(self.h.opencode_calls()), 1)
+        self.assertEqual(len(self.h.comments(1)), 1)
+
+        self.server.requests.clear()
+        self.dispatch("--force")
+        self.assertEqual(self.server.requests, [])
+        self.assertEqual(self.notification(DELIVERY_DELAYED)["state"], "SUPERSEDED")
+        self.assertEqual(self.notification(DELIVERY_COMPLETED)["state"], "SENT")
+        self.assertEqual(len(self.h.comments(1)), 1)
+
+    def test_stale_publication_delay_is_superseded_after_publication_succeeds(self) -> None:
+        self.server.mode = "unavailable"
+        self.enable_notifications(delayed_after_attempts=1)
+        self.h.add_issue(number=1, body=request_body())
+        marker = self.root / "notify-stale-publication"
+        marker.write_text("1", encoding="utf-8")
+        first = self.dispatch(extra_env={"FAKE_GH_FAIL_COMMENT_FILE": str(marker)}, check=False)
+        self.assertEqual(first["published"], 0)
+        delayed = self.notification(DELIVERY_DELAYED)
+        self.assertEqual(delayed["payload"]["stage"], "publication")
+        self.assertEqual(delayed["state"], "RETRY_WAIT")
+        NotificationStore(self.h.config).update(
+            delayed["notification_id"],
+            lambda item: item.update({"next_attempt_at": "2020-01-01T00:00:00Z"}),
+        )
+
+        self.server.mode = "ok"
+        self.server.requests.clear()
+        second = self.dispatch("--force")
+        self.assertTrue(second["ok"], second)
+        self.assertEqual(self.h.record(1)["status"], "ISSUE_UPDATED")
+        self.assertEqual(self.notification(DELIVERY_DELAYED)["state"], "SUPERSEDED")
+        self.assertEqual(self.notification(DELIVERY_COMPLETED)["state"], "SENT")
+        texts = [item["payload"]["text"] for item in self.server.requests]
+        self.assertEqual(len(texts), 1, texts)
+        self.assertIn("PROMPT FOR CHATGPT:", texts[0])
+        self.assertNotIn("تسليم التقرير متأخر", texts[0])
+        self.assertEqual(len(self.h.comments(1)), 1)
+        self.assertEqual(len(self.h.opencode_calls()), 1)
+
+    def test_stale_attention_notification_is_superseded_after_manual_delivery(self) -> None:
+        self.server.mode = "unavailable"
+        self.enable_notifications()
+        self.h.config["dispatch"]["delivery"]["max_attempts"] = 1
+        self.h.write_config()
+        self.h.add_issue(number=1, body=request_body())
+        marker = self.root / "notify-stale-attention"
+        marker.write_text("1", encoding="utf-8")
+        first = self.dispatch(extra_env={"FAKE_GH_FAIL_COMMENT_FILE": str(marker)}, check=False)
+        self.assertEqual(first["needs_attention"], 1)
+        attention = self.notification(NEEDS_ATTENTION)
+        self.assertEqual(attention["state"], "RETRY_WAIT")
+        NotificationStore(self.h.config).update(
+            attention["notification_id"],
+            lambda item: item.update({"next_attempt_at": "2020-01-01T00:00:00Z"}),
+        )
+
+        self.server.mode = "ok"
+        self.server.requests.clear()
+        record = self.h.record(1)
+        delivered = self.jrun_cli(
+            [
+                "dispatch",
+                "deliver",
+                "--task",
+                record["capture"]["task_id"],
+                "--run",
+                record["capture"]["run_id"],
+                "--issue",
+                "1",
+                "--repository",
+                GH_REPO,
+                "--json",
+            ]
+        )
+        self.assertTrue(delivered["ok"], delivered)
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(self.notification(DELIVERY_COMPLETED)["state"], "SENT")
+
+        self.dispatch("--force", check=False)
+        attention = self.notification(NEEDS_ATTENTION)
+        self.assertEqual(attention["state"], "SUPERSEDED")
+        self.assertIn("delivery", (attention.get("superseded_reason") or "").lower())
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(len(self.h.opencode_calls()), 1)
+        self.assertEqual(len(self.h.comments(1)), 1)
+
+    def test_historical_completion_updated_after_activation_is_not_backfilled(self) -> None:
+        self.h.add_issue(number=1, body=request_body())
+        first = self.dispatch("--force")
+        self.assertTrue(first["ok"], first)
+        self.assertEqual(self.h.record(1)["status"], "ISSUE_UPDATED")
+
+        self.enable_notifications()
+        self.jrun_cli(["dispatch", "status", "--json"])
+        ledger = Ledger(self.h.config)
+        path = ledger.path(GH_REPO, 1)
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["updated_at"] = "2999-01-01T00:00:00Z"
+        path.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        self.dispatch("--force")
+        self.assertEqual(self.server.requests, [])
+        self.assertEqual(self.notifications(), [])
+
+    def test_historical_attention_updated_after_activation_is_not_backfilled(self) -> None:
+        issue = self.h.add_issue(number=1, body=request_body())
+        ledger = Ledger(self.h.config)
+        record = new_dispatch_record(
+            repository=GH_REPO,
+            issue=issue,
+            project={
+                "name": "Alpha",
+                "core_key": "alpha",
+                "core_name": "Alpha",
+                "workspace": str(self.h.project_path.resolve()),
+                "drive_folder_id": "alpha_folder_0001",
+            },
+            agent="opencode",
+            model="provider/model-fast",
+            request={"version": "1", "instructions": "stored request"},
+        )
+        ledger.create(record)
+        ledger.set_status(
+            GH_REPO,
+            1,
+            "NEEDS_ATTENTION",
+            note="historical attention before activation",
+            updates={"attention_reason": "historical condition"},
+        )
+        self.enable_notifications()
+        self.jrun_cli(["dispatch", "status", "--json"])
+        path = ledger.path(GH_REPO, 1)
+        current = json.loads(path.read_text(encoding="utf-8"))
+        current["updated_at"] = "2999-01-01T00:00:00Z"
+        path.write_text(json.dumps(current, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        self.dispatch("--force", check=False)
+        self.assertEqual(self.server.requests, [])
+        self.assertEqual(self.notifications(), [])
+
+    def test_new_attention_after_activation_is_recovered(self) -> None:
+        self.enable_notifications()
+        self.jrun_cli(["dispatch", "status", "--json"])
+        issue = self.h.add_issue(number=1, body=request_body())
+        ledger = Ledger(self.h.config)
+        record = new_dispatch_record(
+            repository=GH_REPO,
+            issue=issue,
+            project={
+                "name": "Alpha",
+                "core_key": "alpha",
+                "core_name": "Alpha",
+                "workspace": str(self.h.project_path.resolve()),
+                "drive_folder_id": "alpha_folder_0001",
+            },
+            agent="opencode",
+            model="provider/model-fast",
+            request={"version": "1", "instructions": "stored request"},
+        )
+        ledger.create(record)
+        ledger.set_status(
+            GH_REPO,
+            1,
+            "NEEDS_ATTENTION",
+            note="new attention after activation",
+            updates={"attention_reason": "new condition"},
+        )
+        self.dispatch("--force", check=False)
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(self.notification(NEEDS_ATTENTION)["state"], "SENT")
+
+    def test_unavailable_dispatch_record_preserves_notification_without_sending(self) -> None:
+        self.h.add_issue(number=1, body=request_body())
+        self.dispatch("--force")
+        record = self.h.record(1)
+        self.enable_notifications()
+        with mock.patch.dict(os.environ, {"AGENT_HANDOFF_TELEGRAM_TOKEN": TOKEN}, clear=False):
+            queued = NotificationService(self.h.config).enqueue_completed(record)
+        self.assertIsNotNone(queued)
+        notification_id = queued["notification_id"]
+        ledger = Ledger(self.h.config)
+        path = ledger.path(GH_REPO, 1)
+        saved_record = path.read_text(encoding="utf-8")
+        path.unlink()
+
+        first = self.run_cli(["dispatch", "notify", "--retry", "--json"], check=False)
+        self.assertNotEqual(first.returncode, 0)
+        data = json.loads(first.stdout)
+        self.assertEqual(data.get("preserved"), 1)
+        self.assertEqual(self.server.requests, [])
+        current = NotificationStore(self.h.config).get(notification_id)
+        self.assertEqual(current["state"], "NEEDS_ATTENTION")
+        self.assertTrue(current.get("unresolved"))
+        self.assertIn("dispatch record is unavailable", current.get("last_error") or "")
+
+        path.write_text(saved_record, encoding="utf-8")
+        recovered = self.jrun_cli(["dispatch", "notify", "--retry", "--json"])
+        self.assertTrue(recovered["ok"], recovered)
+        self.assertEqual(len(self.server.requests), 1)
+        current = NotificationStore(self.h.config).get(notification_id)
+        self.assertEqual(current["state"], "SENT")
+        self.assertFalse(current.get("unresolved"))
+        self.assertEqual(self.h.record(1)["status"], "ISSUE_UPDATED")
+        self.assertEqual(len(self.h.opencode_calls()), 1)
+        self.assertEqual(len(self.h.comments(1)), 1)
+
+    def test_ambiguous_send_is_excluded_from_generic_retry_and_requires_acknowledgement(self) -> None:
+        self.h.add_issue(number=1, body=request_body())
+        self.dispatch("--force")
+        record = self.h.record(1)
+        self.enable_notifications()
+        with mock.patch.dict(os.environ, {"AGENT_HANDOFF_TELEGRAM_TOKEN": TOKEN}, clear=False):
+            queued = NotificationService(self.h.config).enqueue_completed(record)
+        self.assertIsNotNone(queued)
+        notification_id = queued["notification_id"]
+        store = NotificationStore(self.h.config)
+        store.update(
+            notification_id,
+            lambda item: item.update(
+                {"state": "SENDING", "sending_at": "2020-01-01T00:00:00Z", "sent_at": None}
+            ),
+        )
+        self.dispatch("--force", check=False)
+        stale = store.get(notification_id)
+        self.assertEqual(stale["state"], "NEEDS_ATTENTION")
+        self.assertTrue(stale.get("ambiguous"))
+
+        self.server.requests.clear()
+        generic_run = self.run_cli(["dispatch", "notify", "--retry", "--json"], check=False)
+        self.assertNotEqual(generic_run.returncode, 0)
+        generic = json.loads(generic_run.stdout)
+        self.assertEqual(generic["retried"], 0)
+        self.assertEqual(generic.get("skipped_ambiguous"), 1)
+        self.assertEqual(self.server.requests, [])
+        self.assertEqual(store.get(notification_id)["state"], "NEEDS_ATTENTION")
+
+        rejected = self.run_cli(
+            ["dispatch", "notify", "--retry", "--notification", notification_id, "--json"],
+            check=False,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(self.server.requests, [])
+        self.assertEqual(store.get(notification_id)["state"], "NEEDS_ATTENTION")
+
+        retried = self.jrun_cli(
+            [
+                "dispatch",
+                "notify",
+                "--retry",
+                "--notification",
+                notification_id,
+                "--acknowledge-duplicate",
+                "--json",
+            ]
+        )
+        self.assertTrue(retried["ok"], retried)
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(store.get(notification_id)["state"], "SENT")
+        history = store.get(notification_id)["history"]
+        self.assertTrue(any("duplicate" in (item.get("note") or "").lower() for item in history))
+        self.assertEqual(self.h.record(1)["status"], "ISSUE_UPDATED")
+        self.assertEqual(len(self.h.opencode_calls()), 1)
+        self.assertEqual(len(self.h.comments(1)), 1)
+
+        self.server.requests.clear()
+        sent_retry = self.run_cli(
+            ["dispatch", "notify", "--retry", "--notification", notification_id, "--json"],
+            check=False,
+        )
+        self.assertNotEqual(sent_retry.returncode, 0)
+        self.assertEqual(self.server.requests, [])
+        self.assertEqual(store.get(notification_id)["state"], "SENT")
+
+    def test_acknowledged_ambiguous_retry_failure_is_not_automatically_retried(self) -> None:
+        self.h.add_issue(number=1, body=request_body())
+        self.dispatch("--force")
+        record = self.h.record(1)
+        self.enable_notifications()
+        with mock.patch.dict(os.environ, {"AGENT_HANDOFF_TELEGRAM_TOKEN": TOKEN}, clear=False):
+            queued = NotificationService(self.h.config).enqueue_completed(record)
+        self.assertIsNotNone(queued)
+        notification_id = queued["notification_id"]
+        store = NotificationStore(self.h.config)
+        store.update(
+            notification_id,
+            lambda item: item.update(
+                {"state": "SENDING", "sending_at": "2020-01-01T00:00:00Z", "sent_at": None}
+            ),
+        )
+        self.dispatch("--force", check=False)
+        self.server.mode = "unavailable"
+        failed = self.jrun_cli(
+            [
+                "dispatch",
+                "notify",
+                "--retry",
+                "--notification",
+                notification_id,
+                "--acknowledge-duplicate",
+                "--json",
+            ],
+            check=False,
+        )
+        self.assertFalse(failed["ok"], failed)
+        current = store.get(notification_id)
+        self.assertEqual(current["state"], "NEEDS_ATTENTION")
+        self.assertTrue(current.get("ambiguous"))
+        self.assertIsNone(current.get("next_attempt_at"))
+
+        self.server.requests.clear()
+        self.server.mode = "ok"
+        generic_run = self.run_cli(["dispatch", "notify", "--retry", "--json"], check=False)
+        self.assertNotEqual(generic_run.returncode, 0)
+        generic = json.loads(generic_run.stdout)
+        self.assertEqual(generic["retried"], 0)
+        self.assertEqual(self.server.requests, [])
+        self.dispatch("--force", check=False)
+        self.assertEqual(self.server.requests, [])
+        self.assertEqual(store.get(notification_id)["state"], "NEEDS_ATTENTION")
+
+    def test_delayed_messages_are_truthful_about_upload_and_publication(self) -> None:
+        upload_text = build_telegram_message(
+            DELIVERY_DELAYED,
+            {
+                "project": "Alpha",
+                "task_title": "Upload retry",
+                "stage": "upload",
+                "reason": "Drive unavailable",
+                "attempts": 3,
+            },
+        )["text"]
+        self.assertIn("تم حفظ التقرير محليًا", upload_text)
+        self.assertIn("التسليم الموثّق إلى Drive غير متاح بعد", upload_text)
+        self.assertNotIn("Verified report:", upload_text)
+        self.assertNotIn("PROMPT FOR CHATGPT:", upload_text)
+        self.assertNotIn("تقرير موثّق لم يُفقد", upload_text)
+
+        report_url = "https://drive.google.com/file/d/verifiedfile123/view"
+        publication_text = build_telegram_message(
+            DELIVERY_DELAYED,
+            {
+                "project": "Alpha",
+                "task_title": "Publication retry",
+                "stage": "publication",
+                "reason": "GitHub unavailable",
+                "attempts": 3,
+                "report_url": report_url,
+            },
+        )["text"]
+        self.assertIn(report_url, publication_text)
+        self.assertIn("التقرير موثّق", publication_text)
+        self.assertIn("GitHub", publication_text)
+        self.assertNotIn("تم تسليم تقرير المهمة", publication_text)
+        self.assertNotIn("PROMPT FOR CHATGPT:", publication_text)
+
+        no_url_text = build_telegram_message(
+            DELIVERY_DELAYED,
+            {
+                "project": "Alpha",
+                "task_title": "Unknown retry",
+                "stage": "publication",
+                "reason": "GitHub unavailable",
+                "attempts": 3,
+            },
+        )["text"]
+        self.assertIn("لا يمكن تأكيد رابط تقرير موثّق بعد", no_url_text)
+        self.assertNotIn("Verified report:", no_url_text)
+        self.assertNotIn("https://", no_url_text)
+
+    def test_transport_ignores_runtime_api_base_environment(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"AGENT_HANDOFF_TELEGRAM_API_BASE": "https://unintended.example.invalid"},
+            clear=False,
+        ):
+            transport = TelegramTransport(TOKEN, timeout_seconds=1)
+        self.assertEqual(transport.api_base, "https://api.telegram.org")
 
     def test_notification_retry_when_disabled_is_safe(self) -> None:
         output = self.run_cli(["dispatch", "notify", "--retry", "--json"], check=False)

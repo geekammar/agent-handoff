@@ -105,7 +105,8 @@ agent-handoff dispatch inspect --task <task-id> --run <run-id> --json
 agent-handoff dispatch deliver --task <task-id> --run <run-id> \
   --issue <number> --repository owner/private-dispatch --json
 agent-handoff dispatch notify --json              # notification outbox (no agent execution)
-agent-handoff dispatch notify --retry --json      # retry Telegram only (no agent execution)
+agent-handoff dispatch notify --retry --json      # retry confirmed Telegram failures only
+agent-handoff dispatch notify --retry --notification <id> --acknowledge-duplicate --json
 ```
 
 - An interrupt during upload is safe: the existing task/run/session identity is reused. Do not submit a duplicate issue.
@@ -136,7 +137,7 @@ Notifications are disabled by default and must never affect report delivery. Con
 
 Export the real token in the dispatcher environment; do not paste it into chat, config examples, Issue bodies, reports, or logs. Verify with `agent-handoff config validate` before enabling the service.
 
-`DELIVERY_COMPLETED` requires `ISSUE_UPDATED` plus a verified upload, verified receipt, and confirmed GitHub publication. `NEEDS_ATTENTION` and one-per-task `DELIVERY_DELAYED` states are separate. Telegram has no universal exactly-once transaction with local files: delivery is best-effort at-least-once with local deduplication, and an interrupted send is flagged for review. Never describe notification delivery as proof that the coding task, tests, or deployment succeeded.
+`DELIVERY_COMPLETED` requires `ISSUE_UPDATED` plus a verified upload, verified receipt, and confirmed GitHub publication. `NEEDS_ATTENTION` and truthful `DELIVERY_DELAYED` states are separate. An unsent message whose task condition recovered becomes `SUPERSEDED` and is never sent. Generic `dispatch notify --retry` excludes ambiguous interrupted sends; a targeted retry requires `--notification <id> --acknowledge-duplicate` because a duplicate may already exist. Telegram has no universal exactly-once transaction with local files: delivery is best-effort at-least-once with local deduplication, and an interrupted send is flagged for review. Never describe notification delivery as proof that the coding task, tests, or deployment succeeded.
 
 ## Boundaries
 

@@ -283,19 +283,24 @@ Notification kinds:
 | --- | --- |
 | `DELIVERY_COMPLETED` | Only after `ISSUE_UPDATED`, a verified upload, a verified upload receipt, and confirmed GitHub publication. |
 | `NEEDS_ATTENTION` | Uncertain execution, capture failure requiring review, or exhausted GitHub publication retries. Never described as successful delivery. |
-| `DELIVERY_DELAYED` | A captured or verified task whose upload/publication is still retrying. Sent once per task/run after `delayed_after_attempts`; it does not fire on every poll. |
+| `DELIVERY_DELAYED` | A captured task whose upload is still failing, or a verified task whose GitHub publication is still failing. It states which situation is current and never calls an unverified upload a verified report. Thresholded by `delayed_after_attempts`; it does not fire on every poll. |
 
-Notifications are stored in a durable local outbox under `state/dispatch/notifications/`. A stable identity of project + task + run + kind prevents repeated completion messages on later polls. Pending notifications survive a dispatcher restart without rerunning OpenCode or republishing the Issue. Telegram has no universal end-to-end exactly-once transaction with the local filesystem, so delivery is best-effort at-least-once with local deduplication; an interrupted send is flagged for review rather than silently resent.
+Notifications are stored in a durable local outbox under `state/dispatch/notifications/`. A stable identity of project + task + run + kind prevents repeated completion messages on later polls. Pending notifications survive a dispatcher restart without rerunning OpenCode or republishing the Issue. Before a queued message is sent, its durable dispatch record is rechecked; if the task recovered or the attention condition was resolved, the obsolete notification becomes `SUPERSEDED` instead of being sent. The audit record is retained, not deleted. Telegram has no universal end-to-end exactly-once transaction with the local filesystem, so delivery is best-effort at-least-once with local deduplication; an interrupted send is flagged for review rather than silently resent.
 
-Old already-delivered records are never backfilled. Enabling notifications only affects lifecycle transitions observed after enablement, so the owner is not flooded with historical reports.
+Old already-delivered records are never backfilled. Reconciliation is bounded by the real lifecycle transition timestamp (for example `publication.published_at` for completion, or the recorded attention transition), not by a generic `updated_at` change. Enabling notifications therefore does not flood the owner with historical reports, while genuinely new transitions after enablement can still be recovered.
+
+The Telegram client always targets the official `https://api.telegram.org` Bot API. It does not read a runtime environment variable for an alternate API host; deterministic tests inject a fake transport explicitly.
 
 ```bash
 agent-handoff dispatch status                 # includes notification counts and per-task state
 agent-handoff dispatch notify                 # inspect pending/failed notifications
 agent-handoff dispatch notify --json
-agent-handoff dispatch notify --retry         # retry notifications only; never runs agents
+agent-handoff dispatch notify --retry         # retry confirmed failures only; never runs agents
 agent-handoff dispatch notify --retry --task <task-id> --run <run-id> --json
+agent-handoff dispatch notify --retry --notification <id> --acknowledge-duplicate --json
 ```
+
+A generic `--retry` never resends an ambiguous interrupted send, because that could deliver a duplicate. After reviewing the Telegram chat, an operator may retry one specific notification with `--notification` and `--acknowledge-duplicate`.
 
 See [docs/DISPATCH.md](docs/DISPATCH.md) for the outbox state machine and [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for notification recovery.
 
@@ -376,7 +381,7 @@ agent-handoff/
 - Automatic reports cannot independently verify code changes, tests, or deployments.
 - The rclone OAuth token can expire or be revoked.
 - The dispatcher runs on your own host; it does not provide a hosted service or public API.
-- Telegram delivery is best-effort at-least-once with local deduplication, not a mathematically guaranteed exactly-once transaction. An interrupted send may have an ambiguous outcome and is flagged for review.
+- Telegram delivery is best-effort at-least-once with local deduplication, not a mathematically guaranteed exactly-once transaction. An interrupted send may have an ambiguous outcome and is flagged for review; a generic retry excludes it.
 - Telegram notifications do not create bots, authenticate Telegram accounts, alter Drive permissions, or replay historical deliveries on first enablement.
 - Google Drive folder IDs must remain stable; renaming a project in config does not rename the Drive folder.
 

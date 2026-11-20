@@ -232,6 +232,8 @@ PENDING -> SENDING -> SENT
              | RETRY_WAIT (bounded backoff)
              v
        NEEDS_ATTENTION (attempts exhausted or ambiguous interruption)
+
+PENDING/RETRY_WAIT -> SUPERSEDED (task condition changed before sending; retained for audit)
 ```
 
 Notification kinds:
@@ -240,7 +242,7 @@ Notification kinds:
 | --- | --- |
 | `DELIVERY_COMPLETED` | Only when the ledger is `ISSUE_UPDATED`, `upload.verified=true`, a direct report URL exists, the upload receipt URL is verified, and `publication.status=PUBLISHED`. Contains the exact verified report URL and the Issue URL. |
 | `NEEDS_ATTENTION` | Uncertain execution, capture failure requiring review, or exhausted GitHub publication retries. Uses the real status/reason. If no verified report URL exists, it says so explicitly. |
-| `DELIVERY_DELAYED` | A captured task with upload still retrying, or a verified task with publication still retrying. Sent at most once per task/run after `delayed_after_attempts`. |
+| `DELIVERY_DELAYED` | A captured task with upload still failing, or a verified task with publication still failing. The message distinguishes the two situations and never describes an unverified upload as a verified report. Thresholded by `delayed_after_attempts`. |
 
 A completion message is never sent from OpenCode text, `REPORT_CAPTURED`, a local test result, a readable Drive folder, or an unverified URL. Execution outcome is reported separately from report delivery. A failed or blocked execution still gets a delivery notification if and only if its report was verified and published, and the message states the outcome honestly.
 
@@ -275,15 +277,17 @@ Dynamic text is HTML-escaped. Titles and reasons are shortened before the verifi
 - Repeated polls do not resend a `SENT` completion.
 - The outbox is independent of the ledger: a Telegram failure cannot change `ISSUE_UPDATED`, rerun OpenCode, re-upload a report, or repost the Issue comment.
 - Pending notifications survive dispatcher restart and are retried by later polls.
-- When notifications are first enabled, the service writes an activation marker before processing transitions. Each poll reconciles ledger records newer than that marker, so a crash between the `ISSUE_UPDATED` ledger write and the outbox write is recovered without replaying older delivered history.
-- A send is persisted as `SENDING` before the HTTP call. If the process disappears during the call, a later drain sees the stale `SENDING` record and marks it `NEEDS_ATTENTION` instead of silently resending; the outcome is inherently ambiguous.
-- `dispatch notify --retry` is the explicit operator retry. It resets bounded attempts, sends the notification again, and never runs an agent. Retrying an ambiguous send can duplicate the Telegram message; that risk is documented, not hidden.
+- Before a queued notification is sent, its related durable dispatch record is resolved and the current condition is checked. If the upload recovered, publication completed, or an attention condition was resolved, the obsolete notification becomes `SUPERSEDED` with a persisted reason and timestamp. It is never sent and never deleted.
+- When notifications are first enabled, the service writes an activation marker before processing transitions. Reconciliation uses the relevant lifecycle transition timestamp, not generic `updated_at`: `publication.published_at` for completion, the recorded attention transition for `NEEDS_ATTENTION`, and recorded upload/publication failure or exhaustion timestamps for delayed/attention recovery. A crash between a transition and the outbox write is recovered only when that real transition is at or after activation. Historical records without a trustworthy timestamp fail closed.
+- A send is persisted as `SENDING` before the HTTP call. If the process disappears during the call, a later drain sees the stale `SENDING` record and marks it `NEEDS_ATTENTION` with `ambiguous=true` instead of silently resending; the outcome is inherently ambiguous.
+- Generic `dispatch notify --retry` resets and retries only confirmed retryable failures. It never requeues an ambiguous send. After reviewing the Telegram chat, an operator can retry one specific notification with `--notification <id> --acknowledge-duplicate`; the acknowledgement and its history are persisted. A failed acknowledged retry returns to `NEEDS_ATTENTION` and is not retried automatically.
+- Telegram network sends run after the dispatcher runner lock is released; the outbox has its own lock, so a slow Telegram endpoint does not block a new dispatcher poll.
 - Telegram `429` with `parameters.retry_after` is honored up to a bounded delay.
 - `dispatch run --force` retries upload/publication work; notification retry remains on its own backoff. Use `dispatch notify --retry` for Telegram.
 
 ### Activation boundary
 
-Notifications are enqueued at lifecycle transitions observed while `notifications.telegram.enabled` is true, and recovered from ledger records updated after the durable `activated_at` boundary. Historical `ISSUE_UPDATED` records older than the marker are never replayed, so enabling Telegram does not flood the owner with every old delivery. Records that are still pending delivery can legitimately publish and notify after enablement.
+Notifications are enqueued at lifecycle transitions observed while `notifications.telegram.enabled` is true, and recovered from ledger records whose real transition timestamp is at or after the durable `activated_at` boundary. Historical `ISSUE_UPDATED` records older than the marker are never replayed, even if a later metadata update changes their generic `updated_at`, so enabling Telegram does not flood the owner with every old delivery. Records that genuinely complete or enter attention after enablement can still be recovered.
 
 `dispatch deliver` reconciles an existing run manually and never invokes an agent.
 
@@ -340,9 +344,12 @@ agent-handoff dispatch deliver --task <task-id> --run <run-id> \
 agent-handoff dispatch notify --json
 agent-handoff dispatch notify --all --json
 
-# Retry notification delivery only; no agent, upload, or Issue comment is repeated
+# Retry confirmed notification failures only; no agent, upload, or Issue comment is repeated
 agent-handoff dispatch notify --retry --json
 agent-handoff dispatch notify --retry --task <task-id> --run <run-id> --json
+
+# After reviewing Telegram, retry one ambiguous send with explicit duplicate-risk acknowledgement
+agent-handoff dispatch notify --retry --notification <notification-id> --acknowledge-duplicate --json
 ```
 
 `dispatch run` refuses to start when `dispatch.enabled` is false. `config validate` validates core and dispatch configuration without contacting GitHub or Drive.
@@ -421,8 +428,8 @@ The service runs as the user who owns `gh` and rclone credentials. It does not r
 - SIGINT and SIGTERM attempt to stop the OpenCode and rclone child process groups before the dispatcher exits. A forced `SIGKILL` cannot run cleanup, so an already-started OpenCode child may continue. The ledger prevents automatic re-execution and marks the request `NEEDS_ATTENTION`; read-only mode limits the effect, but `workspace_write` requires operator care.
 - `allowed_users` matches GitHub login names, not immutable account IDs. Login renames must be handled by the repository owner.
 - Uploaded `REPORT.md` files currently include the local run directory path as audit evidence. They are stored in the user's private Drive; GitHub delivery comments contain only identifiers and verified URLs. Upload receipts omit local filesystem paths.
-- Telegram credentials are read from the configured environment variable only. The bot token is never written to config, reports, notification records, logs, or exception text. The outbox stores report/Issue URLs and sanitized text, not Issue instructions or local paths.
-- Telegram's Bot API has no universal end-to-end exactly-once transaction with the local filesystem. The outbox provides local deduplication, at-least-once retries, and explicit ambiguous-send review; it does not claim mathematically guaranteed exactly-once delivery.
+- Telegram credentials are read from the configured environment variable only. The bot token is never written to config, reports, notification records, logs, or exception text. The outbox stores report/Issue URLs and sanitized text, not Issue instructions or local paths. The transport always targets the official `https://api.telegram.org` endpoint; alternate test endpoints require explicit injection by test code and cannot be selected from runtime configuration.
+- Telegram's Bot API has no universal end-to-end exactly-once transaction with the local filesystem. The outbox provides local deduplication, at-least-once retries, stale-intent suppression, and explicit ambiguous-send review; it does not claim mathematically guaranteed exactly-once delivery.
 - The model can read files allowed by the OpenCode read permission within the workspace. `.env`-style files are denied by pattern, but this is not a substitute for OS-level secret isolation.
 
 ## Failure recovery
@@ -438,8 +445,9 @@ agent-handoff dispatch status --json
 
 Notification-only states are reported separately from the task record:
 
-- `RETRY_WAIT`: Telegram or the configured recipient failed temporarily. The task remains delivered. Retry is automatic after its own backoff, or use `dispatch notify --retry`.
-- `NEEDS_ATTENTION` (notification): notification attempts were exhausted, or a send was interrupted with an ambiguous outcome. Fix the token/chat/network issue, then use `dispatch notify --retry`. The report delivery is still intact.
+- `RETRY_WAIT`: Telegram or the configured recipient failed temporarily. The task remains delivered. Retry is automatic after its own backoff, or use `dispatch notify --retry` for confirmed failures.
+- `NEEDS_ATTENTION` (notification): notification attempts were exhausted, the related dispatch record is unavailable, or an interrupted send has an ambiguous outcome. For a confirmed cause, fix it and use `dispatch notify --retry`. For an ambiguous send, review Telegram first and use a targeted `--notification <id> --acknowledge-duplicate` only if a duplicate is acceptable. The report delivery is still intact.
+- `SUPERSEDED`: the task recovered or the attention condition was resolved before the message was sent. Nothing is sent, and the record is retained for audit.
 - `PENDING`/`SENDING`: queued or in progress. A pending notification survives restart.
 
 Backoff is automatic. `--force` ignores upload/publication backoff for an operator-controlled retry; Telegram retries use `dispatch notify --retry`.
@@ -469,7 +477,11 @@ Deterministic tests use fake GitHub, fake OpenCode, and fake rclone. They cover:
 - one low-noise delayed notification and one truthful attention notification per task/run;
 - repeated polling, restart recovery, stale/ambiguous sending, invalid chat id, token redaction, rate-limit `retry_after`, Arabic/HTML/length handling, and disabled-by-default no-network behavior;
 - manual delivery notification without agent re-execution;
-- activation boundary that does not replay historical delivered records;
+- activation boundary that does not replay historical delivered records, even after a generic metadata update;
+- stale delayed/attention notification suppression with durable `SUPERSEDED` state;
+- ambiguous-send exclusion from generic retry and targeted acknowledged retry;
+- truthful upload-failure and publication-failure delayed messages;
+- fixed official Telegram endpoint with explicit fake-transport injection in tests;
 - configuration preservation across install/upgrade/rollback.
 
 ```bash

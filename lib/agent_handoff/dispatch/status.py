@@ -257,15 +257,33 @@ def format_status_view(view: dict[str, Any]) -> list[str]:
         if notification.get("next_attempt_at"):
             detail += f" · next retry {notification.get('next_attempt_at')}"
         lines.append(detail)
+        if notification.get("superseded_reason"):
+            lines.append(f"        notification superseded: {notification.get('superseded_reason')}")
         if notification.get("last_error"):
             lines.append(f"        notification error: {notification.get('last_error')}")
         state = notification.get("state")
-        if state == "PENDING":
+        if state == "SUPERSEDED":
+            lines.append(
+                "        notification note: the task condition changed before this message was sent; "
+                "the record is retained without sending"
+            )
+        elif state == "PENDING":
             lines.append("        notification note: the next dispatcher poll will send it; report delivery is unaffected")
         elif state == "RETRY_WAIT":
             lines.append(
                 "        notification note: automatic retry is scheduled; use "
                 "agent-handoff dispatch notify --retry for an immediate retry. Report delivery is unaffected"
+            )
+        elif state == "NEEDS_ATTENTION" and notification.get("ambiguous"):
+            lines.append(
+                "        notification note: the interrupted send may already have arrived. Generic --retry "
+                "excludes it; review Telegram, then use a targeted --notification <id> "
+                "--acknowledge-duplicate only if a duplicate is acceptable"
+            )
+        elif state == "NEEDS_ATTENTION" and notification.get("unresolved"):
+            lines.append(
+                "        notification note: the related dispatch record is unavailable, so nothing was sent. "
+                "Inspect the durable state, then use agent-handoff dispatch notify --retry"
             )
         elif state == "NEEDS_ATTENTION":
             lines.append(
