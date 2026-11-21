@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import stat
@@ -47,11 +49,13 @@ class SafeGit:
         child_path: str | None = None,
         timeout: float = GIT_TIMEOUT_SECONDS,
         spawn: Any = subprocess.run,
+        allow_file_protocol: bool = False,
     ) -> None:
         self.identity = dict(identity) if identity else None
         self.child_path = child_path or (self.identity or {}).get("child_path") or DEFAULT_CHILD_PATH
         self.timeout = timeout
         self.spawn = spawn
+        self.allow_file_protocol = bool(allow_file_protocol)
 
     def environment(self, extra: Mapping[str, str] | None = None) -> dict[str, str]:
         env = {
@@ -63,6 +67,7 @@ class SafeGit:
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_ADVICE": "0",
+            "GIT_ATTR_NOSYSTEM": "1",
         }
         if self.identity:
             env["HOME"] = str(self.identity.get("home") or "/")
@@ -86,7 +91,8 @@ class SafeGit:
             "-c",
             "advice.detachedHead=false",
             "-c",
-            "protocol.file.allow=always",
+            "credential.helper=",
+            *(["-c", "protocol.file.allow=always"] if self.allow_file_protocol else []),
             *args,
         ]
 
@@ -98,6 +104,7 @@ class SafeGit:
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
         check: bool = True,
+        text: bool = True,
     ) -> subprocess.CompletedProcess:
         command = self.command(args)
         kwargs: dict[str, Any] = {}
@@ -113,14 +120,16 @@ class SafeGit:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
+                text=text,
                 timeout=timeout or self.timeout,
                 **kwargs,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise ChangeValidationError(f"Git operation failed: {sanitize_error(str(exc))}") from exc
         if check and result.returncode != 0:
-            detail = sanitize_error((result.stderr or result.stdout or f"git exited {result.returncode}"), 600)
+            stderr = result.stderr.decode("utf-8", errors="replace") if isinstance(result.stderr, bytes) else result.stderr
+            stdout = result.stdout.decode("utf-8", errors="replace") if isinstance(result.stdout, bytes) else result.stdout
+            detail = sanitize_error((stderr or stdout or f"git exited {result.returncode}"), 600)
             raise ChangeValidationError(f"Git operation failed: {detail}")
         return result
 
@@ -197,7 +206,15 @@ def _index_mode(git: SafeGit, workspace: str, path: str) -> str | None:
     return mode or None
 
 
-def _read_regular(path: str, max_bytes: int) -> tuple[int, bytes, int]:
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def normalized_publication_mode(raw_mode: int) -> str:
+    return "0755" if int(raw_mode) & 0o111 else "0644"
+
+
+def read_regular_file(path: str, max_bytes: int) -> tuple[int, bytes, int, str]:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -221,7 +238,7 @@ def _read_regular(path: str, max_bytes: int) -> tuple[int, bytes, int]:
         data = b"".join(chunks)
         if len(data) > max_bytes:
             raise ChangeValidationError("changed file exceeds the configured size limit")
-        return info.st_size, data, stat.S_IMODE(info.st_mode)
+        return info.st_size, data, stat.S_IMODE(info.st_mode), sha256_bytes(data)
     finally:
         os.close(descriptor)
 
@@ -238,7 +255,6 @@ def scan_bytes_for_secrets(data: bytes) -> list[str]:
 def _workspace_size(root: str) -> int:
     total = 0
     for current, dirs, files in os.walk(root, followlinks=False):
-        dirs[:] = [name for name in dirs if name != ".git"]
         for name in files:
             try:
                 info = os.lstat(os.path.join(current, name))
@@ -311,12 +327,16 @@ def validate_changes(
             if mode == "160000":
                 submodules.append(path)
                 blocked.append(f"submodule changes are not supported: {path}")
-                files.append({"path": path, "status": entry_status, "size": 0, "mode": mode})
+                files.append(
+                    {"path": path, "status": entry_status, "size": 0, "mode": None, "raw_mode": None, "sha256": None, "git_mode": mode}
+                )
                 continue
             if mode == "120000":
                 symlinks.append(path)
                 blocked.append(f"symlink changes are not supported: {path}")
-                files.append({"path": path, "status": entry_status, "size": 0, "mode": mode})
+                files.append(
+                    {"path": path, "status": entry_status, "size": 0, "mode": None, "raw_mode": None, "sha256": None, "git_mode": mode}
+                )
                 continue
             if mode and mode.startswith("100") and mode not in ("100644", "100755"):
                 blocked.append(f"unsupported Git file mode {mode} for {path}")
@@ -326,7 +346,9 @@ def validate_changes(
                 blocked.append(f"changed path is outside the configured allowlist: {path}")
             absolute = qualified_path(workspace, path)
             if not exists:
-                files.append({"path": path, "status": entry_status, "size": 0, "mode": mode})
+                files.append(
+                    {"path": path, "status": entry_status, "size": 0, "mode": None, "raw_mode": None, "sha256": None, "git_mode": mode}
+                )
                 continue
             try:
                 info = os.lstat(absolute)
@@ -341,7 +363,7 @@ def validate_changes(
                 blocked.append(f"changed path is not a regular file: {path}")
                 continue
             try:
-                size, data, file_mode = _read_regular(absolute, max_file_bytes)
+                size, data, file_mode, digest = read_regular_file(absolute, max_file_bytes)
             except (OSError, ChangeValidationError) as exc:
                 blocked.append(f"{path}: {sanitize_error(str(exc), 300)}")
                 continue
@@ -357,7 +379,9 @@ def validate_changes(
                     "path": path,
                     "status": entry_status,
                     "size": size,
-                    "mode": f"{file_mode:04o}",
+                    "mode": normalized_publication_mode(file_mode),
+                    "raw_mode": f"{file_mode:04o}",
+                    "sha256": digest,
                 }
             )
 
@@ -386,10 +410,31 @@ def validate_changes(
     if total_content > max_diff_bytes:
         blocked.append(f"changed content {total_content} exceeds the diff size limit {max_diff_bytes}")
 
+    ordered_files = sorted(files, key=lambda item: str(item.get("path")))
+    manifest = {
+        "schema": 1,
+        "digest": "sha256",
+        "files": [
+            {
+                "path": item.get("path"),
+                "status": item.get("status"),
+                "size": item.get("size"),
+                "mode": item.get("mode"),
+                "raw_mode": item.get("raw_mode"),
+                "sha256": item.get("sha256"),
+            }
+            for item in ordered_files
+        ],
+    }
+    manifest_sha256 = sha256_bytes(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    )
     return {
         "status": "blocked" if blocked else "passed",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "files": sorted(files, key=lambda item: str(item.get("path"))),
+        "files": ordered_files,
+        "manifest": manifest,
+        "manifest_sha256": manifest_sha256,
         "changed_count": len(files),
         "diff_bytes": diff_bytes,
         "workspace_bytes": workspace_bytes,

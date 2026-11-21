@@ -137,6 +137,58 @@ def _assert_no_symlinks(root: str) -> None:
                 )
 
 
+def _inspect_existing_workspace(
+    *,
+    target: str,
+    workspace_root: str,
+    repository: str,
+    base_branch: str,
+    base_commit: str,
+    identity: Mapping[str, Any],
+    git: SafeGit,
+) -> dict[str, Any]:
+    target = os.path.realpath(target)
+    root = os.path.realpath(workspace_root)
+    if not target.startswith(root.rstrip("/") + "/"):
+        raise WorkspacePreparationError("the existing workspace escaped the managed coding root")
+    if not WORKSPACE_NAME_RE.fullmatch(os.path.basename(target)):
+        raise WorkspacePreparationError("the existing workspace name is not managed by Agent Handoff")
+    if os.path.islink(target):
+        raise WorkspacePreparationError("the existing workspace must not be a symlink")
+    entry = os.stat(target)
+    if not stat.S_ISDIR(entry.st_mode):
+        raise WorkspacePreparationError("the existing workspace is not a directory")
+    uid = int(identity.get("uid", -1))
+    gid = int(identity.get("gid", -1))
+    if entry.st_uid != uid or entry.st_gid != gid:
+        raise WorkspacePreparationError("the existing workspace is not owned by the dedicated execution identity")
+    if entry.st_mode & 0o022:
+        raise WorkspacePreparationError("the existing workspace must not be group/world writable")
+    git_entry = os.path.join(target, ".git")
+    if not os.path.lexists(git_entry) or os.path.islink(git_entry):
+        raise WorkspacePreparationError("the existing workspace has unsafe or missing Git metadata")
+    git_stat = os.lstat(git_entry)
+    if not stat.S_ISDIR(git_stat.st_mode) or git_stat.st_uid != uid:
+        raise WorkspacePreparationError("the existing workspace Git metadata is not child-owned")
+    _assert_no_symlinks(target)
+    head = git.run(["rev-parse", "HEAD"], cwd=target)
+    if (head.stdout or "").strip() != base_commit:
+        raise WorkspacePreparationError("the existing workspace is not at the verified base commit")
+    status = git.run(["status", "--porcelain=v1", "--untracked-files=all"], cwd=target)
+    if (status.stdout or "").strip():
+        raise WorkspacePreparationError(
+            "the existing workspace is dirty; refusing to adopt it for publication"
+        )
+    return {
+        "workspace": target,
+        "workspace_name": os.path.basename(target),
+        "base_commit": base_commit,
+        "base_branch": base_branch,
+        "repository": repository,
+        "recovered": True,
+    }
+
+
 def prepare_workspace(
     *,
     workspace_root: str,
@@ -149,6 +201,7 @@ def prepare_workspace(
     identity: Mapping[str, Any],
     git: SafeGit,
     check_paths: bool = True,
+    allow_existing: bool = False,
 ) -> dict[str, Any]:
     if not TASK_ID_RE.fullmatch(str(task_id)):
         raise WorkspacePreparationError("the Agent Handoff task id is not safe for a workspace name")
@@ -157,6 +210,16 @@ def prepare_workspace(
         raise WorkspacePreparationError("the disposable workspace name is not safe")
     target = os.path.join(workspace_root, name)
     if os.path.lexists(target):
+        if allow_existing:
+            return _inspect_existing_workspace(
+                target=target,
+                workspace_root=workspace_root,
+                repository=repository,
+                base_branch=base_branch,
+                base_commit=base_commit,
+                identity=identity,
+                git=git,
+            )
         raise WorkspacePreparationError(
             "the disposable workspace already exists; refusing to reuse or clean a dirty task directory"
         )

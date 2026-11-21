@@ -506,3 +506,19 @@ If persisted OpenCode events exist, the dispatcher resumes from them and does no
 ## Upload failed after a Draft PR was created
 
 The PR is already a durable review artifact. Upload/publication retries reuse the PR and the verified upload contract; the agent is not re-executed. If the report cannot be verified, the PR remains a Draft and the task is not claimed as delivered. Do not merge or deploy based on an unverified report.
+
+## Coding artifact changed after validation
+
+C2 records a SHA-256 digest, size, raw mode, and publication mode for every approved file. Publication re-reads the file with no-follow semantics and verifies the staged index and committed tree. If a file changes after validation, the task is blocked with no branch or PR. This is intentional: do not edit the task workspace while publication is running, and do not weaken digest checks. The agent is not rerun automatically.
+
+## Coding publication staging is missing
+
+If staging was lost after a commit but before the ledger recorded a push, the dispatcher queries the trusted remote branch by its stable task branch. If the remote already contains the exact verified commit, publication continues and records remote-SHA recovery. If the remote branch is absent or contains a different commit, the task becomes blocked for operator review; the dispatcher does not force-push and does not publish a different commit under the old task identity.
+
+## Draft PR exists but the report link is missing from its body
+
+Report and Issue delivery are independent of the PR body update. After verified report upload, the dispatcher attempts to add the verified report link to the existing Draft PR with bounded backoff. A failure is surfaced as a warning/status retry, never as a duplicate PR. If the bounded retry is exhausted, inspect the existing PR and the verified report; do not create a replacement PR.
+
+## Coding process group outlived its command
+
+Trusted tests and OpenCode run in their own process groups. A surviving group after command completion is terminated and blocks publication. This prevents workspace mutation after validation. A fully detached process that escapes the process group is not detected; use host-level monitoring for that residual risk.

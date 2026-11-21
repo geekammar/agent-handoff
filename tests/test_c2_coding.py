@@ -412,7 +412,7 @@ class TestCodingConfigAndRequests(unittest.TestCase):
             project=project,
             identity=fake_identity(),
             adapter=SimpleNamespace(),
-            git=SafeGit(identity=None),
+            git=SafeGit(identity=None, allow_file_protocol=True),
         )
         orchestrator.mark_agent_running(str(self.root / "events.jsonl"))
         orchestrator.mark_agent_completed(
@@ -450,7 +450,7 @@ class TestCodingConfigAndRequests(unittest.TestCase):
         (workspace / "README.md").write_text("# Changed\n", encoding="utf-8")
         evidence = validate_changes(
             str(workspace),
-            git=SafeGit(identity=None),
+            git=SafeGit(identity=None, allow_file_protocol=True),
             limits={"max_files_changed": 10, "max_file_bytes": 50000, "max_diff_bytes": 200000, "max_workspace_bytes": 1000000},
             protected_paths=[".github/workflows/**"],
             allowed_paths=["README.md"],
@@ -467,7 +467,7 @@ class TestCodingConfigAndRequests(unittest.TestCase):
         (workspace / "src" / "app.py").write_text(f'KEY = "{fake_key}"\n', encoding="utf-8")
         evidence = validate_changes(
             str(workspace),
-            git=SafeGit(identity=None),
+            git=SafeGit(identity=None, allow_file_protocol=True),
             limits={"max_files_changed": 10, "max_file_bytes": 50000, "max_diff_bytes": 200000, "max_workspace_bytes": 1000000},
             protected_paths=[],
         )
@@ -519,7 +519,7 @@ class TestWorkspaceAndDiff(unittest.TestCase):
                 issue_number=issue,
                 task_id=task_id,
                 identity=fake_identity(),
-                git=SafeGit(identity=None),
+                git=SafeGit(identity=None, allow_file_protocol=True),
             )
 
     def test_t08_t11_t12_clean_unique_workspaces_at_verified_base(self) -> None:
@@ -537,7 +537,7 @@ class TestWorkspaceAndDiff(unittest.TestCase):
         (Path(first["workspace"]) / "dirty.txt").write_text("dirty\n", encoding="utf-8")
         evidence = validate_changes(
             str(Path(second["workspace"])),
-            git=SafeGit(identity=None),
+            git=SafeGit(identity=None, allow_file_protocol=True),
             limits={"max_files_changed": 10, "max_file_bytes": 50000, "max_diff_bytes": 200000, "max_workspace_bytes": 1000000},
             protected_paths=[],
         )
@@ -567,8 +567,218 @@ class TestWorkspaceAndDiff(unittest.TestCase):
                     issue_number=3,
                     task_id="t-symlink",
                     identity=fake_identity(),
-                    git=SafeGit(identity=None),
+                    git=SafeGit(identity=None, allow_file_protocol=True),
                 )
+
+    def _artifact_fixture(self, *, issue: int = 31, task_id: str = "t-artifact") -> tuple[TrustedPublisher, dict, Path]:
+        prepared = self._prepare(issue=issue, task_id=task_id)
+        workspace = Path(prepared["workspace"])
+        (workspace / "src" / "app.py").write_text("value = 2\n", encoding="utf-8")
+        (workspace / "src" / "feature.py").write_text("FEATURE = True\n", encoding="utf-8")
+        evidence = validate_changes(
+            str(workspace),
+            git=SafeGit(identity=None, allow_file_protocol=True),
+            limits={"max_files_changed": 10, "max_file_bytes": 50000, "max_diff_bytes": 200000, "max_workspace_bytes": 1000000},
+            protected_paths=[],
+        )
+        self.assertEqual(evidence["status"], "passed", evidence)
+        staging = self.root / f"publication-{task_id}"
+        staging.mkdir(exist_ok=True)
+        os.chmod(staging, 0o700)
+        publisher = TrustedPublisher(
+            repository=PROJECT_REPO,
+            base_branch="main",
+            branch_prefix="agent-handoff/",
+            staging_root=str(staging),
+            token_provider=lambda: "fake-token",
+            remote_url=f"file://{self.repo['bare']}",
+            git=SafeGit(identity=None, allow_file_protocol=True),
+            max_file_bytes=50000,
+        )
+        with mock.patch.object(publisher, "verify_repository", return_value={"repository": PROJECT_REPO}):
+            publisher.prepare(base_commit=self.repo["base"], task_id=task_id, run_id=f"r-{task_id}")
+        return publisher, evidence, workspace
+
+    def _commit_fixture(self, publisher: TrustedPublisher, evidence: dict, workspace: Path, *, task_id: str = "t-artifact") -> dict:
+        return publisher.stage_and_commit(
+            validation=evidence,
+            task_workspace=str(workspace),
+            project="Alpha",
+            title="Artifact integrity",
+            issue_number=31,
+            task_id=task_id,
+            run_id=f"r-{task_id}",
+            base_commit=self.repo["base"],
+        )
+
+    def test_t01_content_changed_after_validation_is_rejected(self) -> None:
+        publisher, evidence, workspace = self._artifact_fixture(task_id="t-t01")
+        (workspace / "src" / "app.py").write_text("value = 9\n", encoding="utf-8")
+        with self.assertRaises(PublicationError) as ctx:
+            self._commit_fixture(publisher, evidence, workspace, task_id="t-t01")
+        self.assertIn("artifact changed", str(ctx.exception))
+
+    def test_t02_size_changed_after_validation_is_rejected(self) -> None:
+        publisher, evidence, workspace = self._artifact_fixture(task_id="t-t02")
+        with (workspace / "src" / "app.py").open("a", encoding="utf-8") as handle:
+            handle.write("# extra\n")
+        with self.assertRaises(PublicationError) as ctx:
+            self._commit_fixture(publisher, evidence, workspace, task_id="t-t02")
+        self.assertIn("artifact changed", str(ctx.exception))
+
+    def test_t03_mode_changed_after_validation_is_rejected(self) -> None:
+        publisher, evidence, workspace = self._artifact_fixture(task_id="t-t03")
+        os.chmod(workspace / "src" / "app.py", 0o755)
+        with self.assertRaises(PublicationError) as ctx:
+            self._commit_fixture(publisher, evidence, workspace, task_id="t-t03")
+        self.assertIn("artifact changed", str(ctx.exception))
+
+    def test_t04_symlink_substitution_during_publication_is_rejected(self) -> None:
+        publisher, evidence, workspace = self._artifact_fixture(task_id="t-t04")
+        target = workspace / "src" / "app.py"
+        target.unlink()
+        os.symlink("feature.py", target)
+        with self.assertRaises(PublicationError):
+            self._commit_fixture(publisher, evidence, workspace, task_id="t-t04")
+
+    def test_t05_manifest_digest_mismatch_is_rejected(self) -> None:
+        publisher, evidence, workspace = self._artifact_fixture(task_id="t-t05")
+        tampered = json.loads(json.dumps(evidence))
+        tampered["manifest"]["files"][1]["sha256"] = "0" * 64
+        import hashlib
+
+        canonical = json.dumps(tampered["manifest"], sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        tampered["manifest_sha256"] = hashlib.sha256(canonical).hexdigest()
+        with self.assertRaises(PublicationError):
+            self._commit_fixture(publisher, tampered, workspace, task_id="t-t05")
+
+    def test_t06_committed_tree_matches_manifest(self) -> None:
+        publisher, evidence, workspace = self._artifact_fixture(task_id="t-t06")
+        committed = self._commit_fixture(publisher, evidence, workspace, task_id="t-t06")
+        staging = Path(committed["staging"])
+        for item in evidence["manifest"]["files"]:
+            data = subprocess.run(
+                ["git", "cat-file", "-p", f"HEAD:{item['path']}"],
+                cwd=staging,
+                capture_output=True,
+                check=True,
+            ).stdout
+            self.assertEqual(__import__("hashlib").sha256(data).hexdigest(), item["sha256"])
+            tree = subprocess.run(
+                ["git", "ls-tree", "HEAD", "--", item["path"]], cwd=staging, capture_output=True, text=True, check=True
+            ).stdout
+            self.assertIn("100755" if item["mode"] == "0755" else "100644", tree)
+
+    def test_t07_unexpected_staged_file_is_refused(self) -> None:
+        publisher, evidence, workspace = self._artifact_fixture(task_id="t-t07")
+        staging = Path(publisher._staging)
+        (staging / "evil.txt").write_text("unexpected\n", encoding="utf-8")
+        subprocess.run(["git", "add", "evil.txt"], cwd=staging, check=True)
+        with self.assertRaises(PublicationError) as ctx:
+            self._commit_fixture(publisher, evidence, workspace, task_id="t-t07")
+        self.assertIn("staged publication paths", str(ctx.exception))
+
+    def test_t08_parent_git_hooks_cannot_execute(self) -> None:
+        publisher, evidence, workspace = self._artifact_fixture(task_id="t-t08")
+        marker = self.root / "hook-ran"
+        hook = Path(publisher._staging) / ".git" / "hooks" / "pre-commit"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+        os.chmod(hook, 0o755)
+        self._commit_fixture(publisher, evidence, workspace, task_id="t-t08")
+        self.assertFalse(marker.exists())
+
+    def test_t09_git_filters_cannot_execute_as_parent(self) -> None:
+        publisher, evidence, workspace = self._artifact_fixture(task_id="t-t09")
+        marker = self.root / "filter-ran"
+        script = self.root / "evil-filter.sh"
+        script.write_text(f"#!/bin/sh\ntouch {marker}\ncat\n", encoding="utf-8")
+        os.chmod(script, 0o755)
+        config = workspace / ".git" / "config"
+        with config.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n[filter \"evil\"]\n\tclean = {script}\n\tsmudge = {script}\n")
+        (workspace / ".gitattributes").write_text("*.py filter=evil\n", encoding="utf-8")
+        self._commit_fixture(publisher, evidence, workspace, task_id="t-t09")
+        self.assertFalse(marker.exists())
+
+    def test_t10_untrusted_fsmonitor_configuration_cannot_execute(self) -> None:
+        prepared = self._prepare(issue=32, task_id="t-t10")
+        workspace = Path(prepared["workspace"])
+        marker = self.root / "fsmonitor-ran"
+        script = self.root / "evil-fsmonitor.sh"
+        script.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+        os.chmod(script, 0o755)
+        config = workspace / ".git" / "config"
+        with config.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n[core]\n\tfsmonitor = {script}\n")
+        (workspace / "src" / "app.py").write_text("value = 7\n", encoding="utf-8")
+        evidence = validate_changes(
+            str(workspace),
+            git=SafeGit(identity=None, allow_file_protocol=True),
+            limits={"max_files_changed": 10, "max_file_bytes": 50000, "max_diff_bytes": 200000, "max_workspace_bytes": 1000000},
+            protected_paths=[],
+        )
+        self.assertEqual(evidence["status"], "passed", evidence)
+        self.assertFalse(marker.exists())
+
+    def test_t12_no_force_push_and_file_protocol_is_restricted(self) -> None:
+        safe = SafeGit(identity=None)
+        command = safe.command(["push", "origin", "abc:refs/heads/task"])
+        self.assertNotIn("--force", command)
+        self.assertNotIn("protocol.file.allow=always", command)
+        self.assertIn("core.hooksPath=/dev/null", command)
+        self.assertIn("credential.helper=", command)
+        allowed = SafeGit(identity=None, allow_file_protocol=True).command(["clone", "src", "dst"])
+        self.assertIn("protocol.file.allow=always", allowed)
+
+    def test_recovery_adopts_only_clean_verified_workspace(self) -> None:
+        prepared = self._prepare(issue=41, task_id="t-adopt")
+        current_identity = {**fake_identity(), "uid": os.getuid(), "gid": os.getgid()}
+        with mock.patch("agent_handoff.dispatch.coding.workspace.os.geteuid", return_value=0):
+            adopted = prepare_workspace(
+                workspace_root=str(self.work),
+                repository=PROJECT_REPO,
+                base_branch="main",
+                base_commit=self.repo["base"],
+                source=str(self.repo["source"]),
+                issue_number=41,
+                task_id="t-adopt",
+                identity=current_identity,
+                git=SafeGit(identity=None, allow_file_protocol=True),
+                allow_existing=True,
+            )
+        self.assertTrue(adopted.get("recovered"))
+        self.assertEqual(adopted["workspace"], prepared["workspace"])
+        (Path(prepared["workspace"]) / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        with mock.patch("agent_handoff.dispatch.coding.workspace.os.geteuid", return_value=0):
+            with self.assertRaises(WorkspacePreparationError):
+                prepare_workspace(
+                    workspace_root=str(self.work),
+                    repository=PROJECT_REPO,
+                    base_branch="main",
+                    base_commit=self.repo["base"],
+                    source=str(self.repo["source"]),
+                    issue_number=41,
+                    task_id="t-adopt",
+                    identity=current_identity,
+                    git=SafeGit(identity=None, allow_file_protocol=True),
+                    allow_existing=True,
+                )
+
+    def test_t13_unpersisted_commit_is_safely_recreated_before_publication(self) -> None:
+        publisher, evidence, workspace = self._artifact_fixture(task_id="t-t13")
+        first = self._commit_fixture(publisher, evidence, workspace, task_id="t-t13")
+        with mock.patch.object(publisher, "verify_repository", return_value={"repository": PROJECT_REPO}):
+            publisher.prepare(base_commit=self.repo["base"], task_id="t-t13", run_id="r-t-t13")
+        second = self._commit_fixture(publisher, evidence, workspace, task_id="t-t13")
+        self.assertRegex(second["commit"], r"^[0-9a-f]{40,64}$")
+        self.assertTrue((Path(second["staging"]) / ".git").is_dir())
+        branches = subprocess.run(
+            ["git", "for-each-ref", "--format=%(refname)", "refs/heads"],
+            cwd=self.repo["bare"], capture_output=True, text=True, check=True
+        ).stdout.strip().splitlines()
+        self.assertEqual([item for item in branches if item.startswith("refs/heads/agent-handoff/")], [])
+        self.assertRegex(second["commit"], r"^[0-9a-f]{40,64}$")
+        self.assertRegex(first["commit"], r"^[0-9a-f]{40,64}$")
 
     def test_t13_t24_diff_and_commit_from_validated_files(self) -> None:
         prepared = self._prepare(issue=9, task_id="t-change")
@@ -577,7 +787,7 @@ class TestWorkspaceAndDiff(unittest.TestCase):
         (workspace / "src" / "new.py").write_text("NEW = True\n", encoding="utf-8")
         evidence = validate_changes(
             str(workspace),
-            git=SafeGit(identity=None),
+            git=SafeGit(identity=None, allow_file_protocol=True),
             limits={"max_files_changed": 10, "max_file_bytes": 50000, "max_diff_bytes": 200000, "max_workspace_bytes": 1000000},
             protected_paths=[".github/workflows/**"],
         )
@@ -593,9 +803,10 @@ class TestWorkspaceAndDiff(unittest.TestCase):
             staging_root=str(staging),
             token_provider=lambda: "fake-token",
             remote_url=f"file://{self.repo['bare']}",
-            git=SafeGit(identity=None),
+            git=SafeGit(identity=None, allow_file_protocol=True),
         )
-        publisher.prepare(base_commit=self.repo["base"], task_id="t-change", run_id="r-change")
+        with mock.patch.object(publisher, "verify_repository", return_value={"repository": PROJECT_REPO}):
+            publisher.prepare(base_commit=self.repo["base"], task_id="t-change", run_id="r-change")
         committed = publisher.stage_and_commit(
             validation=evidence,
             task_workspace=str(workspace),
@@ -704,6 +915,75 @@ class TestTestRunnerSecurity(unittest.TestCase):
             popen_isolation_kwargs({"uid": 0, "gid": 0})
 
 
+class TestProcessSafety(unittest.TestCase):
+    def test_t19_sigterm_unwinding_kills_test_process_tree(self) -> None:
+        class SystemExitProcess(FakeProcess):
+            def __init__(self) -> None:
+                super().__init__(exit_code=0)
+                self.calls = 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.calls += 1
+                if self.calls == 1:
+                    raise SystemExit(143)
+                self.returncode = -9
+                return -9
+
+        process = SystemExitProcess()
+        with mock.patch("agent_handoff.dispatch.coding.testrunner.os.killpg", side_effect=OSError):
+            with self.assertRaises(SystemExit):
+                run_command_bounded(
+                    ["slow"],
+                    workspace="/tmp",
+                    environment={},
+                    identity=fake_identity(),
+                    timeout_seconds=10,
+                    max_output_bytes=100,
+                    spawn=lambda argv, **kwargs: process,
+                )
+        self.assertTrue(process.terminated)
+
+    def test_t21_orphan_process_group_blocks_test_success(self) -> None:
+        process = FakeProcess(exit_code=0)
+        with mock.patch("agent_handoff.dispatch.coding.testrunner.process_group_alive", return_value=True), mock.patch(
+            "agent_handoff.dispatch.coding.testrunner.terminate_process_group", return_value=True
+        ):
+            result = run_command_bounded(
+                ["fast"],
+                workspace="/tmp",
+                environment={},
+                identity=fake_identity(),
+                timeout_seconds=10,
+                max_output_bytes=100,
+                spawn=lambda argv, **kwargs: process,
+            )
+        self.assertEqual(result["status"], "orphans")
+        self.assertTrue(result["orphans_detected"])
+
+    def test_t22_output_is_bounded_and_resource_limits_are_set(self) -> None:
+        process = FakeProcess(exit_code=0, stdout=b"x" * 5000)
+        result = run_command_bounded(
+            ["chatty"],
+            workspace="/tmp",
+            environment={},
+            identity=fake_identity(),
+            timeout_seconds=10,
+            max_output_bytes=100,
+            spawn=lambda argv, **kwargs: process,
+        )
+        self.assertLessEqual(len(result["stdout"]), 100)
+        self.assertTrue(result["output_truncated"])
+        import resource
+        from agent_handoff.dispatch.coding.testrunner import _preexec_limits
+
+        with mock.patch.object(resource, "setrlimit") as setrlimit:
+            _preexec_limits(10, memory_bytes=123456789, processes=77, file_bytes=987654321)()
+        limits = {call.args[0] for call in setrlimit.call_args_list}
+        for name in ("RLIMIT_CPU", "RLIMIT_NOFILE", "RLIMIT_AS", "RLIMIT_NPROC", "RLIMIT_FSIZE"):
+            if hasattr(resource, name):
+                self.assertIn(getattr(resource, name), limits)
+
+
 class TestPublicationAndReporting(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -735,7 +1015,7 @@ class TestPublicationAndReporting(unittest.TestCase):
             gh_command=str(self.gh_dir / "gh"),
             token_provider=lambda: "fake-token",
             remote_url=f"file://{remote or self.repo['bare']}",
-            git=SafeGit(identity=None),
+            git=SafeGit(identity=None, allow_file_protocol=True),
         )
 
     def _commit_change(self, publisher: TrustedPublisher) -> tuple[str, dict]:
@@ -744,11 +1024,12 @@ class TestPublicationAndReporting(unittest.TestCase):
         (workspace / "src" / "app.py").write_text("value = 3\n", encoding="utf-8")
         evidence = validate_changes(
             str(workspace),
-            git=SafeGit(identity=None),
+            git=SafeGit(identity=None, allow_file_protocol=True),
             limits={"max_files_changed": 10, "max_file_bytes": 50000, "max_diff_bytes": 200000, "max_workspace_bytes": 1000000},
             protected_paths=[],
         )
-        publisher.prepare(base_commit=self.repo["base"], task_id="t-pr", run_id="r-pr")
+        with mock.patch.dict(os.environ, {"FAKE_GH_DIR": str(self.gh_dir)}, clear=False):
+            publisher.prepare(base_commit=self.repo["base"], task_id="t-pr", run_id="r-pr")
         committed = publisher.stage_and_commit(
             validation=evidence,
             task_workspace=str(workspace),
@@ -956,6 +1237,9 @@ class CodingIntegrationTests(unittest.TestCase):
         self.identity = fake_identity()
         self.dispatch_cfg = self._dispatch_config()
         self.ledger = Ledger(self.h.config)
+        self.h.gh_dir.joinpath("repo.json").write_text(
+            json.dumps({"full_name": PROJECT_REPO, "private": True, "has_issues": True}), encoding="utf-8"
+        )
         self.issue = self.h.add_issue(number=21, body=request_body().replace("session: new", "session: new\ntask: coding"))
 
     def tearDown(self) -> None:
@@ -1063,7 +1347,7 @@ class CodingIntegrationTests(unittest.TestCase):
             gh_command=str(self.h.fake_bin / "gh"),
             token_provider=lambda: "fake-token",
             remote_url=f"file://{self.repo['bare']}",
-            git=SafeGit(identity=None),
+            git=SafeGit(identity=None, allow_file_protocol=True),
             max_file_bytes=50000,
         )
         return CodingOrchestrator(
@@ -1076,7 +1360,7 @@ class CodingIntegrationTests(unittest.TestCase):
             adapter=adapter,
             progress=lambda stage, message: runner._progress(stage, message, record),
             log=runner._log,
-            git=SafeGit(identity=None),
+            git=SafeGit(identity=None, allow_file_protocol=True),
             publisher=publisher,
             spawn=lambda argv, **kwargs: FakeProcess(exit_code=0, stdout=b"ok\n"),
         )
@@ -1325,6 +1609,110 @@ class CodingIntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.h.comments(21)), 1)
         self.assertEqual(len(json.loads((self.h.gh_dir / "pulls.json").read_text(encoding="utf-8"))), 1)
 
+    def test_t16_missing_staging_recovers_branch_by_remote_sha(self) -> None:
+        first = self._run()
+        self.assertEqual(first["executed"], 1)
+        record = self.ledger.get(GH_REPO, 21)
+        branch = record["coding"]["publication"]["branch"]
+        commit = record["coding"]["publication"]["commit"]
+        runner = self.last_runner
+        runner.summary = {
+            "ok": True, "busy": False, "executed": 0, "rejected": 0, "needs_attention": 0,
+            "uploaded": 0, "published": 0, "errors": [], "warnings": [],
+        }
+
+        def simulate_staging_loss(item: dict) -> None:
+            item["status"] = "EXECUTION_COMPLETED"
+            item["capture"]["status"] = "PENDING"
+            item["upload"].update({"status": "PENDING", "verified": False, "report_url": None, "receipt_url": None, "attempts": 0, "next_attempt_at": None})
+            item["publication"].update({"status": "PENDING", "comment_url": None, "attempts": 0, "next_attempt_at": None})
+            pub = item["coding"]["publication"]
+            pub.update({
+                "branch": branch,
+                "commit": commit,
+                "branch_pushed": False,
+                "pr_url": None,
+                "pr_number": None,
+                "staging": None,
+                "status": "COMMITTED",
+                "report_link_updated": False,
+                "attempts": 0,
+                "next_attempt_at": None,
+            })
+            item["coding"]["stage"] = "PR_CREATED"
+            item["coding"]["milestones"]["REPORT_DELIVERED"] = False
+
+        self.ledger.update(GH_REPO, 21, simulate_staging_loss, note="simulated missing publication staging")
+        env = self.h.env()
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch(
+            "agent_handoff.upload.load_config", return_value=self.h.config
+        ), mock.patch.object(
+            DispatchRunner, "_coding_orchestrator", autospec=True, side_effect=self._fake_orchestrator
+        ), mock.patch.object(DispatchRunner, "_coding_adapter", autospec=True, side_effect=self._adapter):
+            runner._advance_all(force=True)
+        self.assertEqual(runner.summary["executed"], 0)
+        recovered = self.ledger.get(GH_REPO, 21)
+        self.assertTrue(recovered["coding"]["publication"].get("staging_recovered_by_remote_sha"))
+        self.assertEqual(recovered["status"], "ISSUE_UPDATED")
+        self.assertEqual(len(json.loads((self.h.gh_dir / "pulls.json").read_text(encoding="utf-8"))), 1)
+        self.assertEqual(len(self.h.comments(21)), 1)
+
+    def test_t17_pr_body_report_link_retries_after_upload(self) -> None:
+        first = self._run()
+        self.assertEqual(first["executed"], 1)
+        record = self.ledger.get(GH_REPO, 21)
+        report_url = record["upload"]["report_url"]
+        branch = record["coding"]["publication"]["branch"]
+        commit = record["coding"]["publication"]["commit"]
+        pulls_path = self.h.gh_dir / "pulls.json"
+        pulls = json.loads(pulls_path.read_text(encoding="utf-8"))
+        pulls[0]["body"] = pulls[0]["body"].replace(report_url, "")
+        pulls_path.write_text(json.dumps(pulls, indent=2), encoding="utf-8")
+
+        def clear_link(item: dict) -> None:
+            item["coding"]["publication"].update(
+                {
+                    "branch": branch,
+                    "commit": commit,
+                    "report_link_updated": False,
+                    "report_link_next_attempt_at": None,
+                    "report_link_attempts": 0,
+                    "report_link_last_error": None,
+                }
+            )
+
+        self.ledger.update(GH_REPO, 21, clear_link, note="simulate PR body update loss")
+        runner = self.last_runner
+        runner.summary = {
+            "ok": True, "busy": False, "executed": 0, "rejected": 0, "needs_attention": 0,
+            "uploaded": 0, "published": 0, "errors": [], "warnings": [],
+        }
+        marker = self.root / "fail-pr-patch-once"
+        marker.write_text("1", encoding="utf-8")
+        env = self.h.env({"FAKE_GH_FAIL_PATCH_FILE": str(marker)})
+        with mock.patch.dict(os.environ, env, clear=False):
+            runner._advance_all(force=True)
+        failed = self.ledger.get(GH_REPO, 21)
+        self.assertFalse(failed["coding"]["publication"]["report_link_updated"])
+        self.assertTrue(failed["coding"]["publication"]["report_link_last_error"])
+        pulls = json.loads(pulls_path.read_text(encoding="utf-8"))
+        self.assertNotIn(report_url, pulls[0]["body"])
+        self.assertFalse(marker.exists())
+
+        def make_due(item: dict) -> None:
+            item["coding"]["publication"]["report_link_next_attempt_at"] = "2000-01-01T00:00:00Z"
+
+        self.ledger.update(GH_REPO, 21, make_due, note="make PR body retry due")
+        env = self.h.env()
+        with mock.patch.dict(os.environ, env, clear=False):
+            runner._advance_all(force=True)
+        recovered = self.ledger.get(GH_REPO, 21)
+        self.assertTrue(recovered["coding"]["publication"]["report_link_updated"])
+        pulls = json.loads(pulls_path.read_text(encoding="utf-8"))
+        self.assertIn(report_url, pulls[0]["body"])
+        self.assertEqual(len(pulls), 1)
+        self.assertEqual(len(self.h.comments(21)), 1)
+
     def test_t17_test_failure_blocks_publication_but_delivers_report(self) -> None:
         runner = self._runner()
         env = self.h.env()
@@ -1388,6 +1776,33 @@ class CodingIntegrationTests(unittest.TestCase):
 
 
 class TestProductionPreservation(unittest.TestCase):
+    def test_t27_t28_historical_ledger_and_json_status_remain_valid(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            h = DispatchHarness(Path(tmp.name))
+            ledger = Ledger(h.config)
+            record, _ = ledger.create(
+                new_dispatch_record(
+                    repository=GH_REPO,
+                    issue={"number": 91, "title": "historical", "html_url": "https://github.test/issues/91"},
+                    project={"name": "Alpha", "core_name": "Alpha", "workspace": str(h.project_path), "execution": {}},
+                    agent="opencode",
+                    model="provider/model-fast",
+                    request={"instructions": "legacy"},
+                )
+            )
+            record.pop("task_type", None)
+            record["status"] = "ISSUE_UPDATED"
+            ledger.update(GH_REPO, 91, lambda item: item.pop("task_type", None))
+            loaded = ledger.get(GH_REPO, 91)
+            self.assertNotIn("task_type", loaded)
+            view = record_status_view(loaded)
+            self.assertEqual(view["task_type"], "read_only")
+            self.assertIsNone(view["coding"])
+            json.dumps(view)
+        finally:
+            tmp.cleanup()
+
     def test_t38_config_validation_does_not_mutate_files(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         try:

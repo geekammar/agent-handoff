@@ -105,7 +105,10 @@
         "max_output_bytes": 50000,
         "max_workspace_bytes": 2000000000,
         "max_coding_tasks": 1,
-        "max_publication_attempts": 3
+        "max_publication_attempts": 3,
+        "max_test_memory_bytes": 2000000000,
+        "max_test_processes": 128,
+        "max_test_file_bytes": 256000000
       },
       "publication": {
         "draft": true,

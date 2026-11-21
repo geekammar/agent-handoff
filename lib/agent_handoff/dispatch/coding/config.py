@@ -22,6 +22,9 @@ DEFAULT_LIMITS = {
     "max_workspace_bytes": 2_000_000_000,
     "max_coding_tasks": 1,
     "max_publication_attempts": 3,
+    "max_test_memory_bytes": 2_000_000_000,
+    "max_test_processes": 128,
+    "max_test_file_bytes": 256_000_000,
 }
 LIMIT_BOUNDS = {
     "test_timeout_seconds": (1, 7200, 900),
@@ -32,6 +35,9 @@ LIMIT_BOUNDS = {
     "max_workspace_bytes": (1_000_000, 20_000_000_000, 2_000_000_000),
     "max_coding_tasks": (1, 4, 1),
     "max_publication_attempts": (1, 10, 3),
+    "max_test_memory_bytes": (64_000_000, 64_000_000_000, 2_000_000_000),
+    "max_test_processes": (1, 1024, 128),
+    "max_test_file_bytes": (1_000_000, 2_000_000_000, 256_000_000),
 }
 GLOBAL_KEYS = {
     "enabled",

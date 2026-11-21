@@ -11,6 +11,7 @@ from typing import Any, Mapping
 from ...util import sanitize_error, utcnow_iso
 from ..security import DEFAULT_CHILD_PATH, popen_isolation_kwargs
 from .config import SECRET_ENV_MARKERS
+from .process import process_group_alive, terminate_process_group
 
 DEFAULT_TEST_TIMEOUT_SECONDS = 900
 MAX_CAPTURE_SECONDS = 5.0
@@ -91,7 +92,13 @@ def _text(data: bytes, limit: int) -> str:
     return data.decode("utf-8", errors="replace")[:limit]
 
 
-def _preexec_limits(timeout_seconds: int) -> Any:
+def _preexec_limits(
+    timeout_seconds: int,
+    *,
+    memory_bytes: int = 2_000_000_000,
+    processes: int = 128,
+    file_bytes: int = 256_000_000,
+) -> Any:
     def apply() -> None:
         try:
             import resource
@@ -99,6 +106,12 @@ def _preexec_limits(timeout_seconds: int) -> Any:
             cpu = max(1, int(math.ceil(timeout_seconds)) + 5)
             resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 5))
             resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
+            if hasattr(resource, "RLIMIT_AS") and memory_bytes > 0:
+                resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
+            if hasattr(resource, "RLIMIT_NPROC") and processes > 0:
+                resource.setrlimit(resource.RLIMIT_NPROC, (processes, processes))
+            if hasattr(resource, "RLIMIT_FSIZE") and file_bytes > 0:
+                resource.setrlimit(resource.RLIMIT_FSIZE, (file_bytes, file_bytes))
         except Exception:
             pass
 
@@ -113,6 +126,9 @@ def run_command_bounded(
     identity: Mapping[str, Any],
     timeout_seconds: float,
     max_output_bytes: int,
+    memory_bytes: int = 2_000_000_000,
+    processes: int = 128,
+    file_bytes: int = 256_000_000,
     spawn: Any = None,
 ) -> dict[str, Any]:
     if not argv or not all(isinstance(item, str) and item for item in argv):
@@ -132,7 +148,12 @@ def run_command_bounded(
     spawn_callable = spawn or subprocess.Popen
     extra: dict[str, Any] = {}
     if spawn is None and os.name == "posix":
-        extra["preexec_fn"] = _preexec_limits(int(timeout_seconds))
+        extra["preexec_fn"] = _preexec_limits(
+            int(timeout_seconds),
+            memory_bytes=memory_bytes,
+            processes=processes,
+            file_bytes=file_bytes,
+        )
     try:
         process = spawn_callable(
             argv,
@@ -210,8 +231,16 @@ def run_command_bounded(
             thread.join(timeout=MAX_CAPTURE_SECONDS)
 
     duration = max(0.0, time.monotonic() - started)
+    process_group_id = process.pid
+    orphans_detected = process_group_alive(process_group_id)
+    if orphans_detected:
+        terminated = terminate_process_group(process_group_id)
+        if not terminated:
+            err_sink["data"] = (err_sink["data"] + b"\norphaned test process group could not be terminated")[:max_output_bytes]
     if timed_out:
         status = "timed_out"
+    elif orphans_detected:
+        status = "orphans"
     elif exit_code == 0:
         status = "passed"
     else:
@@ -225,6 +254,8 @@ def run_command_bounded(
         "stdout": _text(out_sink["data"], max_output_bytes),
         "stderr": _text(err_sink["data"], max_output_bytes),
         "output_truncated": bool(out_sink["truncated"] or err_sink["truncated"]),
+        "process_group_id": process_group_id,
+        "orphans_detected": bool(orphans_detected),
         "started_at": utcnow_iso(),
         "finished_at": utcnow_iso(),
     }
@@ -281,6 +312,9 @@ def run_test_profile(
             identity=identity,
             timeout_seconds=remaining,
             max_output_bytes=max_output,
+            memory_bytes=int(limits.get("max_test_memory_bytes", 2_000_000_000)),
+            processes=int(limits.get("max_test_processes", 128)),
+            file_bytes=int(limits.get("max_test_file_bytes", 256_000_000)),
             spawn=spawn,
         )
         results.append(result)
@@ -289,7 +323,12 @@ def run_test_profile(
             break
     statuses = {item["status"] for item in results}
     if failed_command is not None:
-        status = "timed_out" if "timed_out" in statuses else "failed"
+        if "orphans" in statuses:
+            status = "orphans"
+        elif "timed_out" in statuses:
+            status = "timed_out"
+        else:
+            status = "failed"
     else:
         status = "passed"
     return {

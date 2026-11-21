@@ -318,7 +318,10 @@ Global defaults live under `dispatch.coding`; per-project policy lives under `di
         "max_output_bytes": 50000,
         "max_workspace_bytes": 2000000000,
         "max_coding_tasks": 1,
-        "max_publication_attempts": 3
+        "max_publication_attempts": 3,
+        "max_test_memory_bytes": 2000000000,
+        "max_test_processes": 128,
+        "max_test_file_bytes": 256000000
       },
       "publication": {
         "draft": true,
@@ -384,7 +387,7 @@ For each coding task:
 6. On success and after verified report capture, remove the workspace when `cleanup_on_success` is true. Failed or blocked tasks preserve the workspace and durable evidence for review.
 7. Cleanup refuses paths outside the managed root, symlinks, unexpected names, and directories not owned by the dedicated identity.
 
-The publisher never runs Git hooks or repository-controlled filters with parent privileges. It creates a fresh parent-owned staging repository, fetches the base from the trusted GitHub repository, copies only validated regular files (using `O_NOFOLLOW`), stages them explicitly, and commits with hooks disabled and `--no-verify`.
+The publisher never runs Git hooks or repository-controlled filters with parent privileges. It verifies the configured repository identity through GitHub, checks the staging root and its ancestors are parent-owned and non-child-writable, creates a fresh parent-owned staging repository, fetches the base from the trusted GitHub repository, copies only digest-verified regular files (using `O_NOFOLLOW`), stages them explicitly, and commits with hooks disabled and `--no-verify`. Git global/system configuration, hooks, fsmonitor, replacement objects, pager, and credential helpers are disabled for privileged Git operations. `protocol.file.allow=always` is enabled only for the documented local workspace-clone path and tests, not for the publication fetch/push path.
 
 ### Trusted test execution
 
@@ -399,6 +402,19 @@ Tests run in the same disposable workspace under the same dedicated non-root ide
 - fail-fast on the first failing command.
 
 If any trusted test fails or times out, C2 records the evidence, does not create a commit/branch/PR, does not claim acceptance, and still generates and delivers an honest report. It never reruns the agent indefinitely or publishes failing code automatically.
+
+### Artifact integrity from validation to commit
+
+`validate_changes()` records a SHA-256 digest, size, normalized publication mode, and raw mode for every approved regular file in a canonical manifest with its own digest. Validation and publication are separate process steps, so publication does not trust path names or Git status alone:
+
+1. The publisher re-reads each source file with no-follow semantics, compares its digest, size, and modes to the manifest, and rejects any mismatch.
+2. The exact bytes read from the source are written to the parent-owned staging tree; the destination is re-read and verified.
+3. After `git add`, the staged index blob and mode are verified against the manifest.
+4. After commit, the committed tree path set, blob content digest, and mode are verified against the manifest.
+5. Deleted paths must be absent from the index and committed tree.
+6. Unexpected staged or committed paths fail closed.
+
+A concurrent mutation is a publication failure, not a warning. The agent and trusted-test process groups are checked after execution; a lingering group is terminated and the task is blocked from publication.
 
 ### Diff validation and publication
 
@@ -426,11 +442,13 @@ The record persists the task/run IDs, source issue, repository, base branch/comm
 
 Recovery rules:
 
-- a claimed request that never started OpenCode may resume workspace preparation;
+- a claimed request that never started OpenCode may resume workspace preparation; a clean, verified, child-owned workspace left by an interrupted preparation is adopted only after ownership, base-commit, symlink, and cleanliness checks;
+- a commit created before its SHA was persisted may be safely recreated in a fresh parent-owned staging repository because no branch or PR has been published yet;
 - a running OpenCode session with persisted events resumes tests/publication without rerunning the agent;
 - a running session without recoverable output becomes `NEEDS_ATTENTION`;
 - interrupted tests or diff validation rerun from the preserved workspace, never the model;
-- a prepared commit is reused; a pushed branch is recognized by remote SHA; a created PR is recovered by branch/marker;
+- a prepared commit is reused; a pushed branch is recognized by remote SHA even if the publication staging directory disappeared; a created PR is recovered by branch/marker;
+- a failed Draft PR body update after verified report upload is retried with bounded backoff against the same PR; it never creates another PR;
 - upload, GitHub comment, and Telegram failures retry only their own stage;
 - an existing published branch/PR is never replaced by a different code result.
 
@@ -448,6 +466,7 @@ C2 does not provide a full sandbox. Residual risks include:
 - resource limits are bounded time/output/size checks, not complete CPU/memory/disk quotas; workspace size is checked after agent/tests, not enforced as a live quota;
 - one dispatcher runner lock serializes coding work; `max_coding_tasks` is validated but C2 currently executes at most one coding task per dispatcher;
 - Draft PR publication is a review artifact, not acceptance, deployment, or merge approval.
+- Artifact digests, no-follow reads, and post-commit verification narrow the validation-to-publication race. They do not defend against a hostile root-level process, a compromised parent, or a separately detached child process that escapes the tracked process group.
 
 ### How to disable and recover
 

@@ -242,7 +242,7 @@ C2 is implemented in source but **disabled by default and not enabled in product
 - the dispatcher creates a fresh per-task clone at a verified base commit, owned by the dedicated non-root identity;
 - OpenCode runs with `workspace_write` only inside that disposable workspace;
 - trusted tests run with the same non-root identity, a bounded timeout, bounded output, and an allowlisted environment;
-- the dispatcher validates changed paths, protected files, diff size, binary/symlink/submodule changes, and obvious secret material;
+- the dispatcher validates changed paths, protected files, diff size, binary/symlink/submodule changes, and obvious secret material, then binds the approved content to SHA-256/size/mode digests that are rechecked while copying and against the staged and committed Git trees;
 - one task branch is committed from validated files in a parent-owned staging repository and pushed without force;
 - exactly one Draft Pull Request is created or recovered by a stable marker; after the report upload is verified, the verified report link is added to the PR body without creating a second PR;
 - the existing verified report upload, GitHub Issue comment, and Telegram outbox follow.

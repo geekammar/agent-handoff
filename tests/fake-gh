@@ -132,6 +132,10 @@ def handle_api(argv: list[str]) -> int:
         if target is None:
             return fail(f"pull #{number} not found")
         if "PATCH" in argv:
+            marker = os.environ.get("FAKE_GH_FAIL_PATCH_FILE")
+            if marker and Path(marker).exists():
+                Path(marker).unlink()
+                return fail("simulated GitHub PR body update failure")
             body = ""
             for index, item in enumerate(argv):
                 if item in ("-f", "-F") and index + 1 < len(argv) and argv[index + 1].startswith("body="):

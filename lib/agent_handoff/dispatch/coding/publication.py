@@ -5,11 +5,19 @@ import os
 import re
 import shutil
 import stat
+import tempfile
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import quote
 
 from ...util import run_command, sanitize_error, utcnow_iso
-from .changes import SafeGit, qualified_path, safe_relative_path
+from .changes import (
+    SafeGit,
+    normalized_publication_mode,
+    qualified_path,
+    read_regular_file,
+    safe_relative_path,
+    sha256_bytes,
+)
 from .config import PROTECTED_BRANCHES, prefix_valid, validate_branch_name
 
 PR_MARKER = "<!-- agent-handoff-coding:{task_id}:{run_id} -->"
@@ -135,38 +143,157 @@ def build_pr_body(
     return "\n".join(lines)
 
 
-def _copy_regular_file(source: str, destination: str, *, max_bytes: int, executable: bool) -> None:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(source, flags)
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode):
-            raise PublicationError("a selected change is no longer a regular file")
-        if info.st_size > max_bytes:
-            raise PublicationError("a selected change exceeds the configured file size limit")
-        parent = os.path.dirname(destination)
-        os.makedirs(parent, mode=0o700, exist_ok=True)
-        flags_out = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        if hasattr(os, "O_NOFOLLOW"):
-            flags_out |= os.O_NOFOLLOW
-        output = os.open(destination, flags_out, 0o600)
+def _manifest_digest(manifest: Mapping[str, Any]) -> str:
+    import hashlib
+
+    canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _validated_manifest(validation: Mapping[str, Any]) -> tuple[dict[str, dict[str, Any]], str]:
+    if validation.get("status") != "passed":
+        raise PublicationError("publication requires a passed diff validation result")
+    manifest = validation.get("manifest")
+    if not isinstance(manifest, dict) or manifest.get("schema") != 1 or not isinstance(manifest.get("files"), list):
+        raise PublicationError("the validation manifest is missing or unsupported")
+    recorded_digest = str(validation.get("manifest_sha256") or "")
+    actual_digest = _manifest_digest(manifest)
+    if not recorded_digest or recorded_digest != actual_digest:
+        raise PublicationError("the validation manifest digest does not match its recorded digest")
+    validation_paths = {
+        safe_relative_path(str(item.get("path") or ""))
+        for item in (validation.get("files") or [])
+        if isinstance(item, dict)
+    }
+    entries: dict[str, dict[str, Any]] = {}
+    for item in manifest["files"]:
+        if not isinstance(item, dict):
+            raise PublicationError("the validation manifest contains an invalid entry")
+        path = safe_relative_path(str(item.get("path") or ""))
+        if path in entries:
+            raise PublicationError(f"the validation manifest contains a duplicate path: {path}")
+        status = str(item.get("status") or "")
+        if status not in ("added", "modified", "renamed", "deleted"):
+            raise PublicationError(f"the validation manifest has an unsupported status for {path}")
+        if status == "deleted":
+            entries[path] = {"path": path, "status": status}
+            continue
+        digest = str(item.get("sha256") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise PublicationError(f"the validation manifest has no valid content digest for {path}")
         try:
-            remaining = max_bytes + 1
-            while remaining > 0:
-                chunk = os.read(descriptor, min(65536, remaining))
-                if not chunk:
-                    break
-                os.write(output, chunk)
-                remaining -= len(chunk)
-            if remaining <= 0:
-                raise PublicationError("a selected change grew beyond the configured file size limit")
-        finally:
-            os.close(output)
-        os.chmod(destination, 0o755 if executable else 0o644)
+            size = int(item.get("size"))
+        except (TypeError, ValueError):
+            raise PublicationError(f"the validation manifest has no valid size for {path}")
+        mode = str(item.get("mode") or "")
+        raw_mode = str(item.get("raw_mode") or "")
+        if mode not in ("0644", "0755") or not re.fullmatch(r"[0-7]{4}", raw_mode):
+            raise PublicationError(f"the validation manifest has no valid mode for {path}")
+        entries[path] = {
+            "path": path,
+            "status": status,
+            "sha256": digest,
+            "size": size,
+            "mode": mode,
+            "raw_mode": raw_mode,
+        }
+    if set(entries) != validation_paths:
+        raise PublicationError("the validation manifest paths do not match the reported changed files")
+    if not entries:
+        raise PublicationError("the validation manifest is empty")
+    return entries, actual_digest
+
+
+def _copy_verified_file(
+    source: str,
+    destination: str,
+    entry: Mapping[str, Any],
+    *,
+    max_bytes: int,
+) -> None:
+    try:
+        size, data, raw_mode, digest = read_regular_file(source, max_bytes)
+    except (OSError, ValueError) as exc:
+        raise PublicationError(f"could not re-read validated artifact {entry['path']}: {sanitize_error(str(exc), 300)}") from exc
+    if (
+        size != int(entry["size"])
+        or digest != entry["sha256"]
+        or f"{raw_mode:04o}" != entry["raw_mode"]
+        or normalized_publication_mode(raw_mode) != entry["mode"]
+    ):
+        raise PublicationError(
+            f"artifact changed between validation and publication: {entry['path']} "
+            "(content, size, or mode mismatch)"
+        )
+    parent = os.path.dirname(destination)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    flags_out = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags_out |= os.O_NOFOLLOW
+    output = os.open(destination, flags_out, 0o600)
+    try:
+        view = memoryview(data)
+        written = 0
+        while written < len(view):
+            written += os.write(output, view[written:])
     finally:
-        os.close(descriptor)
+        os.close(output)
+    os.chmod(destination, int(entry["mode"], 8))
+    try:
+        dest_size, dest_data, dest_raw_mode, dest_digest = read_regular_file(destination, max_bytes)
+    except (OSError, ValueError) as exc:
+        raise PublicationError(f"could not verify copied artifact {entry['path']}") from exc
+    if (
+        dest_size != int(entry["size"])
+        or dest_digest != entry["sha256"]
+        or sha256_bytes(dest_data) != entry["sha256"]
+        or normalized_publication_mode(dest_raw_mode) != entry["mode"]
+    ):
+        raise PublicationError(f"copied artifact verification failed: {entry['path']}")
+
+
+def _git_bytes(git: SafeGit, cwd: str, spec: str) -> bytes:
+    result = git.run(["cat-file", "-p", spec], cwd=cwd, text=False)
+    data = result.stdout if isinstance(result.stdout, bytes) else bytes(result.stdout or b"")
+    return data
+
+
+def _verify_index_entry(git: SafeGit, staging: str, entry: Mapping[str, Any]) -> None:
+    result = git.run(["ls-files", "-s", "-z", "--", entry["path"]], cwd=staging, check=False)
+    if entry["status"] == "deleted":
+        if result.returncode == 0 and (result.stdout or "").strip("\x00"):
+            raise PublicationError(f"a deleted path is still present in the publication index: {entry['path']}")
+        return
+    fields = [item for item in (result.stdout or "").split("\x00") if item]
+    if len(fields) != 1:
+        raise PublicationError(f"the publication index does not contain exactly one entry for {entry['path']}")
+    metadata, _path = fields[0].split("\t", 1)
+    mode, _oid, _stage = metadata.split(" ", 2)
+    expected_mode = "100755" if entry["mode"] == "0755" else "100644"
+    if mode != expected_mode:
+        raise PublicationError(f"the publication index mode does not match the manifest for {entry['path']}")
+    data = _git_bytes(git, staging, f":{entry['path']}")
+    if len(data) != int(entry["size"]) or sha256_bytes(data) != entry["sha256"]:
+        raise PublicationError(f"the publication index content does not match the manifest for {entry['path']}")
+
+
+def _verify_committed_entry(git: SafeGit, staging: str, entry: Mapping[str, Any]) -> None:
+    tree = git.run(["ls-tree", "-z", "HEAD", "--", entry["path"]], cwd=staging, check=False)
+    fields = [item for item in (tree.stdout or "").split("\x00") if item]
+    if entry["status"] == "deleted":
+        if fields:
+            raise PublicationError(f"a deleted path is still present in the committed tree: {entry['path']}")
+        return
+    if len(fields) != 1:
+        raise PublicationError(f"the committed tree does not contain exactly one entry for {entry['path']}")
+    metadata, _path = fields[0].split("\t", 1)
+    mode, kind, _oid = metadata.split(" ", 2)
+    expected_mode = "100755" if entry["mode"] == "0755" else "100644"
+    if kind != "blob" or mode != expected_mode:
+        raise PublicationError(f"the committed tree mode/type does not match the manifest for {entry['path']}")
+    data = _git_bytes(git, staging, f"HEAD:{entry['path']}")
+    if len(data) != int(entry["size"]) or sha256_bytes(data) != entry["sha256"]:
+        raise PublicationError(f"the committed tree content does not match the manifest for {entry['path']}")
 
 
 class TrustedPublisher:
@@ -206,6 +333,7 @@ class TrustedPublisher:
         self._remote_url = remote_url or f"https://github.com/{repository}.git"
         self._owner = repository.split("/", 1)[0]
         self._staging: str | None = None
+        self._auth_dir: str | None = None
 
     def token(self) -> str:
         if self._token_provider is not None:
@@ -222,10 +350,19 @@ class TrustedPublisher:
             )
         return value
 
+    def _auth_directory(self) -> str:
+        if self._staging and os.path.isdir(self._staging):
+            return self._staging
+        if self._auth_dir and os.path.isdir(self._auth_dir):
+            return self._auth_dir
+        root = self.validate_staging_root()
+        self._auth_dir = tempfile.mkdtemp(prefix=".auth-", dir=root)
+        os.chmod(self._auth_dir, 0o700)
+        return self._auth_dir
+
     def _auth_environment(self, token: str) -> dict[str, str]:
-        if not self._staging:
-            raise PublicationError("publication staging is not initialized")
-        script_path = os.path.join(self._staging, ".askpass.sh")
+        auth_dir = self._auth_directory()
+        script_path = os.path.join(auth_dir, ".askpass.sh")
         if not os.path.exists(script_path):
             with open(script_path, "w", encoding="utf-8") as handle:
                 handle.write(
@@ -265,6 +402,12 @@ class TrustedPublisher:
             raise PublicationError("the publication staging root must be owned by the dispatcher identity")
         if entry.st_mode & 0o077:
             raise PublicationError("the publication staging root must not be accessible by group/other")
+        try:
+            from ..security import _check_trusted_ancestors
+
+            _check_trusted_ancestors(root, {"uid": os.geteuid(), "gid": os.getegid()}, "publication staging root")
+        except Exception as exc:
+            raise PublicationError(f"the publication staging root has unsafe ancestors: {exc}") from exc
         return root
 
     def _prepare_staging(self, task_id: str, run_id: str) -> str:
@@ -276,6 +419,9 @@ class TrustedPublisher:
         if os.path.lexists(staging):
             if os.path.islink(staging) or not os.path.isdir(staging):
                 raise PublicationError("publication staging is not a safe directory")
+            existing = os.lstat(staging)
+            if existing.st_uid not in {0, os.geteuid()} or existing.st_mode & 0o022:
+                raise PublicationError("publication staging ownership/mode is not trusted for replacement")
             shutil.rmtree(staging)
         os.mkdir(staging, 0o700)
         self._staging = os.path.realpath(staging)
@@ -295,11 +441,26 @@ class TrustedPublisher:
         self._staging = target
         return target
 
+    def verify_repository(self) -> dict[str, Any]:
+        token = self.token()
+        text = self._gh(["api", f"repos/{self.repository}"], token)
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise PublicationError("GitHub returned invalid repository metadata") from exc
+        if not isinstance(data, dict):
+            raise PublicationError("GitHub repository metadata is not an object")
+        full_name = str(data.get("full_name") or "")
+        if full_name.lower() != self.repository.lower():
+            raise PublicationError("the configured coding repository does not match GitHub")
+        return {"repository": full_name, "private": bool(data.get("private"))}
+
     def prepare(self, *, base_commit: str, task_id: str, run_id: str) -> str:
         """Fetch the trusted base from GitHub into a fresh parent-owned repository."""
 
-        staging = self._prepare_staging(task_id, run_id)
         token = self.token()
+        self.verify_repository()
+        staging = self._prepare_staging(task_id, run_id)
         auth = self._auth_environment(token)
         self.git.run(["init", "--quiet"], cwd=staging, env=auth)
         self.git.run(["remote", "add", "origin", self._remote_url], cwd=staging)
@@ -337,14 +498,10 @@ class TrustedPublisher:
         staging = self._staging
         if not staging:
             raise PublicationError("publication staging is not initialized")
-        files = validation.get("files") or []
-        if not files:
-            raise PublicationError("there are no validated files to commit")
-        expected: set[str] = set()
-        for item in files:
-            path = safe_relative_path(str(item.get("path") or ""))
-            expected.add(path)
-            if item.get("status") == "deleted":
+        manifest_entries, manifest_digest = _validated_manifest(validation)
+        expected: set[str] = set(manifest_entries)
+        for path, entry in manifest_entries.items():
+            if entry["status"] == "deleted":
                 result = self.git.run(
                     ["rm", "--ignore-unmatch", "-f", "--", path], cwd=staging, check=False
                 )
@@ -357,12 +514,11 @@ class TrustedPublisher:
                 os.path.lexists(destination) and os.path.islink(destination)
             ):
                 raise PublicationError(f"publication destination is a symlink: {path}")
-            os.makedirs(os.path.dirname(destination), mode=0o700, exist_ok=True)
-            _copy_regular_file(
+            _copy_verified_file(
                 source,
                 destination,
+                entry,
                 max_bytes=self.max_file_bytes,
-                executable=str(item.get("mode") or "").endswith("755"),
             )
             self.git.run(["add", "-f", "--", path], cwd=staging)
         staged = self.git.run(
@@ -373,9 +529,11 @@ class TrustedPublisher:
             unexpected = sorted(staged_paths - expected)
             missing = sorted(expected - staged_paths)
             raise PublicationError(
-                "staged publication paths do not match the validated set "
+                "staged publication paths do not match the validated manifest "
                 f"(unexpected={unexpected[:5]}, missing={missing[:5]})"
             )
+        for path, entry in manifest_entries.items():
+            _verify_index_entry(self.git, staging, entry)
         message = build_commit_message(
             project=project,
             title=title,
@@ -408,25 +566,52 @@ class TrustedPublisher:
         )
         committed_paths = {item for item in (changed.stdout or "").split("\x00") if item}
         if committed_paths != expected:
-            raise PublicationError("the commit contains paths outside the validated set")
-        return {"commit": sha, "staging": staging, "message": message}
+            raise PublicationError("the commit contains paths outside the validated manifest")
+        for path, entry in manifest_entries.items():
+            _verify_committed_entry(self.git, staging, entry)
+        return {
+            "commit": sha,
+            "staging": staging,
+            "message": message,
+            "manifest_sha256": manifest_digest,
+        }
 
     def _remote_branch_sha(self, branch: str, token: str) -> str | None:
+        direct = not (self._staging and os.path.isdir(self._staging))
         auth = self._auth_environment(token)
-        result = self.git.run(
-            ["ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
-            cwd=self._staging or self.staging_root,
-            env=auth,
-            check=False,
-            timeout=self.timeout,
-        )
+        cwd = self._staging if not direct else self.validate_staging_root()
+        try:
+            result = self.git.run(
+                ["ls-remote", "--heads", self._remote_url, f"refs/heads/{branch}"],
+                cwd=cwd,
+                env=auth,
+                check=False,
+                timeout=self.timeout,
+            )
+        finally:
+            if direct and self._auth_dir:
+                shutil.rmtree(self._auth_dir, ignore_errors=True)
+                self._auth_dir = None
         if result.returncode != 0:
-            raise PublicationError("could not verify the remote branch state")
+            detail = sanitize_error(
+                (result.stderr.decode("utf-8", errors="replace") if isinstance(result.stderr, bytes) else result.stderr)
+                or (result.stdout.decode("utf-8", errors="replace") if isinstance(result.stdout, bytes) else result.stdout)
+                or "git ls-remote failed",
+                400,
+            )
+            raise PublicationError(f"could not verify the remote branch state: {detail}")
         for line in (result.stdout or "").splitlines():
             parts = line.split()
             if len(parts) == 2 and parts[1].endswith(f"refs/heads/{branch}"):
                 return parts[0]
         return None
+
+    def remote_branch_sha(self, branch: str) -> str | None:
+        if not prefix_valid(self.branch_prefix) or not branch.startswith(self.branch_prefix):
+            raise PublicationError("the publication branch is outside the trusted branch namespace")
+        if branch.lower() in PROTECTED_BRANCHES:
+            raise PublicationError("direct publication to a protected branch is refused")
+        return self._remote_branch_sha(branch, self.token())
 
     def push(self, *, branch: str, commit: str) -> dict[str, Any]:
         if not self._staging:
@@ -604,6 +789,9 @@ class TrustedPublisher:
     def cleanup(self, *, preserve: bool = False) -> bool:
         staging = self._staging
         if not staging:
+            if self._auth_dir and not preserve:
+                shutil.rmtree(self._auth_dir, ignore_errors=True)
+                self._auth_dir = None
             return True
         root = os.path.realpath(self.staging_root)
         target = os.path.realpath(staging)
@@ -613,5 +801,17 @@ class TrustedPublisher:
             return False
         if not STAGING_NAME_RE.fullmatch(os.path.basename(target)):
             return False
+        try:
+            entry = os.lstat(target)
+        except OSError:
+            return True
+        if entry.st_uid not in {0, os.geteuid()} or entry.st_mode & 0o022:
+            return False
         shutil.rmtree(target, ignore_errors=True)
+        auth_dir = self._auth_dir
+        if auth_dir:
+            auth_real = os.path.realpath(auth_dir)
+            if auth_real.startswith(root.rstrip("/") + "/") and os.path.basename(auth_real).startswith(".auth-"):
+                shutil.rmtree(auth_real, ignore_errors=True)
+            self._auth_dir = None
         return not os.path.lexists(target)

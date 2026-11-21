@@ -81,7 +81,7 @@ class CodingOrchestrator:
         self.adapter = adapter
         self.progress = progress
         self.log = log or (lambda _message: None)
-        self.git = git or SafeGit(identity=self.identity)
+        self.git = git or SafeGit(identity=self.identity, allow_file_protocol=True)
         self.spawn = spawn
         publication = (project.get("coding") or {}).get("publication") or {}
         self.publication = dict(publication)
@@ -239,6 +239,7 @@ class CodingOrchestrator:
             publisher = self._adopt_publisher()
             publisher.validate_staging_root()
             publisher.token()
+            publisher.verify_repository()
             source = verify_source_repository(
                 self.source_workspace,
                 repository=self.repository,
@@ -255,6 +256,7 @@ class CodingOrchestrator:
                 task_id=self.task_id,
                 identity=self.identity,
                 git=self.git,
+                allow_existing=True,
             )
         except Exception as exc:
             reason = self._safe_text(str(exc), 1200)
@@ -304,6 +306,8 @@ class CodingOrchestrator:
             "timed_out": bool(getattr(result, "timed_out", False)),
             "finished_at": getattr(result, "finished_at", utcnow_iso()),
             "error": self._safe_text(getattr(result, "error", None), 1000) or None,
+            "process_group_id": getattr(result, "process_group_id", None),
+            "orphans_detected": bool(getattr(result, "orphans_detected", False)),
         }
         milestone = "AGENT_COMPLETED"
         return self._stage(
@@ -354,6 +358,11 @@ class CodingOrchestrator:
         agent = coding.get("agent") or {}
         if agent.get("status") != "completed":
             return current
+        if agent.get("orphans_detected"):
+            return self._block(
+                "AGENT_COMPLETED",
+                "the coding agent left an orphaned child process group; the result is not publishable",
+            )
         if str(agent.get("outcome") or "") != "succeeded":
             return self._block(
                 "AGENT_COMPLETED",
@@ -416,6 +425,8 @@ class CodingOrchestrator:
                     "stdout": self._safe_text(item.get("stdout"), 3000),
                     "stderr": self._safe_text(item.get("stderr"), 3000),
                     "output_truncated": item.get("output_truncated"),
+                    "process_group_id": item.get("process_group_id"),
+                    "orphans_detected": bool(item.get("orphans_detected")),
                 }
                 for item in evidence.get("commands") or []
             ],
@@ -462,6 +473,8 @@ class CodingOrchestrator:
         stored = {
             "status": evidence.get("status"),
             "files": evidence.get("files"),
+            "manifest": evidence.get("manifest"),
+            "manifest_sha256": evidence.get("manifest_sha256"),
             "changed_count": evidence.get("changed_count"),
             "diff_bytes": evidence.get("diff_bytes"),
             "workspace_bytes": evidence.get("workspace_bytes"),
@@ -485,6 +498,7 @@ class CodingOrchestrator:
             "VALIDATING_DIFF",
             note="diff validation passed",
             updates={"coding": {"diff": stored}},
+            milestone="DIFF_VALIDATED",
         )
         self._emit("coding_validation", "diff validation passed")
         return updated
@@ -545,11 +559,13 @@ class CodingOrchestrator:
                         "branch": branch,
                         "commit": committed["commit"],
                         "staging": committed.get("staging"),
+                        "manifest_sha256": committed.get("manifest_sha256"),
                         "status": "COMMITTED",
                         "draft": True,
                     }
                 }
             },
+            milestone="COMMIT_CREATED",
         )
         self._emit("coding_commit", f"commit prepared: {committed['commit'][:12]}")
         return updated
@@ -617,8 +633,40 @@ class CodingOrchestrator:
             publisher.adopt_staging(str(staging))
         branch = str(publication.get("branch") or "")
         commit = str(publication.get("commit") or "")
-        if not staging:
-            return self._block("BRANCH_PUBLISHED", "the publication staging repository is missing")
+        if not staging or not os.path.isdir(str(staging)):
+            try:
+                remote_sha = publisher.remote_branch_sha(branch)
+            except (PublicationError, OSError) as exc:
+                return self._block(
+                    "BRANCH_PUBLISHED",
+                    f"publication staging is missing and the remote branch could not be reconciled: {exc}",
+                )
+            if remote_sha == commit:
+                updated = self._stage(
+                    "BRANCH_PUBLISHED",
+                    note="remote branch already contains the verified commit after staging loss",
+                    updates={
+                        "coding": {
+                            "publication": {
+                                "branch": branch,
+                                "commit": commit,
+                                "branch_pushed": True,
+                                "status": "BRANCH_PUBLISHED",
+                                "last_error": None,
+                                "next_attempt_at": None,
+                                "staging_recovered_by_remote_sha": True,
+                            }
+                        }
+                    },
+                    milestone="BRANCH_PUBLISHED",
+                )
+                self._emit("coding_branch", "remote branch reconciled after publication staging loss")
+                return updated
+            reason = (
+                "the publication staging repository is missing and the remote branch does not contain "
+                f"the verified commit (remote={remote_sha or 'absent'})"
+            )
+            return self._block("BRANCH_PUBLISHED", reason)
         self._stage("BRANCH_PUBLISHED", note="pushing one task branch to the trusted repository")
         self._emit("coding_branch", "pushing the task branch to the trusted repository")
         try:
@@ -642,6 +690,7 @@ class CodingOrchestrator:
                     }
                 }
             },
+            milestone="BRANCH_PUBLISHED",
         )
         self._emit("coding_branch", "task branch published")
         return updated
@@ -704,6 +753,11 @@ class CodingOrchestrator:
                     }
                 }
             },
+            milestone="PR_CREATED",
+        )
+        self._stage(
+            "PR_CREATED",
+            note="Draft Pull Request publication milestone",
             milestone="PR_PUBLISHED",
         )
         publisher.cleanup(preserve=False)

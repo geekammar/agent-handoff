@@ -329,6 +329,9 @@ class DispatchRunner:
     def _advance_all(self, *, force: bool) -> None:
         for record in self.ledger.all():
             status = record.get("status")
+            if record.get("task_type") == "coding" and status == "ISSUE_UPDATED":
+                self._publish(record, force=force)
+                continue
             if status in ("NEW", "CLAIMED", "RUNNING", "REJECTED", "NEEDS_ATTENTION", "ISSUE_UPDATED"):
                 continue
             if record.get("task_type") == "coding":
@@ -1420,6 +1423,18 @@ class DispatchRunner:
         pr_url = publication.get("pr_url")
         if not report_url or not pr_number or not pr_url or publication.get("report_link_updated"):
             return
+        next_at = publication.get("report_link_next_attempt_at")
+        if next_at:
+            from datetime import datetime
+
+            from ..util import utcnow
+
+            try:
+                due = datetime.fromisoformat(str(next_at).replace("Z", "+00:00")) <= utcnow()
+            except ValueError:
+                due = True
+            if not due:
+                return
         project = self._dispatch_project_for(record)
         project_coding = project.get("coding") or {}
         project_publication = project_coding.get("publication") or {}
@@ -1450,14 +1465,36 @@ class DispatchRunner:
             publisher.update_pr_body(pr_number=int(pr_number), body=body)
         except Exception as exc:
             message = sanitize_error(f"could not add the verified report link to the Draft PR: {exc}", 500)
-            self.summary.setdefault("warnings", []).append(message)
+            attempts = int(publication.get("report_link_attempts", 0) or 0) + 1
+            next_at = publication_backoff(attempts, 60)
+            self.ledger.update(
+                record["repository"],
+                int(record["issue_number"]),
+                lambda item: item.setdefault("coding", {}).setdefault("publication", {}).update(
+                    {
+                        "report_link_attempts": attempts,
+                        "report_link_last_error": message,
+                        "report_link_next_attempt_at": next_at,
+                    }
+                ),
+                note="Draft PR report-link update failed; bounded retry scheduled",
+            )
+            self.summary.setdefault("warnings", []).append(
+                message + f" (retry after {next_at}; report delivery is unaffected)"
+            )
             self._log(message)
             return
         self.ledger.update(
             record["repository"],
             int(record["issue_number"]),
             lambda item: item.setdefault("coding", {}).setdefault("publication", {}).update(
-                {"report_link_updated": True, "report_link_updated_at": utcnow_iso_precise()}
+                {
+                    "report_link_updated": True,
+                    "report_link_updated_at": utcnow_iso_precise(),
+                    "report_link_attempts": int(publication.get("report_link_attempts", 0) or 0),
+                    "report_link_last_error": None,
+                    "report_link_next_attempt_at": None,
+                }
             ),
             note="verified report link added to the Draft PR body",
         )
@@ -1475,8 +1512,10 @@ class DispatchRunner:
                 coding.setdefault("milestones", {})[milestone] = True
             if stage == "UPLOAD_VERIFIED":
                 coding["upload_verified_at"] = utcnow_iso_precise()
+                coding.setdefault("milestones", {})["REPORT_VERIFIED"] = True
             if stage == "ISSUE_UPDATED":
                 coding["report_delivered_at"] = utcnow_iso_precise()
+                coding.setdefault("milestones", {})["ISSUE_DELIVERED"] = True
 
         self.ledger.update(record["repository"], int(record["issue_number"]), apply, note=note or f"coding milestone {stage}")
 

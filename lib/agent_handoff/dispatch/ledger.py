@@ -167,8 +167,15 @@ def new_coding_state(project: dict[str, Any]) -> dict[str, Any]:
         "milestones": {
             "AGENT_COMPLETED": False,
             "TESTS_PASSED": False,
+            "DIFF_VALIDATED": False,
+            "COMMIT_CREATED": False,
+            "BRANCH_PUBLISHED": False,
+            "PR_CREATED": False,
             "PR_PUBLISHED": False,
+            "REPORT_VERIFIED": False,
+            "ISSUE_DELIVERED": False,
             "REPORT_DELIVERED": False,
+            "TELEGRAM_SENT": False,
         },
         "created_at": now,
     }
@@ -331,11 +338,21 @@ def safe_record_summary(record: dict[str, Any]) -> dict[str, Any]:
             "milestones": {
                 "agent_completed": bool(milestones.get("AGENT_COMPLETED")),
                 "tests_passed": bool(milestones.get("TESTS_PASSED")),
+                "diff_validated": bool(milestones.get("DIFF_VALIDATED")),
+                "commit_created": bool(milestones.get("COMMIT_CREATED")),
+                "branch_published": bool(milestones.get("BRANCH_PUBLISHED")),
+                "pr_created": bool(milestones.get("PR_CREATED") or milestones.get("PR_PUBLISHED")),
                 "pr_published": bool(milestones.get("PR_PUBLISHED")),
+                "report_verified": bool(milestones.get("REPORT_VERIFIED")),
+                "issue_delivered": bool(milestones.get("ISSUE_DELIVERED")),
                 "report_delivered": bool(milestones.get("REPORT_DELIVERED")),
+                "telegram_sent": bool(milestones.get("TELEGRAM_SENT")),
             },
             "publication_attempts": coding_publication.get("attempts", 0),
             "publication_next_attempt_at": coding_publication.get("next_attempt_at"),
+            "report_link_updated": bool(coding_publication.get("report_link_updated")),
+            "report_link_last_error": coding_publication.get("report_link_last_error"),
+            "report_link_next_attempt_at": coding_publication.get("report_link_next_attempt_at"),
             "artifact_preserved": coding.get("artifacts_preserved"),
         }
         if record.get("task_type") == "coding"

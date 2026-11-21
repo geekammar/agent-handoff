@@ -175,6 +175,22 @@ C1 focused coverage (`tests/test_c1_isolation.py`):
 
 Live staging acceptance of an actual isolated OpenCode coding task was **not performed** in this change. It requires a separately approved Unix account, provider credential, and disposable workspace. Production Rabet/Yakfi remain `read_only`, production isolation remains disabled, and the production service was not restarted.
 
+## C2 focused security, artifact integrity, and recovery repair
+
+Date: 2026-11-21
+
+Commands:
+
+```bash
+python3 -m compileall -q lib setup tests
+sh -n setup/install.sh setup/upgrade.sh setup/rollback.sh setup/gdrive-auth.sh
+PYTHONPATH=lib python3 -m unittest discover -s tests -p "test_*.py" -v
+PYTHONPATH=lib python3 -m unittest tests.test_c2_coding -v
+git diff --check
+```
+
+Deterministic result: **188 tests passed, 0 failed**. The focused C2 module ran **49 tests, 0 failed**. New coverage includes artifact digest/size/mode changes after validation, symlink substitution, manifest/index/committed-tree verification, unexpected staged paths, hook/filter/fsmonitor non-execution, restricted file protocol, no force push, clean-workspace adoption, unpersisted-commit recreation, missing-staging remote-SHA recovery, PR body retry, orphan-process blocking, SIGTERM unwinding, bounded output/resource limits, and historical-ledger/status compatibility. These are deterministic local tests, not live C2 staging acceptance.
+
 ## C2 isolated coding workflow deterministic acceptance
 
 Date: 2026-11-21
@@ -189,7 +205,7 @@ PYTHONPATH=lib python3 -m unittest tests.test_c2_coding -v
 git diff --check
 ```
 
-Deterministic result: **169 tests passed, 0 failed**. The focused C2 module ran **30 tests, 0 failed**. The suite uses fake GitHub, fake OpenCode, synthetic credentials, a local trusted Git remote, and fake rclone. It does not prove a live dedicated Unix account, live provider credential, real private GitHub repository, or production enablement.
+Deterministic result: **169 tests passed, 0 failed** at the initial C2 review point; the focused C2 module ran **30 tests, 0 failed**. The focused repair run above supersedes these counts with 188/49. The suite uses fake GitHub, fake OpenCode, synthetic credentials, a local trusted Git remote, and fake rclone. It does not prove a live dedicated Unix account, live provider credential, real private GitHub repository, or production enablement.
 
 C2 focused coverage (`tests/test_c2_coding.py`, mapped to T01-T40 in test names):
 

@@ -189,6 +189,15 @@ def record_status_view(
         view["pr_number"] = coding.get("pr_number")
         view["tests_status"] = (coding.get("tests") or {}).get("status")
         view["milestones"] = coding.get("milestones") or {}
+        notification_states = {str(item.get("state") or "") for item in (notifications or [])}
+        if "SENT" in notification_states:
+            view["telegram_state"] = "SENT"
+        elif "NEEDS_ATTENTION" in notification_states:
+            view["telegram_state"] = "NEEDS_ATTENTION"
+        elif notification_states & {"PENDING", "SENDING", "RETRY_WAIT"}:
+            view["telegram_state"] = "PENDING"
+        else:
+            view["telegram_state"] = "NOT_QUEUED"
         if status == "EXECUTION_COMPLETED":
             if coding.get("blocked"):
                 health = ATTENTION
@@ -226,7 +235,20 @@ def record_status_view(
                     "submit a new Issue if needed."
                 )
             else:
-                next_action = "Review the Draft PR and verified report. A human owner must merge; C2 never auto-merges."
+                coding_pub = (view.get("coding") or {})
+                if not coding_pub.get("report_link_updated") and coding_pub.get("report_link_next_attempt_at"):
+                    next_action = (
+                        "Report and Issue are delivered. A retry is scheduled to add the verified report link "
+                        f"to the existing Draft PR body after {coding_pub.get('report_link_next_attempt_at')}. "
+                        "No agent, PR, upload, or Issue comment is repeated."
+                    )
+                elif not coding_pub.get("report_link_updated") and coding_pub.get("report_link_last_error"):
+                    next_action = (
+                        "Report and Issue are delivered, but the existing Draft PR body could not be updated. "
+                        "Inspect the warning; do not create a second PR."
+                    )
+                else:
+                    next_action = "Review the Draft PR and verified report. A human owner must merge; C2 never auto-merges."
 
     for candidate in (
         (coding.get("publication_next_attempt_at") if coding else None),
@@ -306,8 +328,11 @@ def format_status_view(view: dict[str, Any]) -> list[str]:
         lines.append(
             f"      coding stage: {view['coding_stage']} · tests={tests_status} "
             f"· agent={bool(milestones.get('agent_completed'))} "
+            f"· diff={bool(milestones.get('diff_validated'))} "
+            f"· commit={bool(milestones.get('commit_created'))} "
             f"· pr={bool(milestones.get('pr_published'))} "
-            f"· report={bool(milestones.get('report_delivered'))}"
+            f"· report={bool(milestones.get('report_delivered'))} "
+            f"· telegram={view.get('telegram_state') or 'unknown'}"
         )
     if (view.get("publication") or {}).get("comment_url"):
         lines.append(f"      delivery comment: {view['publication']['comment_url']}")
