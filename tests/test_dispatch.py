@@ -19,9 +19,13 @@ if str(ROOT / "lib") not in sys.path:
 from support import BIN, Harness  # noqa: E402
 
 from agent_handoff.dispatch.ledger import Ledger, new_dispatch_record  # noqa: E402
+from agent_handoff.notify.config import DEFAULT_TOKEN_ENV, notification_token_env_names  # noqa: E402
 
 BETA_ID = "beta_folder_0001"
 GH_REPO = "dev/private-dispatch"
+SYNTHETIC_TELEGRAM_TOKEN = "123456789:AAFakeDispatchEnvSecret_1234567890"
+CUSTOM_TOKEN_ENV = "AGENT_HANDOFF_TEST_CUSTOM_TELEGRAM_TOKEN"
+CUSTOM_TELEGRAM_TOKEN = "987654321:AAAnotherFakeDispatchEnvSecret_0987654321"
 
 
 def request_body(
@@ -1231,6 +1235,193 @@ class DispatchTests(unittest.TestCase):
             for forbidden in ("geekammar", "Rabet", "Yakfi", "/root/projects", "deepseek/deepseek-flash"):
                 self.assertNotIn(forbidden, text)
         self.assertEqual(set(two["dispatch"]["projects"]), {"ProjectA", "ProjectB"})
+
+
+class OpenCodeEnvironmentTests(unittest.TestCase):
+    workspace = "/tmp/agent-handoff-test-workspace"
+
+    def _request(self, *, profile: str = "read_only", allow_write: bool = False):
+        from agent_handoff.dispatch.adapters.base import ExecutionRequest
+
+        return ExecutionRequest(
+            model="provider/model-fast",
+            workspace=self.workspace,
+            title="Environment check",
+            instructions="ENVIRONMENT-CHECK",
+            permission_profile=profile,
+            allow_write=allow_write,
+            timeout_seconds=30,
+        )
+
+    def _adapter(self, *, profile: str = "read_only", allow_write: bool = False, secret_env_names=None):
+        from agent_handoff.dispatch.adapters.opencode import OpenCodeAdapter
+
+        execution = {
+            "timeout_seconds": 30,
+            "permission_profile": profile,
+            "allow_write": allow_write,
+        }
+        if secret_env_names is None:
+            return OpenCodeAdapter(execution)
+        return OpenCodeAdapter(execution, secret_env_names=secret_env_names)
+
+    def test_default_notification_token_is_stripped_without_mutating_parent_environment(self) -> None:
+        patched = {
+            DEFAULT_TOKEN_ENV: SYNTHETIC_TELEGRAM_TOKEN,
+            "OPENAI_API_KEY": "synthetic-model-key",
+            "AGENT_HANDOFF_TEST_ORDINARY_VARIABLE": "kept",
+        }
+        with mock.patch.dict(os.environ, patched, clear=False):
+            env = self._adapter()._environment(self._request())
+            self.assertEqual(os.environ.get(DEFAULT_TOKEN_ENV), SYNTHETIC_TELEGRAM_TOKEN)
+        self.assertNotIn(DEFAULT_TOKEN_ENV, env)
+        self.assertEqual(env["OPENAI_API_KEY"], "synthetic-model-key")
+        self.assertEqual(env["AGENT_HANDOFF_TEST_ORDINARY_VARIABLE"], "kept")
+        self.assertEqual(env["PWD"], self.workspace)
+        self.assertNotIn(SYNTHETIC_TELEGRAM_TOKEN, json.dumps(env))
+
+    def test_custom_notification_token_env_is_stripped_with_its_default_name(self) -> None:
+        config = {
+            "notifications": {
+                "telegram": {
+                    "enabled": True,
+                    "chat_id": "-1001234567890",
+                    "token_env": CUSTOM_TOKEN_ENV,
+                }
+            }
+        }
+        self.assertEqual(notification_token_env_names(config), (DEFAULT_TOKEN_ENV, CUSTOM_TOKEN_ENV))
+        self.assertEqual(notification_token_env_names({}), (DEFAULT_TOKEN_ENV,))
+        patched = {
+            DEFAULT_TOKEN_ENV: SYNTHETIC_TELEGRAM_TOKEN,
+            CUSTOM_TOKEN_ENV: CUSTOM_TELEGRAM_TOKEN,
+            "AGENT_HANDOFF_TEST_ORDINARY_VARIABLE": "kept",
+        }
+        with mock.patch.dict(os.environ, patched, clear=False):
+            env = self._adapter(secret_env_names=notification_token_env_names(config))._environment(
+                self._request()
+            )
+        self.assertNotIn(DEFAULT_TOKEN_ENV, env)
+        self.assertNotIn(CUSTOM_TOKEN_ENV, env)
+        self.assertEqual(env["AGENT_HANDOFF_TEST_ORDINARY_VARIABLE"], "kept")
+        self.assertNotIn(SYNTHETIC_TELEGRAM_TOKEN, json.dumps(env))
+        self.assertNotIn(CUSTOM_TELEGRAM_TOKEN, json.dumps(env))
+
+    def test_read_only_profile_keeps_existing_plan_policy_while_filtering_token(self) -> None:
+        from agent_handoff.dispatch.adapters.opencode import READ_ONLY_POLICY
+
+        with mock.patch.dict(os.environ, {DEFAULT_TOKEN_ENV: SYNTHETIC_TELEGRAM_TOKEN}, clear=False):
+            adapter = self._adapter(profile="read_only")
+            env = adapter._environment(self._request())
+            command = adapter._command(self._request())
+        self.assertNotIn(DEFAULT_TOKEN_ENV, env)
+        self.assertEqual(json.loads(env["OPENCODE_CONFIG_CONTENT"]), READ_ONLY_POLICY)
+        self.assertEqual(command[command.index("--agent") + 1], "plan")
+        self.assertNotIn("edit", json.loads(env["OPENCODE_CONFIG_CONTENT"])["permission"])
+
+    def test_workspace_write_profile_keeps_existing_build_policy_while_filtering_token(self) -> None:
+        from agent_handoff.dispatch.adapters.opencode import WORKSPACE_WRITE_POLICY
+
+        with mock.patch.dict(os.environ, {DEFAULT_TOKEN_ENV: SYNTHETIC_TELEGRAM_TOKEN}, clear=False):
+            adapter = self._adapter(profile="workspace_write", allow_write=True)
+            env = adapter._environment(self._request(profile="workspace_write", allow_write=True))
+            command = adapter._command(self._request(profile="workspace_write", allow_write=True))
+        self.assertNotIn(DEFAULT_TOKEN_ENV, env)
+        self.assertEqual(json.loads(env["OPENCODE_CONFIG_CONTENT"]), WORKSPACE_WRITE_POLICY)
+        self.assertEqual(command[command.index("--agent") + 1], "build")
+        self.assertEqual(
+            json.loads(env["OPENCODE_CONFIG_CONTENT"])["permission"]["edit"],
+            "allow",
+        )
+
+    def test_adapter_instances_reapply_the_filter_on_every_launch(self) -> None:
+        with mock.patch.dict(os.environ, {DEFAULT_TOKEN_ENV: SYNTHETIC_TELEGRAM_TOKEN}, clear=False):
+            first = self._adapter()._environment(self._request())
+            second = self._adapter()._environment(self._request())
+        self.assertNotIn(DEFAULT_TOKEN_ENV, first)
+        self.assertNotIn(DEFAULT_TOKEN_ENV, second)
+
+
+class DispatchSecretEnvironmentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.h = DispatchHarness(self.root)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def probe(self, *names: str, **extra: str) -> dict[str, str]:
+        value = {"FAKE_OPENCODE_ENV_PROBE": ",".join(names)}
+        value.update(extra)
+        return value
+
+    def test_read_only_dispatch_filters_token_and_keeps_existing_execution(self) -> None:
+        from agent_handoff.dispatch.adapters.opencode import READ_ONLY_POLICY
+
+        self.h.add_issue(number=1, body=request_body())
+        result = self.h.dispatch(
+            extra_env=self.probe(DEFAULT_TOKEN_ENV, **{DEFAULT_TOKEN_ENV: SYNTHETIC_TELEGRAM_TOKEN})
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["executed"], 1)
+        self.assertEqual(result["published"], 1)
+        calls = self.h.opencode_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0]["env_present"][DEFAULT_TOKEN_ENV])
+        self.assertEqual(calls[0]["agent"], "plan")
+        self.assertEqual(json.loads(calls[0]["config_content"]), READ_ONLY_POLICY)
+        self.assertEqual(self.h.record(1)["status"], "ISSUE_UPDATED")
+
+    def test_workspace_write_dispatch_filters_token_and_keeps_existing_execution(self) -> None:
+        from agent_handoff.dispatch.adapters.opencode import WORKSPACE_WRITE_POLICY
+
+        self.h.config["dispatch"]["execution"]["permission_profile"] = "workspace_write"
+        self.h.config["dispatch"]["execution"]["allow_write"] = True
+        self.h.write_config()
+        self.h.add_issue(number=1, body=request_body())
+        result = self.h.dispatch(
+            extra_env=self.probe(DEFAULT_TOKEN_ENV, **{DEFAULT_TOKEN_ENV: SYNTHETIC_TELEGRAM_TOKEN})
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["executed"], 1)
+        self.assertEqual(result["published"], 1)
+        calls = self.h.opencode_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0]["env_present"][DEFAULT_TOKEN_ENV])
+        self.assertEqual(calls[0]["agent"], "build")
+        self.assertEqual(json.loads(calls[0]["config_content"]), WORKSPACE_WRITE_POLICY)
+        self.assertEqual(self.h.record(1)["status"], "ISSUE_UPDATED")
+
+    def test_no_notification_configuration_keeps_v11_dispatch_working_and_filters_token(self) -> None:
+        self.assertNotIn("notifications", self.h.config)
+        self.h.add_issue(number=1, body=request_body())
+        result = self.h.dispatch(
+            extra_env=self.probe(DEFAULT_TOKEN_ENV, **{DEFAULT_TOKEN_ENV: SYNTHETIC_TELEGRAM_TOKEN})
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["executed"], 1)
+        self.assertEqual(result["uploaded"], 1)
+        self.assertEqual(result["published"], 1)
+        calls = self.h.opencode_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0]["env_present"][DEFAULT_TOKEN_ENV])
+        self.assertEqual(self.h.record(1)["status"], "ISSUE_UPDATED")
+
+    def test_restarted_dispatcher_process_cannot_reintroduce_the_token(self) -> None:
+        probe = self.probe(DEFAULT_TOKEN_ENV, **{DEFAULT_TOKEN_ENV: SYNTHETIC_TELEGRAM_TOKEN})
+        self.h.add_issue(number=1, body=request_body())
+        first = self.h.dispatch(extra_env=probe)
+        self.h.add_issue(number=2, body=request_body())
+        second = self.h.dispatch(extra_env=probe)
+        self.assertTrue(first["ok"], first)
+        self.assertTrue(second["ok"], second)
+        calls = self.h.opencode_calls()
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertFalse(call["env_present"][DEFAULT_TOKEN_ENV])
+        self.assertEqual(self.h.record(1)["status"], "ISSUE_UPDATED")
+        self.assertEqual(self.h.record(2)["status"], "ISSUE_UPDATED")
 
 
 if __name__ == "__main__":

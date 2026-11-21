@@ -22,7 +22,7 @@ from support import Harness  # noqa: E402
 from test_dispatch import GH_REPO, DispatchHarness, request_body  # noqa: E402
 
 from agent_handoff.dispatch.ledger import Ledger, new_dispatch_record  # noqa: E402
-from agent_handoff.notify.config import validate_notification_config  # noqa: E402
+from agent_handoff.notify.config import DEFAULT_TOKEN_ENV, validate_notification_config  # noqa: E402
 from agent_handoff.notify.messages import (  # noqa: E402
     DELIVERY_COMPLETED,
     DELIVERY_DELAYED,
@@ -34,6 +34,8 @@ from agent_handoff.notify.store import NotificationStore  # noqa: E402
 from agent_handoff.notify.transport import TelegramTransport  # noqa: E402
 
 TOKEN = "123456789:AAFakeTokenForTests_1234567890"
+CUSTOM_TOKEN_ENV = "AGENT_HANDOFF_TEST_CUSTOM_TELEGRAM_TOKEN"
+CUSTOM_TOKEN = "987654321:AAAnotherFakeTokenForTests_0987654321"
 CHAT_ID = "-1001234567890"
 
 
@@ -565,6 +567,80 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(status["records"][0]["health"], "delivered")
         self.assertEqual(status["records"][0]["notifications"], [])
         self.assertEqual(self.h.record(1)["status"], "ISSUE_UPDATED")
+
+    def test_parent_notification_service_keeps_token_while_agent_child_loses_it(self) -> None:
+        self.enable_notifications()
+        self.h.add_issue(number=1, body=request_body())
+        result = self.dispatch(extra_env={"FAKE_OPENCODE_ENV_PROBE": DEFAULT_TOKEN_ENV})
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(self.notification(DELIVERY_COMPLETED)["state"], "SENT")
+        calls = self.h.opencode_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0]["env_present"][DEFAULT_TOKEN_ENV])
+        self.assertEqual(self.h.record(1)["status"], "ISSUE_UPDATED")
+
+    def test_custom_token_env_is_used_by_parent_and_hidden_from_agent(self) -> None:
+        self.server.expected_token = CUSTOM_TOKEN
+        self.enable_notifications(token_env=CUSTOM_TOKEN_ENV)
+        self.h.add_issue(number=1, body=request_body())
+        result = self.dispatch(
+            extra_env={
+                DEFAULT_TOKEN_ENV: TOKEN,
+                CUSTOM_TOKEN_ENV: CUSTOM_TOKEN,
+                "FAKE_OPENCODE_ENV_PROBE": f"{DEFAULT_TOKEN_ENV},{CUSTOM_TOKEN_ENV}",
+            }
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(self.notification(DELIVERY_COMPLETED)["state"], "SENT")
+        calls = self.h.opencode_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0]["env_present"][DEFAULT_TOKEN_ENV])
+        self.assertFalse(calls[0]["env_present"][CUSTOM_TOKEN_ENV])
+        self.assertEqual(self.h.record(1)["status"], "ISSUE_UPDATED")
+
+    def test_disabled_notifications_filter_token_and_never_contact_telegram(self) -> None:
+        self.enable_notifications(enabled=False)
+        self.h.add_issue(number=1, body=request_body())
+        result = self.dispatch(extra_env={"FAKE_OPENCODE_ENV_PROBE": DEFAULT_TOKEN_ENV})
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.server.requests, [])
+        self.assertEqual(self.notifications(), [])
+        calls = self.h.opencode_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0]["env_present"][DEFAULT_TOKEN_ENV])
+        self.assertEqual(self.h.record(1)["status"], "ISSUE_UPDATED")
+
+    def test_synthetic_token_never_appears_in_cli_output_logs_reports_or_events(self) -> None:
+        self.enable_notifications()
+        self.h.add_issue(number=1, body=request_body())
+        result = self.run_cli(
+            ["dispatch", "run", "--once", "--json"],
+            extra_env={"FAKE_OPENCODE_ENV_PROBE": DEFAULT_TOKEN_ENV},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
+        self.assertEqual(len(self.server.requests), 1)
+        record = self.h.record(1)
+        self.assertEqual(record["status"], "ISSUE_UPDATED")
+        run_dir = (
+            self.h.task_dir_for("Alpha", record["capture"]["task_id"])
+            / "RUNS"
+            / record["capture"]["run_id"]
+        )
+        paths = [
+            run_dir / "REPORT.md",
+            run_dir / "COMPLETE.json",
+            run_dir / "UPLOAD-RECEIPT.json",
+            self.h.home / "logs" / "dispatch.log",
+            Path(str(record["session"]["events_path"])),
+        ]
+        for path in paths:
+            if path.is_file():
+                self.assertNotIn(TOKEN, path.read_text(encoding="utf-8", errors="replace"), str(path))
+        self.assertNotIn(TOKEN, json.dumps(self.notifications(), ensure_ascii=False))
+        self.assertNotIn(TOKEN, json.dumps(self.h.opencode_calls(), ensure_ascii=False))
 
     def test_configuration_validation_and_token_redaction(self) -> None:
         disabled = {"notifications": {"telegram": {"enabled": False}}}

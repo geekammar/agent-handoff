@@ -52,6 +52,11 @@ def main() -> int:
             "format": flag(argv, "--format"),
             "prompt": argv[-1] if argv else "",
             "config_content": os.environ.get("OPENCODE_CONFIG_CONTENT"),
+            "env_present": {
+                key.strip(): key.strip() in os.environ
+                for key in (os.environ.get("FAKE_OPENCODE_ENV_PROBE") or "").split(",")
+                if key.strip()
+            },
         }
     )
     delay = float(os.environ.get("FAKE_OPENCODE_DELAY", "0") or 0)
