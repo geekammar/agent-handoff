@@ -27,6 +27,7 @@ from .delivery import (
 from .github import GithubError, GithubTransport
 from .ledger import Ledger, new_dispatch_record
 from .progress import ProgressReporter
+from ..notify.config import notification_token_env_names
 from ..notify.service import NotificationService
 from .requests import RequestError, detect_request, parse_issue_request, resolve_request
 
@@ -38,7 +39,10 @@ class DispatchRunner:
         self.store = Store(config)
         self.ledger = Ledger(config)
         self.transport = GithubTransport(dispatch)
-        self.adapter = OpenCodeAdapter(dispatch.get("execution") or {})
+        self.adapter = OpenCodeAdapter(
+            dispatch.get("execution") or {},
+            secret_env_names=notification_token_env_names(config),
+        )
         self.uploader = Uploader(config, self.store)
         self.log_path = self.store.logs_root / "dispatch.log"
         self.progress = progress

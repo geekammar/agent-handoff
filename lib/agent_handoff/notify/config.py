@@ -37,6 +37,26 @@ def _int_value(value: Any, default: int, minimum: int, maximum: int, label: str,
     return number
 
 
+def notification_token_env_names(config: dict[str, Any]) -> tuple[str, ...]:
+    """Environment variable names that may hold notification credentials.
+
+    The dispatcher reads the token from the parent environment, but coding
+    agents launched by the dispatcher must never inherit it. The default name
+    is always included so an accidentally exported token is still filtered
+    when notifications are disabled or unconfigured.
+    """
+
+    names = [DEFAULT_TOKEN_ENV]
+    raw = config.get("notifications")
+    if isinstance(raw, dict):
+        telegram = raw.get("telegram")
+        if isinstance(telegram, dict):
+            token_env = _text(telegram.get("token_env")) or DEFAULT_TOKEN_ENV
+            if TOKEN_ENV_RE.fullmatch(token_env) and token_env not in names:
+                names.append(token_env)
+    return tuple(names)
+
+
 def validate_notification_config(config: dict[str, Any]) -> tuple[dict[str, Any], list[str], list[str]]:
     """Validate the optional notification section without contacting Telegram.
 

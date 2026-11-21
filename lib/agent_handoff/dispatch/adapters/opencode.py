@@ -8,8 +8,9 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Mapping
 
+from ...notify.config import DEFAULT_TOKEN_ENV
 from ...util import ensure_dir, sanitize_error, utc_from_timestamp, utcnow_iso
 from .base import ExecutionRequest, ExecutionResult
 
@@ -39,6 +40,15 @@ WORKSPACE_WRITE_POLICY = {
 }
 
 BAD_TERMINATION_REASONS = {"error", "length", "max_tokens", "content_filter", "timeout", "cancelled"}
+
+
+def filter_agent_environment(
+    environment: Mapping[str, str], secret_env_names: Iterable[str]
+) -> dict[str, str]:
+    """Copy a parent environment without variables that hold agent-launcher secrets."""
+
+    blocked = {name for name in secret_env_names if name}
+    return {key: value for key, value in environment.items() if key not in blocked}
 
 
 class OpenCodeEventParser:
@@ -137,11 +147,13 @@ def _outcome(parser: OpenCodeEventParser, exit_code: int | None, timed_out: bool
 class OpenCodeAdapter:
     name = "opencode"
 
-    def __init__(self, execution: dict[str, Any]):
+    def __init__(self, execution: dict[str, Any], *, secret_env_names: Iterable[str] | None = None):
         self.execution = execution
         self.permission_profile = execution.get("permission_profile", "read_only")
         self.allow_write = bool(execution.get("allow_write", False))
         self.timeout_seconds = float(execution.get("timeout_seconds", 1200))
+        names = (DEFAULT_TOKEN_ENV,) if secret_env_names is None else tuple(secret_env_names)
+        self.secret_env_names = tuple(name for name in names if name)
 
     def _command(self, request: ExecutionRequest) -> list[str]:
         binary = os.environ.get("AGENT_HANDOFF_OPENCODE_BIN") or "opencode"
@@ -163,7 +175,7 @@ class OpenCodeAdapter:
         ]
 
     def _environment(self, request: ExecutionRequest) -> dict[str, str]:
-        env = os.environ.copy()
+        env = filter_agent_environment(os.environ, self.secret_env_names)
         env["PWD"] = request.workspace
         env["OPENCODE_CONFIG_CONTENT"] = json.dumps(_policy(self.permission_profile, self.allow_write))
         return env
