@@ -275,7 +275,12 @@ class C1ConfigTests(unittest.TestCase):
             allow_write=True,
             timeout_seconds=30,
         )
-        with mock.patch.dict(os.environ, {"AGENT_HANDOFF_OPENCODE_BIN": sys.executable}, clear=False):
+        trusted_bin = self.root / "trusted-bin"
+        trusted_bin.mkdir()
+        executable = trusted_bin / "opencode"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        os.chmod(executable, 0o755)
+        with mock.patch.dict(os.environ, {"AGENT_HANDOFF_OPENCODE_BIN": str(executable)}, clear=False):
             self.assertEqual(agent_adapter._command(request)[4], "build")
             request = ExecutionRequest(
                 model="provider/model-fast",
