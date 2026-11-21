@@ -170,7 +170,7 @@ class OpenCodeAdapter:
 
     def _command(self, request: ExecutionRequest) -> list[str]:
         if self.identity:
-            binary = resolve_opencode_binary(self.identity, os.environ)
+            binary = resolve_opencode_binary(self.identity, os.environ, workspace=request.workspace)
         else:
             binary = os.environ.get("AGENT_HANDOFF_OPENCODE_BIN") or "opencode"
         agent = "build" if request.permission_profile == "workspace_write" else "plan"

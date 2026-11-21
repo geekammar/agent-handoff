@@ -71,32 +71,63 @@ def _resolve_project_execution(
     global_execution: dict[str, Any],
     label: str,
     errors: list[str],
+    *,
+    global_isolation_enabled: bool = False,
 ) -> dict[str, Any]:
     """Resolve one project's effective execution policy.
 
     A missing override inherits the global policy exactly. A project-level
     workspace_write profile requires its own explicit allow_write=true, so a
     project can never become write-capable implicitly through global state.
+    Write-capable execution additionally requires effective isolation; there is
+    no root-write fallback.
     """
 
     global_profile = str(global_execution.get("permission_profile") or "read_only")
     global_allow_write = bool(global_execution.get("allow_write", False))
-    if raw is None:
-        return {
-            "permission_profile": global_profile,
-            "allow_write": global_allow_write,
-            "inherited": True,
-        }
-    if not isinstance(raw, dict):
+    default_isolation = {
+        "enabled": bool(global_isolation_enabled),
+        "inherited": True,
+    }
+    if raw is not None and not isinstance(raw, dict):
         _add(errors, f"{label} must be an object")
+    if raw is None or not isinstance(raw, dict):
+        if global_allow_write and not global_isolation_enabled:
+            _add(
+                errors,
+                f"{label} inherits a write-capable policy but isolation is not enabled; "
+                "write-capable root execution is refused. Enable isolation for this project "
+                "with a validated non-root identity.",
+            )
         return {
             "permission_profile": global_profile,
             "allow_write": global_allow_write,
             "inherited": True,
+            "isolation": default_isolation,
         }
-    unknown = sorted(set(raw) - {"permission_profile", "allow_write"})
+    unknown = sorted(set(raw) - {"permission_profile", "allow_write", "isolation"})
     if unknown:
         _add(errors, f"{label} contains unsupported field(s): {', '.join(unknown)}")
+
+    isolation_explicit = "isolation" in raw
+    isolation_enabled = bool(global_isolation_enabled)
+    if isolation_explicit:
+        isolation_raw = raw.get("isolation")
+        if not isinstance(isolation_raw, dict):
+            _add(errors, f"{label}.isolation must be an object")
+        else:
+            unknown_isolation = sorted(set(isolation_raw) - {"enabled"})
+            if unknown_isolation:
+                _add(
+                    errors,
+                    f"{label}.isolation contains unsupported field(s): "
+                    + ", ".join(unknown_isolation),
+                )
+            if "enabled" in isolation_raw:
+                if not isinstance(isolation_raw["enabled"], bool):
+                    _add(errors, f"{label}.isolation.enabled must be true or false")
+                else:
+                    isolation_enabled = isolation_raw["enabled"]
 
     profile_explicit = "permission_profile" in raw
     allow_explicit = "allow_write" in raw
@@ -129,11 +160,21 @@ def _resolve_project_execution(
         _add(errors, f"{label}.allow_write requires permission_profile 'workspace_write'")
     if profile == "workspace_write" and not allow_write:
         _add(errors, f"{label} permission_profile 'workspace_write' requires allow_write=true")
+    if allow_write and not isolation_enabled:
+        _add(
+            errors,
+            f"{label} is write-capable but isolation is not enabled; write-capable root execution "
+            "is refused. Enable isolation for this project with a validated non-root identity.",
+        )
 
     return {
         "permission_profile": profile,
         "allow_write": allow_write,
         "inherited": not (profile_explicit or allow_explicit),
+        "isolation": {
+            "enabled": isolation_enabled,
+            "inherited": not (isolation_explicit and isinstance(raw.get("isolation"), dict) and "enabled" in raw["isolation"]),
+        },
     }
 
 
@@ -144,11 +185,29 @@ def _parse_isolation(
     *,
     check_paths: bool,
 ) -> dict[str, Any]:
+    """Parse the global isolation definition without resolving the OS identity.
+
+    The global `enabled` value remains the legacy default for every project.
+    A project may opt in or opt out with `execution.isolation.enabled`. The
+    identity is resolved later only when at least one effective project policy
+    uses isolation, so a disabled example/staging block never requires a real
+    Unix account.
+    """
+
+    parsed = {
+        "enabled": False,
+        "environment": "allowlist",
+        "identity": None,
+        "identity_raw": None,
+        "child_path": None,
+        "workspace_roots": [],
+        "denied_projects": list(DEFAULT_DENIED_PROJECTS),
+    }
     if raw is None:
-        return {"enabled": False, "identity": None, "workspace_roots": [], "denied_projects": list(DEFAULT_DENIED_PROJECTS)}
+        return parsed
     if not isinstance(raw, dict):
         _add(errors, "dispatch.execution.isolation must be an object")
-        return {"enabled": False, "identity": None, "workspace_roots": [], "denied_projects": list(DEFAULT_DENIED_PROJECTS)}
+        return parsed
     unknown = sorted(
         set(raw) - {"enabled", "environment", "identity", "workspace_roots", "denied_projects", "child_path"}
     )
@@ -179,12 +238,8 @@ def _parse_isolation(
             if root == "/" or root == "/root" or root.startswith("/root/"):
                 _add(errors, "dispatch.execution.isolation.workspace_roots must not include / or /root")
                 continue
-            if check_paths and not os.path.isdir(root):
-                _add(errors, f"dispatch.execution.isolation.workspace_roots entry does not exist: {root}")
             if root not in workspace_roots:
                 workspace_roots.append(root)
-    if enabled and not workspace_roots:
-        _add(errors, "dispatch.execution.isolation.workspace_roots must contain at least one safe root when isolation is enabled")
 
     denied_projects = list(DEFAULT_DENIED_PROJECTS)
     denied_raw = raw.get("denied_projects")
@@ -197,38 +252,104 @@ def _parse_isolation(
                 if name.lower() not in {existing.lower() for existing in denied_projects}:
                     denied_projects.append(name)
 
-    identity = None
-    if enabled:
-        identity_raw = raw.get("identity")
+    identity_raw = raw.get("identity")
+    if identity_raw is not None:
         if not isinstance(identity_raw, dict):
-            _add(errors, "dispatch.execution.isolation.identity must be an object when isolation is enabled")
+            _add(errors, "dispatch.execution.isolation.identity must be an object")
+            identity_raw = None
         else:
-            try:
-                identity = resolve_child_identity(
-                    identity_raw,
-                    check_paths=check_paths,
-                    child_path=_text(raw.get("child_path")) or None,
-                )
-            except IdentityError as exc:
-                _add(errors, str(exc))
-        if identity is not None and check_paths:
-            try:
-                validate_model_auth(identity)
-            except IsolationError as exc:
-                _add(errors, f"{exc}; isolated execution will fail closed until this is provisioned")
-            if os.geteuid() != 0:
-                warnings.append(
-                    "dedicated execution identity requires the dispatcher to run as root; "
-                    "isolated execution will fail closed under a non-root dispatcher"
+            unknown_identity = sorted(set(identity_raw) - {"user", "group", "home"})
+            if unknown_identity:
+                _add(
+                    errors,
+                    "dispatch.execution.isolation.identity contains unsupported field(s): "
+                    + ", ".join(unknown_identity),
                 )
 
-    return {
-        "enabled": enabled,
-        "environment": environment,
-        "identity": identity,
-        "workspace_roots": workspace_roots,
-        "denied_projects": denied_projects,
-    }
+    parsed.update(
+        {
+            "enabled": enabled,
+            "environment": environment,
+            "identity_raw": identity_raw,
+            "child_path": _text(raw.get("child_path")) or None,
+            "workspace_roots": workspace_roots,
+            "denied_projects": denied_projects,
+        }
+    )
+    return parsed
+
+
+def resolve_effective_isolation(
+    global_isolation: dict[str, Any] | None,
+    project_execution: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return the one effective isolation policy used by config, runner, and adapter."""
+
+    isolation = dict(global_isolation or {})
+    override = (project_execution or {}).get("isolation") or {}
+    enabled = override.get("enabled")
+    isolation["enabled"] = enabled if isinstance(enabled, bool) else bool(isolation.get("enabled", False))
+    if not isolation["enabled"]:
+        isolation["identity"] = None
+    return isolation
+
+
+def _finalize_isolation(
+    isolation: dict[str, Any],
+    *,
+    required: bool,
+    errors: list[str],
+    warnings: list[str],
+    check_paths: bool,
+) -> dict[str, Any]:
+    if not required:
+        isolation["identity"] = None
+        isolation.pop("identity_raw", None)
+        isolation.pop("child_path", None)
+        return isolation
+
+    workspace_roots = isolation.get("workspace_roots") or []
+    if not workspace_roots:
+        _add(
+            errors,
+            "dispatch.execution.isolation.workspace_roots must contain at least one safe root "
+            "when isolation is enabled for any project",
+        )
+    elif check_paths:
+        for root in workspace_roots:
+            if not os.path.isdir(root):
+                _add(errors, f"dispatch.execution.isolation.workspace_roots entry does not exist: {root}")
+
+    identity_raw = isolation.get("identity_raw")
+    identity = None
+    if not isinstance(identity_raw, dict):
+        _add(
+            errors,
+            "dispatch.execution.isolation.identity must be an object when isolation is enabled for any project",
+        )
+    else:
+        try:
+            identity = resolve_child_identity(
+                identity_raw,
+                check_paths=check_paths,
+                child_path=isolation.get("child_path"),
+            )
+        except IdentityError as exc:
+            _add(errors, str(exc))
+    if identity is not None and check_paths:
+        try:
+            validate_model_auth(identity)
+        except IsolationError as exc:
+            _add(errors, f"{exc}; isolated execution will fail closed until this is provisioned")
+        if os.geteuid() != 0:
+            warnings.append(
+                "dedicated execution identity requires the dispatcher to run as root; "
+                "isolated execution will fail closed under a non-root dispatcher"
+            )
+    isolation["identity"] = identity
+    isolation.pop("identity_raw", None)
+    isolation.pop("child_path", None)
+    return isolation
 
 
 def validate_dispatch_config(
@@ -398,38 +519,12 @@ def validate_dispatch_config(
                 continue
             project_label = f"dispatch project {dispatch_name!r} execution"
             project_execution = _resolve_project_execution(
-                value.get("execution"), global_execution, project_label, errors
+                value.get("execution"),
+                global_execution,
+                project_label,
+                errors,
+                global_isolation_enabled=bool(isolation.get("enabled")),
             )
-            if isolation.get("enabled"):
-                identity = isolation.get("identity")
-                if identity is None:
-                    continue
-                project_names = [
-                    dispatch_name,
-                    str(core_project.get("name") or ""),
-                    str(core_project.get("key") or ""),
-                    *[str(item) for item in (core_project.get("aliases") or [])],
-                ]
-                try:
-                    workspace_real = validate_workspace_path(
-                        workspace,
-                        workspace_roots=isolation.get("workspace_roots") or [],
-                        project_names=project_names,
-                        denied_projects=isolation.get("denied_projects") or [],
-                        protected_paths=[str(BASE_DIR)],
-                        check_paths=check_paths,
-                    )
-                    if check_paths:
-                        validate_workspace_filesystem(
-                            workspace_real,
-                            identity,
-                            require_write=bool(project_execution.get("allow_write", False)),
-                            require_clean=False,
-                            protected_paths=[str(BASE_DIR)],
-                        )
-                except WorkspaceSecurityError as exc:
-                    _add(errors, f"dispatch project {dispatch_name!r}: {exc}")
-                    continue
             core_keys[str(core_project.get("key"))] = dispatch_name
             projects[dispatch_name] = {
                 "name": dispatch_name,
@@ -439,6 +534,61 @@ def validate_dispatch_config(
                 "drive_folder_id": folder_id,
                 "execution": project_execution,
             }
+
+    any_project_isolation = any(
+        bool(resolve_effective_isolation(isolation, project.get("execution")).get("enabled"))
+        for project in projects.values()
+    )
+    _finalize_isolation(
+        isolation,
+        required=bool(isolation.get("enabled")) or any_project_isolation,
+        errors=errors,
+        warnings=warnings,
+        check_paths=check_paths,
+    )
+    for dispatch_name in list(projects):
+        project = projects[dispatch_name]
+        effective_isolation = resolve_effective_isolation(isolation, project.get("execution"))
+        if not effective_isolation.get("enabled"):
+            continue
+        identity = effective_isolation.get("identity")
+        if identity is None:
+            _add(
+                errors,
+                f"dispatch project {dispatch_name!r} enables isolation but no validated non-root "
+                "identity is available; refusing root fallback",
+            )
+            projects.pop(dispatch_name)
+            continue
+        core_project = project_by_name(config, str(project.get("core_name") or dispatch_name)) or {}
+        project_names = [
+            dispatch_name,
+            str(project.get("core_name") or ""),
+            str(project.get("core_key") or ""),
+            *[str(item) for item in (core_project.get("aliases") or [])],
+        ]
+        try:
+            workspace_real = validate_workspace_path(
+                str(project.get("workspace") or ""),
+                workspace_roots=effective_isolation.get("workspace_roots") or [],
+                project_names=project_names,
+                denied_projects=effective_isolation.get("denied_projects") or [],
+                protected_paths=[str(BASE_DIR)],
+                check_paths=check_paths,
+            )
+            if check_paths:
+                validate_workspace_filesystem(
+                    workspace_real,
+                    identity,
+                    require_write=bool((project.get("execution") or {}).get("allow_write", False)),
+                    require_clean=False,
+                    protected_paths=[str(BASE_DIR)],
+                )
+        except WorkspaceSecurityError as exc:
+            _add(errors, f"dispatch project {dispatch_name!r}: {exc}")
+            projects.pop(dispatch_name)
+            continue
+        project["workspace"] = workspace_real
     if (enabled or require_enabled) and not projects:
         _add(errors, "dispatch.projects must configure at least one project")
 

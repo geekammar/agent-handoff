@@ -35,7 +35,7 @@ from .security import (
 )
 from ..notify.config import notification_token_env_names
 from ..notify.service import NotificationService
-from .config import resolve_dispatch_project
+from .config import resolve_dispatch_project, resolve_effective_isolation
 from .requests import RequestError, detect_request, parse_issue_request, resolve_request
 
 
@@ -462,7 +462,7 @@ class DispatchRunner:
             "max_prompt_bytes": int(global_execution.get("max_prompt_bytes", 50000)),
             "permission_profile": profile,
             "allow_write": allow_write,
-            "isolation": global_execution.get("isolation") or {"enabled": False},
+            "isolation": resolve_effective_isolation(global_execution.get("isolation"), policy),
         }
 
     def _adapter_for(self, execution: dict[str, Any]) -> OpenCodeAdapter:
@@ -473,6 +473,17 @@ class DispatchRunner:
             secret_env_names=notification_token_env_names(self.config),
             identity=identity,
         )
+
+    @staticmethod
+    def _isolation_ledger_state(execution: dict[str, Any]) -> dict[str, Any]:
+        isolation = execution.get("isolation") or {}
+        enabled = bool(isolation.get("enabled"))
+        identity = isolation.get("identity") if enabled else None
+        return {
+            "enabled": enabled,
+            "identity_user": (identity or {}).get("user") if identity else None,
+            "workspace_roots": list(isolation.get("workspace_roots") or []) if enabled else [],
+        }
 
     def _validate_isolation(self, record: dict[str, Any], project: dict[str, Any], execution: dict[str, Any]) -> str:
         isolation = execution.get("isolation") or {}
@@ -517,7 +528,6 @@ class DispatchRunner:
         profile = str(execution.get("permission_profile") or "read_only")
         allow_write = bool(execution.get("allow_write", False))
         timeout_seconds = float(execution.get("timeout_seconds", 1200))
-        isolation_enabled = bool((execution.get("isolation") or {}).get("enabled"))
         self.ledger.set_status(
             repository,
             number,
@@ -529,7 +539,7 @@ class DispatchRunner:
                     "runner_pid": os.getpid(),
                     "permission_profile": profile,
                     "allow_write": allow_write,
-                    "isolation": isolation_enabled,
+                    "isolation": self._isolation_ledger_state(execution),
                 }
             },
         )
@@ -548,7 +558,7 @@ class DispatchRunner:
                         "status": "FAILED",
                         "permission_profile": profile,
                         "allow_write": allow_write,
-                        "isolation": isolation_enabled,
+                        "isolation": self._isolation_ledger_state(execution),
                         "last_error": error,
                         "finished_at": utcnow_iso(),
                     },
@@ -581,7 +591,7 @@ class DispatchRunner:
                     "runner_pid": os.getpid(),
                     "permission_profile": profile,
                     "allow_write": allow_write,
-                    "isolation": isolation_enabled,
+                    "isolation": self._isolation_ledger_state(execution),
                 },
                 "session": {"events_path": events_path},
             },

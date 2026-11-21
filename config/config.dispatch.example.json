@@ -56,7 +56,14 @@
     "default_model": "fast",
     "projects": {
       "ProjectA": {"workspace": "/home/dev/projects/project-a"},
-      "ProjectB": {"workspace": "/home/dev/projects/project-b"}
+      "ProjectB": {
+        "workspace": "/srv/agent-handoff/work/project-b",
+        "execution": {
+          "permission_profile": "workspace_write",
+          "allow_write": true,
+          "isolation": {"enabled": true}
+        }
+      }
     },
     "poll_interval_seconds": 30,
     "execution": {

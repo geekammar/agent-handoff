@@ -119,6 +119,35 @@ def _check_ancestor_traversal(path: str, identity: dict[str, Any], label: str) -
             )
 
 
+def _check_trusted_ancestors(path: str, identity: Mapping[str, Any], label: str) -> None:
+    """Reject parents writable by users other than root or the dispatcher identity.
+
+    On the production host the dispatcher is root, so this means root-owned.
+    Sticky, root-owned directories such as /tmp are allowed as ancestors because
+    another user cannot rename or replace a root-owned child entry there. A
+    non-sticky group/world-writable ancestor, or one owned by a third UID, could
+    be used to swap the trusted path, so it is rejected. This narrowing is not a
+    complete TOCTOU guarantee; see docs/SECURE-CODING.md.
+    """
+
+    current = Path(path).parent
+    for candidate in (current, *current.parents):
+        try:
+            entry = os.lstat(candidate)
+        except OSError as exc:
+            raise WorkspaceSecurityError(f"{label} ancestor is not accessible: {candidate}") from exc
+        if stat.S_ISLNK(entry.st_mode):
+            raise WorkspaceSecurityError(f"{label} ancestor must not be a symlink: {candidate}")
+        if not stat.S_ISDIR(entry.st_mode):
+            raise WorkspaceSecurityError(f"{label} ancestor is not a directory: {candidate}")
+        if entry.st_uid not in {0, os.geteuid()}:
+            raise WorkspaceSecurityError(f"{label} ancestor is owned by an untrusted user: {candidate}")
+        if entry.st_mode & stat.S_ISVTX and entry.st_uid == 0:
+            continue
+        if entry.st_mode & 0o022:
+            raise WorkspaceSecurityError(f"{label} ancestor is writable by untrusted users: {candidate}")
+
+
 def resolve_child_identity(
     raw: Any,
     *,
@@ -406,14 +435,21 @@ def validate_workspace_filesystem(
             "dispatch workspace must not be group/world writable for isolated execution"
         )
     _check_workspace_bits(path, identity, require_write=require_write)
+    _check_trusted_ancestors(path, identity, "dispatch workspace")
     git_entry_path = os.path.join(path, ".git")
     if not os.path.lexists(git_entry_path):
         raise WorkspaceSecurityError("isolated coding requires a Git workspace; .git is missing")
     if os.path.islink(git_entry_path):
         raise WorkspaceSecurityError("the Git metadata path must not be a symlink")
     git_entry = os.lstat(git_entry_path)
+    if not stat.S_ISDIR(git_entry.st_mode):
+        raise WorkspaceSecurityError(
+            "the Git metadata path must be a .git directory; linked worktree metadata is not supported in C1"
+        )
     if git_entry.st_uid != uid:
         raise WorkspaceSecurityError("the Git metadata path must be owned by the dedicated execution identity")
+    if git_entry.st_mode & 0o022:
+        raise WorkspaceSecurityError("the Git metadata path must not be group/world writable")
     model_auth = str(identity.get("model_auth_path") or "")
     if model_auth:
         for candidate in (os.path.dirname(model_auth), model_auth):
@@ -522,7 +558,74 @@ def build_isolated_environment(
     return env
 
 
-def resolve_opencode_binary(identity: Mapping[str, Any], parent_env: Mapping[str, str] | None = None) -> str:
+def _validate_opencode_executable(
+    binary: str,
+    identity: Mapping[str, Any],
+    *,
+    workspace: str | None = None,
+) -> str:
+    """Require a non-tamperable OpenCode executable.
+
+    The child identity is itself untrusted for executable selection: a binary in
+    the child's HOME, workspace, cache, or TMPDIR could be replaced by the task.
+    On the production host the parent runs as root, so the file and its parent
+    directories must be root-owned and must not be group/world writable (sticky
+    root-owned directories are allowed).
+    """
+
+    uid = int(identity["uid"])
+    gid = int(identity["gid"])
+    canonical = os.path.realpath(binary)
+    if not os.path.isfile(canonical):
+        raise IsolationError(
+            "the OpenCode executable is not available on the dedicated child PATH; "
+            "install it in a reviewed location or set an explicit absolute binary path"
+        )
+    entry = os.stat(canonical)
+    if not stat.S_ISREG(entry.st_mode):
+        raise IsolationError("the OpenCode executable must be a regular file")
+    if entry.st_uid not in {0, os.geteuid()}:
+        raise IsolationError(
+            "the OpenCode executable must be owned by root (or the dispatcher identity) so the "
+            "dedicated coding identity cannot replace it"
+        )
+    if entry.st_mode & 0o022:
+        raise IsolationError("the OpenCode executable must not be group/world writable")
+    if entry.st_mode & (stat.S_ISUID | stat.S_ISGID):
+        raise IsolationError("the OpenCode executable must not be setuid or setgid")
+    if not _has_execute_bits(entry.st_mode, uid, gid, owner_uid=entry.st_uid, owner_gid=entry.st_gid):
+        raise IsolationError("the OpenCode executable is not executable by the dedicated identity")
+
+    untrusted_roots = [
+        identity.get("home"),
+        identity.get("config_home"),
+        identity.get("data_home"),
+        identity.get("cache_home"),
+        identity.get("tmp_dir"),
+        workspace,
+    ]
+    for root in untrusted_roots:
+        if not isinstance(root, str) or not root:
+            continue
+        root_real = os.path.realpath(root)
+        if _is_within(canonical, root_real):
+            raise IsolationError(
+                "the OpenCode executable must not live under the dedicated child's "
+                "HOME, workspace, cache, or temporary directories"
+            )
+    try:
+        _check_trusted_ancestors(canonical, identity, "the OpenCode executable")
+    except WorkspaceSecurityError as exc:
+        raise IsolationError(str(exc)) from exc
+    return canonical
+
+
+def resolve_opencode_binary(
+    identity: Mapping[str, Any],
+    parent_env: Mapping[str, str] | None = None,
+    *,
+    workspace: str | None = None,
+) -> str:
     parent = parent_env or {}
     explicit = _text(parent.get("AGENT_HANDOFF_OPENCODE_BIN"))
     if explicit:
@@ -531,17 +634,12 @@ def resolve_opencode_binary(identity: Mapping[str, Any], parent_env: Mapping[str
         binary = os.path.realpath(explicit)
     else:
         binary = shutil.which("opencode", path=str(identity["child_path"])) or ""
-    if not binary or not os.path.isfile(binary):
+    if not binary:
         raise IsolationError(
             "the OpenCode executable is not available on the dedicated child PATH; "
             "install it in a reviewed location or set an explicit absolute binary path"
         )
-    entry = os.stat(binary)
-    uid = int(identity["uid"])
-    gid = int(identity["gid"])
-    if not _has_execute_bits(entry.st_mode, uid, gid, owner_uid=entry.st_uid, owner_gid=entry.st_gid):
-        raise IsolationError("the OpenCode executable is not executable by the dedicated identity")
-    return binary
+    return _validate_opencode_executable(binary, identity, workspace=workspace)
 
 
 def popen_isolation_kwargs(identity: Mapping[str, Any] | None) -> dict[str, Any]:

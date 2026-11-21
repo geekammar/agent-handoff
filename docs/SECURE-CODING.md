@@ -54,7 +54,8 @@ Not implemented:
         "workspace": "/srv/agent-handoff/work/project-b",
         "execution": {
           "permission_profile": "workspace_write",
-          "allow_write": true
+          "allow_write": true,
+          "isolation": {"enabled": true}
         }
       }
     }
@@ -66,11 +67,13 @@ Resolution rules:
 
 1. A missing project override inherits the global policy exactly.
 2. A project-level `workspace_write` requires an explicit `allow_write: true` in the **same project override**. Inheriting write permission is not enough.
-3. A project-level `read_only` is a safe downgrade and forces `allow_write` to false.
-4. `allow_write: true` with any profile other than `workspace_write` is rejected.
-5. Unknown project execution fields and non-boolean `allow_write` values are rejected.
-6. The effective policy is resolved before the OpenCode adapter is constructed.
-7. Issue text cannot select or change a permission profile, workspace, UID, GID, model, or environment.
+3. Write-capable execution additionally requires effective isolation. A project that resolves to `workspace_write` with `allow_write: true` while isolation is disabled is rejected; the dispatcher never falls back to a root write-capable child.
+4. A project-level `read_only` is a safe downgrade and forces `allow_write` to false.
+5. `allow_write: true` with any profile other than `workspace_write` is rejected.
+6. Unknown project execution fields, unknown project isolation fields, and non-boolean `allow_write`/`isolation.enabled` values are rejected.
+7. `execution.isolation` selection is per project: missing values inherit the global `enabled` default, an explicit `true` opts in, and an explicit `false` opts out (permitted only for read-only projects).
+8. The effective policy is resolved once and used by config validation, the runner, and the OpenCode adapter. The effective isolation is persisted in the dispatch ledger.
+9. Issue text cannot select or change a permission profile, workspace, UID, GID, isolation, model, or environment.
 
 Example:
 
@@ -99,7 +102,7 @@ ProjectA is read-only. ProjectB is write-capable only because both values are ex
 
 ## Dedicated Unix identity
 
-Isolation is configured globally under `dispatch.execution.isolation` and is disabled by default:
+The dedicated identity and workspace-root definition live under `dispatch.execution.isolation`. The global `enabled` value is the legacy default for every project, and each project may override it with `execution.isolation.enabled`. This allows one mixed configuration where legacy read-only projects stay non-isolated while a dedicated project opts into isolated write execution. Isolation is disabled by default:
 
 ```json
 {
@@ -145,7 +148,19 @@ Suggested staging layout:
     agent-handoff/                 # clean Git workspace, owned by agent-handoff-dev
 ```
 
-The runtime home (`$AGENT_HANDOFF_HOME`), `/root`, and protected system directories must not be used as child home or workspace.
+The runtime home (`$AGENT_HANDOFF_HOME`), `/root`, and protected system directories must not be used as child home or workspace. Ancestors ABOVE the dedicated leaf directories (for example `/srv/agent-handoff` and `/srv/agent-handoff/work`) must be root-owned and not group/world writable; only the leaf home/work directories are owned by the child identity.
+
+## OpenCode executable trust
+
+The isolated child must not be able to replace the executable that the privileged dispatcher starts. Before launch, the resolved OpenCode binary must:
+
+- be a regular, non-setuid file;
+- be owned by root (or the dispatcher identity) and not group/world writable;
+- be executable by the dedicated identity;
+- not live under the child's HOME, workspace, cache, or TMPDIR;
+- have root/dispatcher-owned ancestors that are not group/world writable, except for sticky root-owned directories such as `/tmp`.
+
+`shutil.which` is restricted to the reviewed `child_path`. An explicit `AGENT_HANDOFF_OPENCODE_BIN` is accepted only after the same checks. A user-home installation, a workspace-local shim, or a world-writable directory fails closed instead of being executed.
 
 ## Child model authentication
 
@@ -199,8 +214,11 @@ An isolated coding workspace must:
 - exist, be owned by the dedicated UID/GID, and be readable/executable by it;
 - be writable only when the effective project policy is explicitly `workspace_write`;
 - not be group/world writable;
-- contain a Git metadata path owned by the dedicated identity and not a symlink;
+- have trusted ancestors: root/dispatcher-owned and not group/world writable (sticky root-owned directories are allowed);
+- contain a real `.git` directory owned by the dedicated identity, not a symlink, not group/world writable, and not a linked-worktree pointer file;
 - be a clean Git working tree at execution time.
+
+Canonical-path and ownership checks narrow substitution risk, but they do not eliminate TOCTOU races between validation and use. The parent re-validates before each execution, the child is the only non-root writer, and the workspace must be a dedicated disposable path. A complete TOCTOU guarantee is not claimed.
 
 A dirty tree is refused. C1 never resets, cleans, stashes, or overwrites local work. Repository config and hooks are not trusted by the privileged parent: the clean check runs as the dedicated identity with system/global config disabled, `core.fsmonitor` off, `core.hooksPath` disabled, `core.untrackedCache` off, and an empty external excludes file. Repository-local `.gitignore`/`.git/info/exclude` content can still hide intentionally ignored files, which is one reason C2 must use disposable task worktrees.
 
@@ -230,6 +248,8 @@ Isolation adds a preflight before the `RUNNING` transition. Missing identity, mi
 8. Running repository tests or modified build code is a separate risk. C1 does not execute tests; C2 must address it.
 9. Clean Git status proves only that the current tree has no uncommitted/untracked changes. It does not prove that repository content is safe.
 10. Git hooks are disabled for the privileged clean check, but code run later by the child can still be influenced by repository content. Repository-local ignore rules can also hide ignored files from the clean-status check.
+11. Executable and workspace path checks reduce substitution risk but cannot prove the absence of a TOCTOU race. C2 must use disposable worktrees and a reviewed publication path.
+12. Legacy read-only projects that do not opt into isolation keep the pre-C1 parent identity and environment behavior. A write-capable policy without effective isolation is rejected rather than silently executed as root.
 
 ## Staging acceptance (operator-controlled)
 
@@ -240,7 +260,7 @@ Do not perform these steps on production Rabet or Yakfi workspaces. Do not resta
 3. Create the home/XDG directories and workspace-owned layout. Set the auth file mode `600` and owner to the dedicated identity. Do not copy root's auth file.
 4. Provision an independent provider credential with a quota/spend cap. Verify only its owner/mode, never its contents.
 5. Clone a disposable test repository to `/srv/agent-handoff/work/agent-handoff`; confirm a clean tree.
-6. In a **staging** config only, enable `dispatch.execution.isolation` and set the test project to `read_only`. Run:
+6. In a **staging** config only, keep `dispatch.execution.isolation.enabled: false`, define the identity and workspace roots, and opt the disposable project in with `execution.isolation.enabled: true` plus `read_only`. Run:
 
    ```bash
    agent-handoff config validate --json
@@ -249,7 +269,7 @@ Do not perform these steps on production Rabet or Yakfi workspaces. Do not resta
 7. Submit one staging Issue. Verify from the host that the OpenCode child has the dedicated UID/GID, no supplementary groups, the dedicated HOME/XDG values, no parent secrets, and no root auth access.
 8. Verify the read-only probe denies a requested file write. Verify report capture, MD5/read-back upload, receipt, and Issue publication are unchanged.
 9. Test dirty-tree refusal by adding an untracked file to the disposable workspace; the task must become `NEEDS_ATTENTION` with no OpenCode run, and the file must remain.
-10. Only then test `workspace_write` on the disposable repository with an explicit project override and `allow_write: true`.
+10. Only then test `workspace_write` on the disposable repository with an explicit project override, `allow_write: true`, and `execution.isolation.enabled: true`.
 11. Revert staging configuration or leave it isolated; do not enable production coding until C2 is accepted.
 
 A live staging run is not proof of C2 automation. If a step cannot be performed safely, record it as `Not verified`.

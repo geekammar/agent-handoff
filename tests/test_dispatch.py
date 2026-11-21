@@ -1373,25 +1373,16 @@ class DispatchSecretEnvironmentTests(unittest.TestCase):
         self.assertEqual(json.loads(calls[0]["config_content"]), READ_ONLY_POLICY)
         self.assertEqual(self.h.record(1)["status"], "ISSUE_UPDATED")
 
-    def test_workspace_write_dispatch_filters_token_and_keeps_existing_execution(self) -> None:
-        from agent_handoff.dispatch.adapters.opencode import WORKSPACE_WRITE_POLICY
-
+    def test_workspace_write_without_isolation_is_refused(self) -> None:
         self.h.config["dispatch"]["execution"]["permission_profile"] = "workspace_write"
         self.h.config["dispatch"]["execution"]["allow_write"] = True
         self.h.write_config()
         self.h.add_issue(number=1, body=request_body())
-        result = self.h.dispatch(
-            extra_env=self.probe(DEFAULT_TOKEN_ENV, **{DEFAULT_TOKEN_ENV: SYNTHETIC_TELEGRAM_TOKEN})
-        )
-        self.assertTrue(result["ok"], result)
-        self.assertEqual(result["executed"], 1)
-        self.assertEqual(result["published"], 1)
-        calls = self.h.opencode_calls()
-        self.assertEqual(len(calls), 1)
-        self.assertFalse(calls[0]["env_present"][DEFAULT_TOKEN_ENV])
-        self.assertEqual(calls[0]["agent"], "build")
-        self.assertEqual(json.loads(calls[0]["config_content"]), WORKSPACE_WRITE_POLICY)
-        self.assertEqual(self.h.record(1)["status"], "ISSUE_UPDATED")
+        result = self.h.run(["dispatch", "run", "--once", "--json"], check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("write-capable root execution is refused", result.stderr)
+        self.assertEqual(self.h.opencode_calls(), [])
+        self.assertEqual(Ledger(self.h.config).all(), [])
 
     def test_no_notification_configuration_keeps_v11_dispatch_working_and_filters_token(self) -> None:
         self.assertNotIn("notifications", self.h.config)

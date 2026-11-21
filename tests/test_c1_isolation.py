@@ -30,10 +30,13 @@ from agent_handoff.dispatch.adapters.opencode import (  # noqa: E402
 from agent_handoff.dispatch.config import (  # noqa: E402
     _parse_isolation,
     _resolve_project_execution,
+    resolve_effective_isolation,
     resolve_model,
     validate_dispatch_config,
 )
+from agent_handoff.dispatch.ledger import new_dispatch_record  # noqa: E402
 from agent_handoff.dispatch.requests import RequestError, parse_issue_request  # noqa: E402
+from agent_handoff.dispatch.runner import DispatchRunner  # noqa: E402
 from agent_handoff.dispatch.security import (  # noqa: E402
     DEFAULT_CHILD_PATH,
     IdentityError,
@@ -43,6 +46,7 @@ from agent_handoff.dispatch.security import (  # noqa: E402
     check_clean_git_workspace,
     popen_isolation_kwargs,
     resolve_child_identity,
+    resolve_opencode_binary,
     validate_model_auth,
     validate_workspace_filesystem,
     validate_workspace_path,
@@ -105,6 +109,63 @@ def isolation_config(harness: Harness, *, roots: list[str] | None = None) -> dic
             "home": "/srv/agent-handoff/home/agent-handoff-dev",
         },
         "workspace_roots": roots or [str(harness.workspace)],
+        "child_path": DEFAULT_CHILD_PATH,
+    }
+    return config
+
+
+def _register_project(config: dict, harness: Harness, name: str, path: Path) -> None:
+    config["projects"][name.lower()] = {
+        "name": name,
+        "drive_folder_id": f"{name.lower()}_folder_0001",
+        "paths": [str(path)],
+        "path_prefixes": [],
+        "aliases": [name.lower()],
+        "auto_registered": False,
+    }
+    harness.drive.joinpath(f"{name.lower()}_folder_0001").mkdir(parents=True, exist_ok=True)
+
+
+def mixed_project_config(
+    harness: Harness,
+    *,
+    global_isolation_enabled: bool = False,
+    legacy_isolation_opt_out: bool = False,
+) -> dict:
+    """Rabet/Yakfi stay legacy read_only; AgentHandoff opts into isolated write."""
+
+    config = copy.deepcopy(harness.config)
+    config["dispatch"]["execution"]["permission_profile"] = "read_only"
+    config["dispatch"]["execution"]["allow_write"] = False
+    config["dispatch"]["projects"] = {}
+    for name in ("Rabet", "Yakfi"):
+        path = harness.workspace / name.lower()
+        path.mkdir(parents=True, exist_ok=True)
+        _register_project(config, harness, name, path)
+        entry: dict = {"workspace": str(path)}
+        if legacy_isolation_opt_out:
+            entry["execution"] = {"isolation": {"enabled": False}}
+        config["dispatch"]["projects"][name] = entry
+    agent_path = harness.workspace / "agent-handoff"
+    agent_path.mkdir(parents=True, exist_ok=True)
+    _register_project(config, harness, "AgentHandoff", agent_path)
+    config["dispatch"]["projects"]["AgentHandoff"] = {
+        "workspace": str(agent_path),
+        "execution": {
+            "permission_profile": "workspace_write",
+            "allow_write": True,
+            "isolation": {"enabled": True},
+        },
+    }
+    config["dispatch"]["execution"]["isolation"] = {
+        "enabled": global_isolation_enabled,
+        "environment": "allowlist",
+        "identity": {
+            "user": "agent-handoff-dev",
+            "group": "agent-handoff-dev",
+            "home": "/srv/agent-handoff/home/agent-handoff-dev",
+        },
+        "workspace_roots": [str(harness.workspace)],
         "child_path": DEFAULT_CHILD_PATH,
     }
     return config
@@ -184,27 +245,63 @@ class C1ConfigTests(unittest.TestCase):
         self.assertEqual(adapter._command(read_only_request)[4], "plan")
 
     def test_t04_valid_project_specific_write_policy_executes_per_project(self) -> None:
-        self.h.config["dispatch"]["projects"]["Alpha"]["execution"] = {
-            "permission_profile": "workspace_write",
-            "allow_write": True,
-        }
-        self.h.write_config()
-        self.h.add_issue(number=1, body=request_body(project="Alpha"))
-        self.h.add_issue(number=2, body=request_body(project="Beta"))
-        result = self.h.dispatch()
-        self.assertTrue(result["ok"], result)
-        self.assertEqual(result["executed"], 2)
-        calls = self.h.opencode_calls()
-        self.assertEqual(len(calls), 2)
-        by_cwd = {call["cwd"]: call for call in calls}
-        alpha = by_cwd[str(self.h.project_path.resolve())]
-        beta = by_cwd[str(self.h.beta_path.resolve())]
-        self.assertEqual(alpha["agent"], "build")
-        self.assertEqual(json.loads(alpha["config_content"]), WORKSPACE_WRITE_POLICY)
-        self.assertEqual(beta["agent"], "plan")
-        self.assertEqual(json.loads(beta["config_content"]), READ_ONLY_POLICY)
-        self.assertEqual(self.h.record(1)["project"]["execution"]["permission_profile"], "workspace_write")
-        self.assertEqual(self.h.record(2)["project"]["execution"]["permission_profile"], "read_only")
+        config = mixed_project_config(self.h)
+        patches = identity_patches()
+        with patches[0], patches[1], patches[2], patches[3]:
+            resolved, errors, _warnings = validate_dispatch_config(config, check_paths=False)
+        self.assertEqual(errors, [])
+        runner = DispatchRunner.__new__(DispatchRunner)
+        runner.config = config
+        runner.dispatch = resolved
+        agent_execution = runner._effective_execution(resolved["projects"]["AgentHandoff"])
+        legacy_execution = runner._effective_execution(resolved["projects"]["Rabet"])
+        self.assertEqual(agent_execution["permission_profile"], "workspace_write")
+        self.assertTrue(agent_execution["allow_write"])
+        self.assertTrue(agent_execution["isolation"]["enabled"])
+        self.assertEqual(agent_execution["isolation"]["identity"]["uid"], UID)
+        self.assertEqual(legacy_execution["permission_profile"], "read_only")
+        self.assertFalse(legacy_execution["allow_write"])
+        self.assertFalse(legacy_execution["isolation"]["enabled"])
+        agent_adapter = runner._adapter_for(agent_execution)
+        legacy_adapter = runner._adapter_for(legacy_execution)
+        self.assertEqual(agent_adapter.identity["uid"], UID)
+        self.assertIsNone(legacy_adapter.identity)
+        request = ExecutionRequest(
+            model="provider/model-fast",
+            workspace=str(self.h.workspace / "agent-handoff"),
+            title="Policy",
+            instructions="Policy marker.",
+            permission_profile="workspace_write",
+            allow_write=True,
+            timeout_seconds=30,
+        )
+        with mock.patch.dict(os.environ, {"AGENT_HANDOFF_OPENCODE_BIN": sys.executable}, clear=False):
+            self.assertEqual(agent_adapter._command(request)[4], "build")
+            request = ExecutionRequest(
+                model="provider/model-fast",
+                workspace=str(self.h.workspace / "rabet"),
+                title="Policy",
+                instructions="Policy marker.",
+                permission_profile="read_only",
+                allow_write=False,
+                timeout_seconds=30,
+            )
+            self.assertEqual(legacy_adapter._command(request)[4], "plan")
+
+        record = new_dispatch_record(
+            repository="dev/private-dispatch",
+            issue={"number": 10, "html_url": "https://github.test/dev/private-dispatch/issues/10"},
+            project=resolved["projects"]["AgentHandoff"],
+            agent="opencode",
+            model="provider/model-fast",
+            request={"instructions": "Policy marker."},
+        )
+        self.assertEqual(record["project"]["execution"]["permission_profile"], "workspace_write")
+        self.assertTrue(record["project"]["execution"]["isolation"]["enabled"])
+        state = runner._isolation_ledger_state(agent_execution)
+        self.assertTrue(state["enabled"])
+        self.assertEqual(state["identity_user"], "agent-handoff-dev")
+        self.assertEqual(state["workspace_roots"], [str(self.h.workspace.resolve())])
 
     def test_t05_invalid_project_profile_is_rejected(self) -> None:
         errors: list[str] = []
@@ -255,7 +352,16 @@ class C1ConfigTests(unittest.TestCase):
         )
         with self.assertRaises(RequestError):
             parse_issue_request(body)
-        for field in ("uid", "gid", "allow_write", "workspace", "isolation"):
+        for field in (
+            "uid",
+            "gid",
+            "allow_write",
+            "workspace",
+            "isolation",
+            "isolation_enabled",
+            "execution",
+            "identity",
+        ):
             bad = body.replace("permission_profile: workspace_write", f"{field}: value")
             with self.assertRaises(RequestError):
                 parse_issue_request(bad)
@@ -330,6 +436,84 @@ class C1ConfigTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertNotIn("isolation", minimal["dispatch"]["execution"] if "execution" in minimal["dispatch"] else {})
         self.assertFalse(resolved["execution"]["isolation"]["enabled"])
+
+    def test_t31_mixed_project_isolation_opt_in_keeps_legacy_projects_read_only(self) -> None:
+        config = mixed_project_config(self.h)
+        patches = identity_patches()
+        with patches[0], patches[1], patches[2], patches[3]:
+            resolved, errors, _warnings = validate_dispatch_config(config, check_paths=False)
+        self.assertEqual(errors, [])
+        self.assertFalse(resolved["execution"]["isolation"]["enabled"])
+        for name in ("Rabet", "Yakfi"):
+            policy = resolved["projects"][name]["execution"]
+            self.assertEqual(policy["permission_profile"], "read_only")
+            self.assertFalse(policy["allow_write"])
+            self.assertFalse(policy["isolation"]["enabled"])
+        agent = resolved["projects"]["AgentHandoff"]["execution"]
+        self.assertEqual(agent["permission_profile"], "workspace_write")
+        self.assertTrue(agent["allow_write"])
+        self.assertTrue(agent["isolation"]["enabled"])
+        effective = resolve_effective_isolation(resolved["execution"]["isolation"], agent)
+        self.assertTrue(effective["enabled"])
+        self.assertEqual(effective["identity"]["uid"], UID)
+        legacy_effective = resolve_effective_isolation(
+            resolved["execution"]["isolation"], resolved["projects"]["Rabet"]["execution"]
+        )
+        self.assertFalse(legacy_effective["enabled"])
+        self.assertIsNone(legacy_effective["identity"])
+
+    def test_t32_legacy_global_isolation_still_applies_to_every_project(self) -> None:
+        config = isolation_config(self.h)
+        patches = identity_patches()
+        with patches[0], patches[1], patches[2], patches[3]:
+            resolved, errors, _warnings = validate_dispatch_config(config, check_paths=False)
+        self.assertEqual(errors, [])
+        for name in ("Alpha", "Beta"):
+            self.assertTrue(resolved["projects"][name]["execution"]["isolation"]["enabled"], name)
+
+    def test_t33_explicit_project_isolation_opt_out_is_preserved(self) -> None:
+        config = mixed_project_config(self.h, global_isolation_enabled=True, legacy_isolation_opt_out=True)
+        patches = identity_patches()
+        with patches[0], patches[1], patches[2], patches[3]:
+            resolved, errors, _warnings = validate_dispatch_config(config, check_paths=False)
+        self.assertEqual(errors, [])
+        for name in ("Rabet", "Yakfi"):
+            policy = resolved["projects"][name]["execution"]
+            self.assertEqual(policy["permission_profile"], "read_only")
+            self.assertFalse(policy["isolation"]["enabled"])
+        self.assertTrue(resolved["projects"]["AgentHandoff"]["execution"]["isolation"]["enabled"])
+
+    def test_t34_malformed_project_isolation_override_is_rejected(self) -> None:
+        cases = (
+            {"isolation": True},
+            {"isolation": {"enabled": "yes"}},
+            {"isolation": {"enabled": True, "uid": 0}},
+            {"isolation": {"identity": {"user": "root"}}},
+        )
+        for case in cases:
+            config = mixed_project_config(self.h)
+            config["dispatch"]["projects"]["AgentHandoff"]["execution"].update(case)
+            patches = identity_patches()
+            with patches[0], patches[1], patches[2], patches[3]:
+                _resolved, errors, _warnings = validate_dispatch_config(config, check_paths=False)
+            self.assertTrue(any("isolation" in item for item in errors), (case, errors))
+
+    def test_t35_write_without_project_isolation_is_rejected(self) -> None:
+        config = mixed_project_config(self.h)
+        config["dispatch"]["projects"]["AgentHandoff"]["execution"].pop("isolation")
+        patches = identity_patches()
+        with patches[0], patches[1], patches[2], patches[3]:
+            _resolved, errors, _warnings = validate_dispatch_config(config, check_paths=False)
+        self.assertTrue(any("write-capable root execution is refused" in item for item in errors), errors)
+
+    def test_t36_project_isolation_without_identity_fails_closed(self) -> None:
+        config = mixed_project_config(self.h)
+        config["dispatch"]["execution"]["isolation"].pop("identity")
+        patches = identity_patches()
+        with patches[0], patches[1], patches[2], patches[3]:
+            resolved, errors, _warnings = validate_dispatch_config(config, check_paths=False)
+        self.assertTrue(any("identity must be an object" in item for item in errors), errors)
+        self.assertNotIn("AgentHandoff", resolved["projects"])
 
 
 class C1IdentityAndEnvironmentTests(unittest.TestCase):
@@ -564,6 +748,38 @@ class C1WorkspaceSafetyTests(unittest.TestCase):
                 check_paths=False,
             )
 
+    def test_t37_writable_workspace_ancestor_and_git_metadata_are_rejected(self) -> None:
+        identity = fake_identity(uid=os.getuid(), gid=os.getgid())
+        unsafe_parent = self.root / "unsafe"
+        unsafe_parent.mkdir()
+        workspace = unsafe_parent / "repo"
+        workspace.mkdir()
+        (workspace / ".git").mkdir()
+        os.chmod(unsafe_parent, 0o777)
+        with self.assertRaises(WorkspaceSecurityError) as ancestor_error:
+            validate_workspace_filesystem(
+                str(workspace), identity, require_write=False, require_clean=False
+            )
+        self.assertIn("ancestor", str(ancestor_error.exception))
+        os.chmod(unsafe_parent, 0o755)
+        validate_workspace_filesystem(str(workspace), identity, require_write=False, require_clean=False)
+
+        os.chmod(workspace / ".git", 0o775)
+        with self.assertRaises(WorkspaceSecurityError) as git_mode_error:
+            validate_workspace_filesystem(
+                str(workspace), identity, require_write=False, require_clean=False
+            )
+        self.assertIn("Git metadata", str(git_mode_error.exception))
+        os.chmod(workspace / ".git", 0o755)
+
+        (workspace / ".git").rmdir()
+        (workspace / ".git").write_text("gitdir: /tmp/elsewhere\n", encoding="utf-8")
+        with self.assertRaises(WorkspaceSecurityError) as git_file_error:
+            validate_workspace_filesystem(
+                str(workspace), identity, require_write=False, require_clean=False
+            )
+        self.assertIn(".git directory", str(git_file_error.exception))
+
     def _git(self, *args: str) -> None:
         subprocess.run(
             ["git", *args],
@@ -573,6 +789,83 @@ class C1WorkspaceSafetyTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             text=True,
         )
+
+
+class C1ExecutableTrustTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        os.chmod(self.root, 0o755)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _binary(self, directory: Path, *, mode: int = 0o755) -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        binary = directory / "opencode"
+        binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        os.chmod(binary, mode)
+        return binary
+
+    def test_t38_root_owned_executable_in_trusted_path_is_accepted(self) -> None:
+        binary = self._binary(self.root / "bin")
+        identity = fake_identity()
+        resolved = resolve_opencode_binary(
+            identity,
+            {"AGENT_HANDOFF_OPENCODE_BIN": str(binary)},
+            workspace=str(self.root / "work"),
+        )
+        self.assertEqual(resolved, os.path.realpath(binary))
+
+    def test_t39_group_or_world_writable_executable_is_rejected(self) -> None:
+        for mode in (0o775, 0o757, 0o777):
+            directory = self.root / f"mode-{mode:o}"
+            binary = self._binary(directory, mode=mode)
+            with self.assertRaises(IsolationError):
+                resolve_opencode_binary(
+                    fake_identity(), {"AGENT_HANDOFF_OPENCODE_BIN": str(binary)}
+                )
+
+    def test_t40_writable_non_sticky_parent_is_rejected(self) -> None:
+        parent = self.root / "unsafe-parent"
+        binary = self._binary(parent)
+        os.chmod(parent, 0o777)
+        with self.assertRaises(IsolationError) as error:
+            resolve_opencode_binary(fake_identity(), {"AGENT_HANDOFF_OPENCODE_BIN": str(binary)})
+        self.assertIn("ancestor", str(error.exception))
+
+    def test_t41_executable_under_child_home_workspace_cache_or_tmp_is_rejected(self) -> None:
+        home = self.root / "child-home"
+        identity = fake_identity(home=str(home))
+        for label in ("home", "config_home", "data_home", "cache_home", "tmp_dir"):
+            directory = Path(identity[label]) / "bin"
+            binary = self._binary(directory)
+            with self.assertRaises(IsolationError) as error:
+                resolve_opencode_binary(identity, {"AGENT_HANDOFF_OPENCODE_BIN": str(binary)})
+            self.assertIn("HOME, workspace, cache", str(error.exception), label)
+        workspace = self.root / "workspace"
+        binary = self._binary(workspace / "bin")
+        with self.assertRaises(IsolationError):
+            resolve_opencode_binary(
+                identity, {"AGENT_HANDOFF_OPENCODE_BIN": str(binary)}, workspace=str(workspace)
+            )
+
+    def test_t42_child_owned_executable_or_ancestor_is_rejected(self) -> None:
+        if os.geteuid() != 0:
+            self.skipTest("requires root to create a foreign-owned executable")
+        binary = self._binary(self.root / "child-owned")
+        os.chown(binary, UID, GID)
+        with self.assertRaises(IsolationError) as owner_error:
+            resolve_opencode_binary(fake_identity(), {"AGENT_HANDOFF_OPENCODE_BIN": str(binary)})
+        self.assertIn("owned", str(owner_error.exception))
+
+        parent = self.root / "foreign-parent"
+        trusted = self._binary(parent)
+        os.chown(parent, UID, GID)
+        os.chown(trusted, 0, 0)
+        with self.assertRaises(IsolationError) as ancestor_error:
+            resolve_opencode_binary(fake_identity(), {"AGENT_HANDOFF_OPENCODE_BIN": str(trusted)})
+        self.assertIn("ancestor", str(ancestor_error.exception))
 
 
 def shutil_which(name: str) -> str | None:
@@ -809,6 +1102,199 @@ class C1ProcessLifecycleTests(unittest.TestCase):
             time.sleep(0.05)
         else:
             self.fail(f"OpenCode child process {pid} survived the execution timeout")
+
+
+class C1MixedProjectDispatchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        os.chmod(self.root, 0o755)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_t43_mixed_projects_use_legacy_read_only_and_isolated_write(self) -> None:
+        import pwd
+        import shutil
+
+        if os.geteuid() != 0:
+            self.skipTest("requires root to prove the mixed isolated child identity")
+        if not shutil.which("git"):
+            self.skipTest("git is not available")
+        try:
+            nobody = pwd.getpwnam("nobody")
+        except KeyError:
+            self.skipTest("no unprivileged nobody account available")
+
+        h = DispatchHarness(self.root)
+        config = copy.deepcopy(h.config)
+        config["dispatch"]["projects"] = {}
+        legacy_root = self.root / "legacy"
+        legacy_root.mkdir()
+        os.chmod(legacy_root, 0o755)
+        for name in ("Rabet", "Yakfi"):
+            path = legacy_root / name.lower()
+            path.mkdir()
+            config["projects"][name.lower()] = {
+                "name": name,
+                "drive_folder_id": f"{name.lower()}_folder_0001",
+                "paths": [str(path)],
+                "path_prefixes": [],
+                "aliases": [name.lower()],
+                "auto_registered": False,
+            }
+            h.drive.joinpath(f"{name.lower()}_folder_0001").mkdir(parents=True, exist_ok=True)
+            config["dispatch"]["projects"][name] = {"workspace": str(path)}
+
+        work_root = self.root / "srv-work"
+        work_root.mkdir()
+        os.chmod(work_root, 0o755)
+        workspace = work_root / "agent-handoff"
+        workspace.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "initial",
+            ],
+            cwd=workspace,
+            check=True,
+        )
+        config["projects"]["agenthandoff"] = {
+            "name": "AgentHandoff",
+            "drive_folder_id": "agenthandoff_folder_0001",
+            "paths": [str(workspace)],
+            "path_prefixes": [],
+            "aliases": ["agenthandoff"],
+            "auto_registered": False,
+        }
+        h.drive.joinpath("agenthandoff_folder_0001").mkdir(parents=True, exist_ok=True)
+        children_path = h.drive / h.drive_root_id() / ".children.json"
+        children = json.loads(children_path.read_text(encoding="utf-8"))
+        children.update(
+            {
+                "Rabet": "rabet_folder_0001",
+                "Yakfi": "yakfi_folder_0001",
+                "AgentHandoff": "agenthandoff_folder_0001",
+            }
+        )
+        children_path.write_text(json.dumps(children), encoding="utf-8")
+        config["dispatch"]["projects"]["AgentHandoff"] = {
+            "workspace": str(workspace),
+            "execution": {
+                "permission_profile": "workspace_write",
+                "allow_write": True,
+                "isolation": {"enabled": True},
+            },
+        }
+
+        home = self.root / "child-home"
+        child_dirs = (
+            home,
+            home / ".config",
+            home / ".local",
+            home / ".local" / "share",
+            home / ".local" / "share" / "opencode",
+            home / ".cache",
+            home / "tmp",
+        )
+        for directory in child_dirs:
+            directory.mkdir(parents=True, exist_ok=True)
+            os.chown(directory, nobody.pw_uid, nobody.pw_gid)
+        os.chmod(home, 0o700)
+        os.chmod(home / "tmp", 0o700)
+        for directory in child_dirs[1:]:
+            os.chmod(directory, 0o755)
+        auth = home / ".local" / "share" / "opencode" / "auth.json"
+        auth.write_text('{"synthetic": {"type": "test"}}\n', encoding="utf-8")
+        os.chown(auth, nobody.pw_uid, nobody.pw_gid)
+        os.chmod(auth, 0o600)
+        for directory in (workspace, workspace / ".git"):
+            for current_root, dirnames, filenames in os.walk(directory):
+                os.chown(current_root, nobody.pw_uid, nobody.pw_gid)
+                for filename in filenames:
+                    os.chown(Path(current_root) / filename, nobody.pw_uid, nobody.pw_gid)
+
+        fake_source = (ROOT / "tests" / "fake-opencode").read_text(encoding="utf-8")
+        fake_source = fake_source.replace('"/tmp/fake-opencode"', json.dumps(str(h.opencode_dir)))
+        fake_source = fake_source.replace(
+            '"pid": os.getpid(),',
+            '"pid": os.getpid(),\n            "uid": os.getuid(),\n'
+            '            "gid": os.getgid(),\n            "groups": os.getgroups(),\n'
+            '            "HOME": os.environ.get("HOME"),\n'
+            '            "GH_TOKEN_present": "GH_TOKEN" in os.environ,\n',
+        )
+        fake = h.fake_bin / "opencode"
+        fake.write_text(fake_source, encoding="utf-8")
+        os.chmod(fake, 0o755)
+        os.chown(fake, 0, 0)
+        os.chown(h.opencode_dir, nobody.pw_uid, nobody.pw_gid)
+        os.chmod(h.opencode_dir, 0o755)
+        calls_log = h.opencode_dir / "calls.jsonl"
+        calls_log.write_text("", encoding="utf-8")
+        os.chown(calls_log, nobody.pw_uid, nobody.pw_gid)
+        os.chmod(calls_log, 0o666)
+
+        config["dispatch"]["execution"]["isolation"] = {
+            "enabled": False,
+            "environment": "allowlist",
+            "identity": {"user": "nobody", "home": str(home)},
+            "workspace_roots": [str(work_root)],
+            "denied_projects": ["Rabet", "Yakfi"],
+            "child_path": f"{h.fake_bin}:/usr/local/bin:/usr/bin:/bin",
+        }
+        h.config = config
+        h.write_config()
+        h.add_issue(number=1, body=request_body(project="Rabet"))
+        h.add_issue(number=2, body=request_body(project="Yakfi"))
+        h.add_issue(number=3, body=request_body(project="AgentHandoff"))
+        result = h.dispatch(extra_env={"AGENT_HANDOFF_OPENCODE_BIN": str(fake)})
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["executed"], 3, result)
+        self.assertEqual(result["needs_attention"], 0, result)
+        self.assertEqual(result["uploaded"], 3, result)
+        self.assertEqual(result["published"], 3, result)
+
+        calls = {call["cwd"]: call for call in h.opencode_calls()}
+        self.assertIn(str(workspace.resolve()), calls, h.record(3))
+        rabet = calls[str((legacy_root / "rabet").resolve())]
+        yakfi = calls[str((legacy_root / "yakfi").resolve())]
+        agent = calls[str(workspace.resolve())]
+        for legacy in (rabet, yakfi):
+            self.assertEqual(legacy["agent"], "plan")
+            self.assertEqual(json.loads(legacy["config_content"]), READ_ONLY_POLICY)
+            self.assertEqual(legacy["uid"], 0)
+        self.assertEqual(agent["agent"], "build")
+        self.assertEqual(json.loads(agent["config_content"]), WORKSPACE_WRITE_POLICY)
+        self.assertEqual(agent["uid"], int(nobody.pw_uid))
+        self.assertEqual(agent["gid"], int(nobody.pw_gid))
+        self.assertEqual(agent["groups"], [])
+        self.assertEqual(agent["HOME"], str(home))
+        self.assertFalse(agent["GH_TOKEN_present"])
+
+        for number in (1, 2):
+            record = h.record(number)
+            self.assertEqual(record["status"], "ISSUE_UPDATED")
+            self.assertFalse(record["execution"]["isolation"]["enabled"])
+            self.assertIsNone(record["execution"]["isolation"]["identity_user"])
+        agent_record = h.record(3)
+        self.assertEqual(agent_record["status"], "ISSUE_UPDATED")
+        self.assertTrue(agent_record["execution"]["isolation"]["enabled"])
+        self.assertEqual(agent_record["execution"]["isolation"]["identity_user"], "nobody")
+        self.assertEqual(
+            agent_record["execution"]["isolation"]["workspace_roots"],
+            [str(work_root.resolve())],
+        )
+        self.assertEqual(agent_record["project"]["execution"]["permission_profile"], "workspace_write")
+        self.assertTrue(agent_record["project"]["execution"]["isolation"]["enabled"])
 
 
 if __name__ == "__main__":

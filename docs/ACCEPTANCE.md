@@ -154,19 +154,23 @@ sh -n setup/install.sh setup/upgrade.sh setup/rollback.sh setup/gdrive-auth.sh
 PYTHONPATH=lib python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-Deterministic result: **126 tests passed, 0 failed**. This run used fake GitHub, fake OpenCode, and fake rclone. It does not prove a live dedicated Unix account, provider credential, or production coding path.
+Deterministic result: **139 tests passed, 0 failed**. The focused C1 module ran **37 tests, 0 failed**. This run used fake GitHub, fake OpenCode, and fake rclone. It does not prove a live dedicated Unix account, provider credential, or production coding path.
 
 C1 focused coverage (`tests/test_c1_isolation.py`):
 
 - legacy config and Rabet/Yakfi-style read-only inheritance remain unchanged;
+- mixed configuration: Rabet and Yakfi stay legacy read-only while AgentHandoff opts into isolated `workspace_write`;
+- legacy global `isolation.enabled: true` still isolates every project, and an explicit per-project `false` opt-out is preserved for read-only projects;
 - valid per-project write policy and explicit authorization checks;
-- Issue metadata cannot change policy, UID/GID, workspace, or model allowlist;
-- missing user, root identity, privileged supplementary groups, and wrong workspace ownership fail closed;
+- write-capable policy without effective isolation is rejected instead of running as root;
+- malformed project isolation overrides and missing dedicated identity fail closed;
+- Issue metadata cannot change policy, UID/GID, isolation, workspace, or model allowlist;
 - child environment excludes parent Telegram/GitHub/rclone/runtime secrets while the parent keeps them;
 - dedicated HOME/XDG/TMPDIR and child-owned model auth are required; root auth is never inherited;
-- canonical path, symlink escape, protected path, denied project, and dirty-tree refusal without resetting work;
+- canonical path, symlink escape, protected path, denied project, writable ancestor, unsafe Git metadata, and dirty-tree refusal without resetting work;
+- trusted versus untrusted OpenCode executable paths, including child-owned, group/world-writable, and child-HOME/workspace/cache/TMPDIR locations;
 - timeout, progress heartbeat, and no-orphan process cleanup;
 - real Python child UID/GID drop with empty supplementary groups and a denied root-only secret read when the test runs as root with an unprivileged account available;
-- real adapter launch under `nobody`: dedicated UID/GID, empty supplementary groups, dedicated HOME/XDG, no parent GitHub/Telegram secrets, and the read-only plan policy. These OS-level proofs were **skipped** on non-root CI runners because dropping to another UID requires root.
+- real mixed-project dispatcher run under `nobody`: Rabet/Yakfi execute legacy read-only as root while AgentHandoff executes isolated `workspace_write` with the dedicated UID/GID, empty supplementary groups, dedicated HOME, no parent GitHub token, and effective isolation persisted in the ledger. These OS-level proofs were **skipped** on non-root CI runners because dropping to another UID requires root.
 
 Live staging acceptance of an actual isolated OpenCode coding task was **not performed** in this change. It requires a separately approved Unix account, provider credential, and disposable workspace. Production Rabet/Yakfi remain `read_only`, production isolation remains disabled, and the production service was not restarted.

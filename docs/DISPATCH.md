@@ -19,7 +19,7 @@ Implemented:
 - Upload verification plus a direct Drive file URL and `UPLOAD-RECEIPT.json`.
 - Idempotent issue publication.
 - Optional durable Telegram notifications after verified delivery, with bounded retries and a copy-ready Arabic ChatGPT prompt.
-- Opt-in C1 isolation foundation for future coding tasks: per-project policy, dedicated Unix identity, allowlisted child environment, dedicated model auth, and workspace validation.
+- Opt-in C1 isolation foundation for future coding tasks: project-scoped selection, per-project policy, dedicated Unix identity, allowlisted child environment, dedicated model auth, executable trust, and workspace validation.
 
 Not implemented:
 
@@ -39,7 +39,7 @@ Not implemented:
 3. The Issue body is untrusted data. It can select only a configured project alias and model alias.
 4. Paths, commands, tokens, and arbitrary model IDs are never accepted from Issue content.
 5. The execution workspace must exactly match a path recorded for the Agent Handoff project.
-6. Read-only execution is the default. Write mode requires both `permission_profile: workspace_write` and `allow_write: true`.
+6. Read-only execution is the default. Write mode requires both `permission_profile: workspace_write` and `allow_write: true`, plus effective project isolation with a validated non-root identity.
 7. A request is claimed before execution and is never automatically executed again after a crash or restart.
 
 ## Configuration
@@ -118,7 +118,8 @@ Fields:
 | `execution.allow_write` | Must be explicitly true with `workspace_write`. Must be a JSON boolean. |
 | `projects.<name>.execution.permission_profile` | Optional per-project `read_only` or `workspace_write`. Missing fields inherit the global policy. |
 | `projects.<name>.execution.allow_write` | A project-level `workspace_write` requires explicit `true` in the same project override. |
-| `execution.isolation.enabled` | `false` by default. When true, the child runs as the dedicated non-root identity with an allowlisted environment and validated workspace. |
+| `projects.<name>.execution.isolation.enabled` | Optional boolean. Missing values inherit `execution.isolation.enabled`. Write-capable projects must resolve to `true`; there is no root-write fallback. Unknown fields inside this override are rejected. |
+| `execution.isolation.enabled` | Legacy default for every project, `false` by default. When true, all projects are isolated unless a project explicitly sets `execution.isolation.enabled: false`. When false, only explicit project opt-ins are isolated. |
 | `execution.isolation.identity` | `user`, optional primary `group`, and dedicated `home`. No root or privileged group membership. |
 | `execution.isolation.workspace_roots` | Safe canonical roots; isolated workspaces must be inside one of them. |
 | `execution.isolation.denied_projects` | Additional denied project names. `Rabet` and `Yakfi` are always denied in isolated mode. |
@@ -136,6 +137,37 @@ Fields:
 | `notifications.telegram.delayed_after_attempts` | Upload/publication failure threshold before one low-noise `DELIVERY_DELAYED` message per task/run. Default `3`. |
 
 `config validate` reports disabled notifications as valid without requiring a token or chat id. Enabled notifications require both and fail with an actionable message that never contains the token value. Disabled notifications never create a Telegram transport and never make an outbound request. Restart a running dispatcher service after changing notification configuration; the service reads it at startup.
+
+Mixed project isolation is supported without a second dispatcher and without changing legacy projects. The global identity/workspace-root block is shared; each project selects whether it uses it:
+
+```json
+{
+  "dispatch": {
+    "execution": {
+      "isolation": {
+        "enabled": false,
+        "identity": {"user": "agent-handoff-dev", "home": "/srv/agent-handoff/home/agent-handoff-dev"},
+        "workspace_roots": ["/srv/agent-handoff/work"],
+        "denied_projects": ["Rabet", "Yakfi"]
+      }
+    },
+    "projects": {
+      "Rabet": {"workspace": "/home/dev/projects/rabet"},
+      "Yakfi": {"workspace": "/home/dev/projects/yakfi"},
+      "AgentHandoff": {
+        "workspace": "/srv/agent-handoff/work/agent-handoff",
+        "execution": {
+          "permission_profile": "workspace_write",
+          "allow_write": true,
+          "isolation": {"enabled": true}
+        }
+      }
+    }
+  }
+}
+```
+
+Rabet and Yakfi inherit legacy `read_only` without isolation. AgentHandoff is the only isolated write-capable project. Issue text cannot select, enable, or disable isolation. The resolved effective isolation is written to the dispatch ledger; a missing identity, an invalid override, or a write policy without isolation is rejected rather than falling back to root.
 
 Discover exact OpenCode model IDs:
 
