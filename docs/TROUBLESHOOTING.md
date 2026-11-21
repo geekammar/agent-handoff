@@ -284,7 +284,9 @@ Common causes:
 - A dispatch project is not present in the core `projects` mapping.
 - A dispatch workspace does not exactly match one of that project's recorded paths.
 - A model alias is missing from `dispatch.models`.
-- `workspace_write` was selected without `allow_write: true`, or `allow_write` was enabled with `read_only`.
+- `workspace_write` was selected without `allow_write: true`, or `allow_write` was enabled with `read_only`;
+- a project-level `workspace_write` omitted its own explicit `allow_write: true`;
+- an unknown execution/isolation field or a non-boolean `allow_write` was used.
 
 Fix the config and rerun:
 
@@ -463,3 +465,16 @@ PYTHONPATH=lib python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 Deterministic tests do not need Drive, provider, or Telegram credentials. They use fake GitHub, OpenCode, rclone, and a local fake Bot API. Live dispatch testing requires real `gh`, OpenCode provider auth, Drive auth, and (only for notification acceptance) an owner-provided bot token/chat id; if any are unavailable, report the limitation instead of claiming a pass.
+
+## Isolated coding preflight failed
+
+When `dispatch.execution.isolation.enabled` is true, the dispatcher refuses to start OpenCode unless the dedicated identity, child authentication, and workspace can be proven safe. Typical reasons:
+
+- the configured Unix user or primary group does not exist;
+- the user is root or belongs to a privileged group;
+- the dispatcher itself is not running as root, so the UID/GID drop cannot be applied;
+- the child HOME/XDG directories or `$XDG_DATA_HOME/opencode/auth.json` are missing, not child-owned, or group/world readable;
+- the workspace is outside the configured roots, under `/root` or `$AGENT_HANDOFF_HOME`, symlinked, not owned by the dedicated identity, or not a Git workspace;
+- the Git tree has uncommitted or untracked changes.
+
+The record becomes `NEEDS_ATTENTION` without an OpenCode run. Nothing is reset, and the dispatcher never falls back to root or the parent identity. Fix the staging layout or authentication, then submit a new request. Do not edit the ledger to force a rerun. See `docs/SECURE-CODING.md`.

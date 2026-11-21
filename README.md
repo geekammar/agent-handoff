@@ -2,11 +2,12 @@
 
 Agent Handoff is an AI-native, self-describing, portable developer tool for recording agent work and delivering upload-verified execution reports.
 
-It has two layers:
+It has these layers:
 
 1. **Core capture (always available):** records structured reports for OpenCode and AGY sessions, stores them locally, uploads them to a Google Drive reports subtree with `rclone`, and verifies the upload using MD5 or read-back.
 2. **Optional GitHub Issue dispatcher (v1.1):** a separate process on your own Linux machine claims explicitly configured tasks from a private GitHub Issue, runs a local OpenCode model in a fixed project workspace, captures the report through Agent Handoff, uploads it, verifies it, and publishes the direct Drive report URL back to the originating issue.
 3. **Optional Telegram notifications (v1.2 P1):** after the durable dispatcher record reaches `ISSUE_UPDATED`, a small local outbox sends one concise Telegram message with the verified Drive report URL, the original Issue URL, and a copy-ready Arabic ChatGPT handoff prompt. Telegram failures never change report delivery.
+4. **Opt-in secure coding execution foundation (C1):** per-project permission policy, a dedicated non-root child identity, an allowlisted child environment, dedicated HOME/XDG/model auth, and canonical clean-workspace validation. Coding-task and Draft PR automation is C2 and is not enabled in production.
 
 The runtime is deliberately small: Python standard library, `rclone`, and (for the optional dispatcher) the GitHub CLI `gh` plus OpenCode. There is no database server, web dashboard, inbound public port, SaaS dependency, or mandatory cloud service.
 
@@ -186,7 +187,7 @@ Rules enforced by the dispatcher:
 - Issue content selects only a configured project alias and model alias. It can never provide a filesystem path, shell command, or arbitrary model ID.
 - Unknown projects, agents, models, malformed metadata, and duplicate execution attempts are rejected.
 - `session: new` is the only supported mode in v1.1. `session: same` is rejected explicitly; it is never simulated.
-- Read-only execution is the default. A write-capable mode requires an explicit `workspace_write` permission profile and `allow_write: true`.
+- Read-only execution is the default. A write-capable mode requires an explicit `workspace_write` permission profile and `allow_write: true`. `allow_write` must be a JSON boolean, and a project-level `workspace_write` requires its own explicit `allow_write: true`; a missing project override inherits the global policy.
 
 ### Issue request format
 
@@ -345,6 +346,7 @@ Upgrade snapshots the installed code and restores it automatically if installati
 - Issue text is untrusted input, never privileged configuration.
 - The dispatcher never derives filesystem paths or shell commands from issue content.
 - The default execution policy is read-only (`plan` agent, denied writes, denied env reads). This is an OpenCode tool-permission policy, not an OS-level sandbox; see the security limitations in `docs/DISPATCH.md`.
+- C1 adds an opt-in, disabled-by-default isolated coding profile: a dedicated non-root UID/GID, empty supplementary groups, an allowlisted child environment, dedicated HOME/XDG/model auth, and canonical clean-workspace checks. The parent dispatcher still runs as root. This is UID/environment separation, not full container or kernel sandboxing, and no coding tasks are enabled in production; see `docs/SECURE-CODING.md`.
 - Logs and uploaded reports are sanitized of obvious secrets; local report copies remain intact for audit.
 - The Telegram bot token is read from an environment variable named in config. It is never written to the repository, reports, notification records, logs, or error messages.
 - Telegram messages contain only project, task title, status/outcome, verified URLs, and a sanitized reason. They never include Issue instructions, prompts, transcripts, local paths, or credentials.
@@ -361,6 +363,7 @@ agent-handoff/
     adapters/                  # core session-ingest adapters (OpenCode/AGY capture)
     dispatch/                  # optional v1.1 dispatcher
       config.py, requests.py, ledger.py, github.py, runner.py, delivery.py
+      security.py              # C1 identity/environment/workspace validation
       adapters/base.py, adapters/opencode.py
     notify/                    # optional Telegram outbox and transport
       config.py, messages.py, service.py, store.py, transport.py
@@ -376,6 +379,7 @@ agent-handoff/
 ## Known limitations
 
 - SAME SESSION continuation is deferred and rejected explicitly.
+- C1 secure coding isolation is an opt-in foundation only. C2 (clean task worktrees, test execution, and Draft PR automation) is not implemented; coding tasks are not enabled in production.
 - Only OpenCode execution is implemented. AGY remains capture-only. No other CLI adapters are shipped.
 - No automatic model selection or AI-based project inference.
 - Automatic reports cannot independently verify code changes, tests, or deployments.
@@ -392,3 +396,4 @@ agent-handoff/
 - [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md)
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
 - [docs/AI-QUICKSTART.md](docs/AI-QUICKSTART.md)
+- [docs/SECURE-CODING.md](docs/SECURE-CODING.md)

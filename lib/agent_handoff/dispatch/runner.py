@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from ..adapters.common import git_info
-from ..config import all_projects, project_by_name
+from ..config import BASE_DIR, all_projects, project_by_name
 from ..report import auto_report
 from ..store import Store
 from ..upload import Uploader
@@ -27,8 +27,15 @@ from .delivery import (
 from .github import GithubError, GithubTransport
 from .ledger import Ledger, new_dispatch_record
 from .progress import ProgressReporter
+from .security import (
+    WorkspaceSecurityError,
+    validate_model_auth,
+    validate_workspace_filesystem,
+    validate_workspace_path,
+)
 from ..notify.config import notification_token_env_names
 from ..notify.service import NotificationService
+from .config import resolve_dispatch_project
 from .requests import RequestError, detect_request, parse_issue_request, resolve_request
 
 
@@ -433,18 +440,132 @@ class DispatchRunner:
     def _reject(self, issue: dict[str, Any], reason: str, *, comment: bool) -> None:
         self._record_rejection(issue, reason, comment=comment)
 
+    def _dispatch_project_for(self, record: dict[str, Any]) -> dict[str, Any]:
+        project = record.get("project") or {}
+        name = str(project.get("name") or project.get("core_name") or project.get("core_key") or "")
+        resolved_project = resolve_dispatch_project(self.dispatch, name)
+        if resolved_project:
+            return resolved_project
+        return {
+            "name": name,
+            "workspace": project.get("workspace"),
+            "execution": project.get("execution") or {},
+        }
+
+    def _effective_execution(self, project: dict[str, Any]) -> dict[str, Any]:
+        global_execution = self.dispatch.get("execution") or {}
+        policy = project.get("execution") or {}
+        profile = str(policy.get("permission_profile") or global_execution.get("permission_profile") or "read_only")
+        allow_write = bool(policy.get("allow_write", global_execution.get("allow_write", False)))
+        return {
+            "timeout_seconds": float(global_execution.get("timeout_seconds", 1200)),
+            "max_prompt_bytes": int(global_execution.get("max_prompt_bytes", 50000)),
+            "permission_profile": profile,
+            "allow_write": allow_write,
+            "isolation": global_execution.get("isolation") or {"enabled": False},
+        }
+
+    def _adapter_for(self, execution: dict[str, Any]) -> OpenCodeAdapter:
+        isolation = execution.get("isolation") or {}
+        identity = isolation.get("identity") if isolation.get("enabled") else None
+        return OpenCodeAdapter(
+            execution,
+            secret_env_names=notification_token_env_names(self.config),
+            identity=identity,
+        )
+
+    def _validate_isolation(self, record: dict[str, Any], project: dict[str, Any], execution: dict[str, Any]) -> str:
+        isolation = execution.get("isolation") or {}
+        if not isolation.get("enabled"):
+            return str((record.get("project") or {}).get("workspace") or "")
+        identity = isolation.get("identity")
+        if not identity:
+            raise WorkspaceSecurityError(
+                "isolated execution identity is unavailable; refusing to fall back to the parent identity"
+            )
+        workspace = str((record.get("project") or {}).get("workspace") or project.get("workspace") or "")
+        project_names = [
+            str(project.get("name") or ""),
+            str(project.get("core_name") or ""),
+            str(project.get("core_key") or ""),
+        ]
+        safe_workspace = validate_workspace_path(
+            workspace,
+            workspace_roots=isolation.get("workspace_roots") or [],
+            project_names=project_names,
+            denied_projects=isolation.get("denied_projects") or [],
+            protected_paths=[str(BASE_DIR)],
+            check_paths=True,
+        )
+        validate_workspace_filesystem(
+            safe_workspace,
+            identity,
+            require_write=bool(execution.get("allow_write", False)),
+            require_clean=True,
+            protected_paths=[str(BASE_DIR)],
+        )
+        validate_model_auth(identity)
+        return safe_workspace
+
     def _execute(self, record: dict[str, Any], *, force: bool) -> None:
         repository = record["repository"]
         number = int(record["issue_number"])
         request_data = record.get("request") or {}
-        workspace = str((record.get("project") or {}).get("workspace") or "")
+        project = self._dispatch_project_for(record)
+        execution = self._effective_execution(project)
+        workspace = str((record.get("project") or {}).get("workspace") or project.get("workspace") or "")
+        profile = str(execution.get("permission_profile") or "read_only")
+        allow_write = bool(execution.get("allow_write", False))
+        timeout_seconds = float(execution.get("timeout_seconds", 1200))
+        isolation_enabled = bool((execution.get("isolation") or {}).get("enabled"))
         self.ledger.set_status(
             repository,
             number,
             "CLAIMED",
             note="claimed before execution",
-            updates={"execution": {"status": "CLAIMED", "runner_pid": os.getpid()}},
+            updates={
+                "execution": {
+                    "status": "CLAIMED",
+                    "runner_pid": os.getpid(),
+                    "permission_profile": profile,
+                    "allow_write": allow_write,
+                    "isolation": isolation_enabled,
+                }
+            },
         )
+        try:
+            workspace = self._validate_isolation(record, project, execution)
+        except Exception as exc:
+            error = sanitize_error(f"isolated coding preflight failed: {exc}")
+            updated = self.ledger.set_status(
+                repository,
+                number,
+                "NEEDS_ATTENTION",
+                note="isolated coding preflight failed; no execution was started",
+                updates={
+                    "attention_reason": error,
+                    "execution": {
+                        "status": "FAILED",
+                        "permission_profile": profile,
+                        "allow_write": allow_write,
+                        "isolation": isolation_enabled,
+                        "last_error": error,
+                        "finished_at": utcnow_iso(),
+                    },
+                },
+            )
+            self._notify_attention(
+                updated,
+                error,
+                "Fix the dedicated identity, model authentication, or clean workspace state. "
+                "The agent was not run and will not fall back to root.",
+            )
+            self.summary["needs_attention"] += 1
+            self.summary["ok"] = False
+            self._progress("needs_attention", "isolated coding preflight failed; no agent was started", record)
+            self._log(f"issue #{number} isolated preflight failed: {error}")
+            return
+        adapter = self._adapter_for(execution)
         stamp = utcnow_iso().replace(":", "").replace("-", "")
         events_path = str(self.ledger.event_path(repository, number, stamp))
         self.ledger.set_status(
@@ -453,12 +574,18 @@ class DispatchRunner:
             "RUNNING",
             note="opencode execution started",
             updates={
-                "execution": {"status": "RUNNING", "started_at": utcnow_iso(), "last_error": None, "runner_pid": os.getpid()},
+                "execution": {
+                    "status": "RUNNING",
+                    "started_at": utcnow_iso(),
+                    "last_error": None,
+                    "runner_pid": os.getpid(),
+                    "permission_profile": profile,
+                    "allow_write": allow_write,
+                    "isolation": isolation_enabled,
+                },
                 "session": {"events_path": events_path},
             },
         )
-        timeout_seconds = float((self.dispatch.get("execution") or {}).get("timeout_seconds", 1200))
-        profile = str((self.dispatch.get("execution") or {}).get("permission_profile", "read_only"))
         self._progress(
             "executing",
             f"OpenCode started with model={record.get('model')} profile={profile} "
@@ -467,14 +594,14 @@ class DispatchRunner:
         )
         title = safe_title(f"Agent Handoff issue #{number}: {record.get('issue_title') or record.get('project', {}).get('name', '')}")
         try:
-            result = self.adapter.run(
+            result = adapter.run(
                 ExecutionRequest(
                     model=str(record.get("model")),
                     workspace=workspace,
                     title=title,
                     instructions=str(request_data.get("instructions") or ""),
-                    permission_profile=str((self.dispatch.get("execution") or {}).get("permission_profile", "read_only")),
-                    allow_write=bool((self.dispatch.get("execution") or {}).get("allow_write", False)),
+                    permission_profile=profile,
+                    allow_write=allow_write,
                     timeout_seconds=timeout_seconds,
                 ),
                 events_path=events_path,

@@ -141,4 +141,4 @@ Export the real token in the dispatcher environment; do not paste it into chat, 
 
 ## Boundaries
 
-Keep the core CLI working when dispatch is disabled. Do not merge a Draft PR without human approval. Do not add speculative adapters. Stop and report accurately if a credential or permission is missing.
+Keep the core CLI working when dispatch is disabled. C1 isolation is an opt-in foundation only; do not enable coding tasks, create a Unix account, or provision provider keys without explicit owner approval. Do not merge a Draft PR without human approval. Do not add speculative adapters. Stop and report accurately if a credential or permission is missing.

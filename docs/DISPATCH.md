@@ -1,6 +1,6 @@
 # Dispatcher (v1.1, v1.2 P0/P1)
 
-v1.2 P0 adds observable progress, actionable `dispatch status`, and safe interruption/restart reporting. v1.2 P1 adds an optional, disabled-by-default Telegram outbox with a verified report link and an Arabic ChatGPT handoff prompt. The durable ledger, request contract, upload verification, issue publication, and re-execution rules below are unchanged.
+v1.2 P0 adds observable progress, actionable `dispatch status`, and safe interruption/restart reporting. v1.2 P1 adds an optional, disabled-by-default Telegram outbox with a verified report link and an Arabic ChatGPT handoff prompt. C1 adds an opt-in secure coding execution foundation: per-project permission policy, a dedicated non-root child identity, an allowlisted child environment, dedicated HOME/XDG/auth, and workspace safety validation. C1 does not enable coding tasks in production and does not implement Draft PR automation. The durable ledger, request contract, upload verification, issue publication, and re-execution rules below are unchanged. See [SECURE-CODING.md](SECURE-CODING.md).
 
 The dispatcher is an optional process on the user's own Linux machine or VPS. It polls a private GitHub Issue inbox, validates a versioned request, runs OpenCode in one explicitly configured project workspace, captures the result through Agent Handoff, verifies the Drive upload, and publishes the direct report URL back to the originating issue.
 
@@ -19,6 +19,7 @@ Implemented:
 - Upload verification plus a direct Drive file URL and `UPLOAD-RECEIPT.json`.
 - Idempotent issue publication.
 - Optional durable Telegram notifications after verified delivery, with bounded retries and a copy-ready Arabic ChatGPT prompt.
+- Opt-in C1 isolation foundation for future coding tasks: per-project policy, dedicated Unix identity, allowlisted child environment, dedicated model auth, and workspace validation.
 
 Not implemented:
 
@@ -28,6 +29,8 @@ Not implemented:
 - Automatic project inference or model selection.
 - A dashboard, database server, public API, SaaS hosting, or multi-user service.
 - Telegram bot creation, Telegram account login, managed bot provisioning, or a generic notification platform.
+- Coding-task automation, test execution, commit/branch creation, or Draft PR publication (C2).
+- OS account creation, provider-key creation, or production workspace provisioning.
 
 ## Trust model
 
@@ -65,7 +68,19 @@ Add a `dispatch` section to `$AGENT_HANDOFF_HOME/config/config.json`. Never copy
       "timeout_seconds": 1200,
       "max_prompt_bytes": 50000,
       "permission_profile": "read_only",
-      "allow_write": false
+      "allow_write": false,
+      "isolation": {
+        "enabled": false,
+        "environment": "allowlist",
+        "identity": {
+          "user": "agent-handoff-dev",
+          "group": "agent-handoff-dev",
+          "home": "/srv/agent-handoff/home/agent-handoff-dev"
+        },
+        "workspace_roots": ["/srv/agent-handoff/work"],
+        "denied_projects": ["Rabet", "Yakfi"],
+        "child_path": "/usr/local/bin:/usr/bin:/bin"
+      }
     },
     "delivery": {"retry_seconds": 60, "max_attempts": 0},
     "github": {"command": "gh", "require_private": true}
@@ -95,12 +110,19 @@ Fields:
 | `agent` | Only `opencode`. |
 | `models` | Trusted alias → exact `provider/model` mapping. |
 | `default_model` | Optional alias used when an issue omits `model`. |
-| `projects` | Dispatch project name → `{ "workspace": "<canonical absolute path>" }`. The name must match an existing core project; the workspace must exactly match one of that project's recorded paths. |
+| `projects` | Dispatch project name → `{ "workspace": "<canonical absolute path>" }`. The name must match an existing core project; the workspace must exactly match one of that project's recorded paths. An optional `execution` object overrides the global permission policy for that project. |
 | `poll_interval_seconds` | Watch-mode polling interval. |
 | `execution.timeout_seconds` | Bounded OpenCode execution timeout. |
 | `execution.max_prompt_bytes` | Maximum Issue instruction size. |
 | `execution.permission_profile` | `read_only` (default) or `workspace_write`. |
-| `execution.allow_write` | Must be explicitly true with `workspace_write`. |
+| `execution.allow_write` | Must be explicitly true with `workspace_write`. Must be a JSON boolean. |
+| `projects.<name>.execution.permission_profile` | Optional per-project `read_only` or `workspace_write`. Missing fields inherit the global policy. |
+| `projects.<name>.execution.allow_write` | A project-level `workspace_write` requires explicit `true` in the same project override. |
+| `execution.isolation.enabled` | `false` by default. When true, the child runs as the dedicated non-root identity with an allowlisted environment and validated workspace. |
+| `execution.isolation.identity` | `user`, optional primary `group`, and dedicated `home`. No root or privileged group membership. |
+| `execution.isolation.workspace_roots` | Safe canonical roots; isolated workspaces must be inside one of them. |
+| `execution.isolation.denied_projects` | Additional denied project names. `Rabet` and `Yakfi` are always denied in isolated mode. |
+| `execution.isolation.child_path` | Reviewed executable PATH for the child; system directories by default. |
 | `delivery.retry_seconds` | Base backoff for GitHub publication retries. |
 | `delivery.max_attempts` | `0` means retry indefinitely. A non-zero value stops automatic publication retries after that many failures; the verified upload is preserved and `dispatch deliver` can publish manually. |
 | `github.command` | `gh` executable name or absolute path. |
@@ -424,9 +446,11 @@ The service runs as the user who owns `gh` and rclone credentials. It does not r
 ## Security limitations
 
 - `read_only` is an OpenCode tool-permission policy: the `plan` agent is used and `edit`/`bash` and other unspecified tools are denied through `OPENCODE_CONFIG_CONTENT`. It is **not** an operating-system sandbox. The dispatcher process runs with the Unix permissions of the user who started it.
-- A user who can modify the runtime config, the OpenCode binary, the model/provider, or the host can change behavior. Run the dispatcher under a dedicated Unix account if you need stronger host-level isolation.
+- A user who can modify the runtime config, the OpenCode binary, the model/provider, or the host can change behavior.
+- C1 isolation drops the OpenCode child to a dedicated non-root UID/GID with empty supplementary groups and an allowlisted environment. The parent dispatcher still runs as root with its credentials; this is UID/environment separation, not full OS sandboxing. CPU/memory/disk limits, network policy, prompt-injection resistance, and hostile test code are not fully solved by C1. See [SECURE-CODING.md](SECURE-CODING.md).
 - SIGINT and SIGTERM attempt to stop the OpenCode and rclone child process groups before the dispatcher exits. A forced `SIGKILL` cannot run cleanup, so an already-started OpenCode child may continue. The ledger prevents automatic re-execution and marks the request `NEEDS_ATTENTION`; read-only mode limits the effect, but `workspace_write` requires operator care.
 - `allowed_users` matches GitHub login names, not immutable account IDs. Login renames must be handled by the repository owner.
+- Isolated coding is opt-in and disabled by default. Production Rabet/Yakfi remain read-only. A clean Git tree, canonical path, and validated ownership do not prove that repository content or tests are safe; C2 must use disposable worktrees and review publication.
 - Uploaded `REPORT.md` files currently include the local run directory path as audit evidence. They are stored in the user's private Drive; GitHub delivery comments contain only identifiers and verified URLs. Upload receipts omit local filesystem paths.
 - Telegram credentials are read from the configured environment variable only. The bot token is never written to config, reports, notification records, logs, or exception text. The outbox stores report/Issue URLs and sanitized text, not Issue instructions or local paths. The transport always targets the official `https://api.telegram.org` endpoint; alternate test endpoints require explicit injection by test code and cannot be selected from runtime configuration.
 - The dispatcher removes the default and configured notification token environment variables from the OpenCode child environment for both `read_only` and `workspace_write` profiles. This is defense in depth, not an OS sandbox: a child running under the same Unix account may still access credential files or unrelated parent secrets, and model-authentication variables remain available because OpenCode legitimately needs them.
@@ -483,7 +507,13 @@ Deterministic tests use fake GitHub, fake OpenCode, and fake rclone. They cover:
 - ambiguous-send exclusion from generic retry and targeted acknowledged retry;
 - truthful upload-failure and publication-failure delayed messages;
 - fixed official Telegram endpoint with explicit fake-transport injection in tests;
-- configuration preservation across install/upgrade/rollback.
+- configuration preservation across install/upgrade/rollback;
+- per-project policy inheritance and explicit write authorization;
+- legacy Rabet/Yakfi-style read-only inheritance;
+- issue metadata cannot change policy, identity, workspace, or model allowlist;
+- dedicated identity fail-closed behavior, privileged-group rejection, and env allowlist;
+- canonical/symlink/protected/dirty workspace refusal without resetting work;
+- timeout and orphan-process cleanup with progress unchanged.
 
 ```bash
 PYTHONPATH=lib python3 -m unittest discover -s tests -p "test_*.py" -v

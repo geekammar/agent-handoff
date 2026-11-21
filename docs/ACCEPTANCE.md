@@ -141,3 +141,32 @@ Additional P0 coverage:
 - reused delivery reconciliation preserves verified-at metadata without another upload.
 
 Live acceptance remains a separate, operator-controlled step. It was not performed as part of this change.
+
+## C1 secure coding foundation deterministic acceptance
+
+Date: 2026-11-21
+
+Command:
+
+```bash
+python3 -m compileall -q lib setup tests
+sh -n setup/install.sh setup/upgrade.sh setup/rollback.sh setup/gdrive-auth.sh
+PYTHONPATH=lib python3 -m unittest discover -s tests -p "test_*.py" -v
+```
+
+Deterministic result: **126 tests passed, 0 failed**. This run used fake GitHub, fake OpenCode, and fake rclone. It does not prove a live dedicated Unix account, provider credential, or production coding path.
+
+C1 focused coverage (`tests/test_c1_isolation.py`):
+
+- legacy config and Rabet/Yakfi-style read-only inheritance remain unchanged;
+- valid per-project write policy and explicit authorization checks;
+- Issue metadata cannot change policy, UID/GID, workspace, or model allowlist;
+- missing user, root identity, privileged supplementary groups, and wrong workspace ownership fail closed;
+- child environment excludes parent Telegram/GitHub/rclone/runtime secrets while the parent keeps them;
+- dedicated HOME/XDG/TMPDIR and child-owned model auth are required; root auth is never inherited;
+- canonical path, symlink escape, protected path, denied project, and dirty-tree refusal without resetting work;
+- timeout, progress heartbeat, and no-orphan process cleanup;
+- real Python child UID/GID drop with empty supplementary groups and a denied root-only secret read when the test runs as root with an unprivileged account available;
+- real adapter launch under `nobody`: dedicated UID/GID, empty supplementary groups, dedicated HOME/XDG, no parent GitHub/Telegram secrets, and the read-only plan policy. These OS-level proofs were **skipped** on non-root CI runners because dropping to another UID requires root.
+
+Live staging acceptance of an actual isolated OpenCode coding task was **not performed** in this change. It requires a separately approved Unix account, provider credential, and disposable workspace. Production Rabet/Yakfi remain `read_only`, production isolation remains disabled, and the production service was not restarted.

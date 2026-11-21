@@ -94,7 +94,7 @@ agent-handoff config validate
 agent-handoff dispatch run --once --json
 ```
 
-7. Create an issue from `.github/ISSUE_TEMPLATE/agent-handoff-task.md` and submit it.
+7. Create an issue from `.github/ISSUE_TEMPLATE/agent-handoff-task.md` and submit it. Do not enable `dispatch.execution.isolation`, create a dedicated Unix account, or submit a coding task without explicit owner approval; see `docs/SECURE-CODING.md` for the C1 staging boundary.
 8. Inspect delivery:
 
 ```bash

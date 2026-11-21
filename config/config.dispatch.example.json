@@ -63,7 +63,18 @@
       "timeout_seconds": 1200,
       "max_prompt_bytes": 50000,
       "permission_profile": "read_only",
-      "allow_write": false
+      "allow_write": false,
+      "isolation": {
+        "enabled": false,
+        "environment": "allowlist",
+        "identity": {
+          "user": "agent-handoff-dev",
+          "group": "agent-handoff-dev",
+          "home": "/srv/agent-handoff/home/agent-handoff-dev"
+        },
+        "workspace_roots": ["/srv/agent-handoff/work"],
+        "child_path": "/usr/local/bin:/usr/bin:/bin"
+      }
     },
     "delivery": {"retry_seconds": 60, "max_attempts": 0},
     "github": {"command": "gh", "require_private": true}

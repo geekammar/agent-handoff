@@ -152,6 +152,7 @@ def new_dispatch_record(
             "core_name": project.get("core_name"),
             "workspace": project.get("workspace"),
             "drive_folder_id": project.get("drive_folder_id"),
+            "execution": project.get("execution"),
         },
         "agent": agent,
         "model": model,
