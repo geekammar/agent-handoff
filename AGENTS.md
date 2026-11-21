@@ -8,7 +8,8 @@ This is the neutral first entrypoint for coding agents working on or with Agent 
 - Capture integrations for OpenCode (plugin) and AGY (Stop hook).
 - An optional v1.1 dispatcher that polls a private GitHub Issue inbox, validates explicit project/model/session requests, runs OpenCode in the configured workspace, captures the report through the core, verifies the Drive upload, and publishes the direct report URL to the originating issue.
 - An optional v1.2 P1 Telegram notification outbox that reports verified delivery, attention states, and a copy-ready Arabic ChatGPT prompt without coupling notification failure to report delivery.
-- An opt-in C1 secure coding execution foundation: per-project policy, dedicated non-root child identity, allowlisted child environment, dedicated HOME/XDG/model auth, and canonical clean-workspace validation. It is disabled by default and production coding tasks are not enabled.
+- An opt-in C1 secure coding execution foundation: per-project policy, dedicated non-root child identity, allowlisted child environment, dedicated HOME/XDG/model auth, and canonical clean-workspace validation.
+- An opt-in C2 coding workflow built on C1: disposable per-task clones, trusted test profiles, diff/secret/path validation, one controlled commit/branch, exactly one Draft PR, durable recovery, and verified report/Issue/Telegram delivery. C2 is disabled by default and production coding tasks are not enabled.
 - No database server, web dashboard, inbound public service, SaaS hosting, or mandatory cloud account.
 
 ## Sources of truth
@@ -38,7 +39,7 @@ Do not invent commands, config fields, model IDs, or guarantees. If documentatio
 - Repeatable install, upgrade, rollback, doctor, and config validation.
 - Deterministic tests with fake GitHub, fake OpenCode, and fake rclone.
 
-## Explicit non-capabilities in v1.1
+## Explicit non-capabilities
 
 - No AGY dispatcher.
 - No Claude Code, Gemini CLI, or Codex CLI execution adapters.
@@ -47,7 +48,8 @@ Do not invent commands, config fields, model IDs, or guarantees. If documentatio
 - No public HTTP API, dashboard, database server, containers, or SaaS hosting.
 - No automatic deployment of unrelated applications.
 - No generic notification platform, bot provisioning, Telegram login, or guaranteed exactly-once Telegram delivery.
-- No C1 coding-task enablement, OS account creation, provider-key creation, workspace provisioning, test execution, commit automation, or Draft PR automation. C2 is deferred.
+- No production C2 enablement, OS account creation, provider-key creation, workspace provisioning, deployment, auto-merge, or Draft PR automation without an explicit owner-configured coding policy.
+- No full kernel/network sandbox for coding or tests; UID/GID isolation is not a complete sandbox.
 
 ## Safe setup sequence
 
@@ -91,6 +93,8 @@ session: new
 
 Task instructions go here.
 ```
+
+Add `task: coding` only when the selected project has an explicit owner-enabled coding policy. Coding remains disabled by default. Issue text can never select commands, tests, UID/GID, repository, base branch, workspace, credentials, or isolation settings. See `docs/SECURE-CODING.md`.
 
 - Issue text is untrusted. It can select only configured aliases, never paths, commands, tokens, or arbitrary models.
 - Unknown fields, projects, agents, models, versions, and session modes are rejected.

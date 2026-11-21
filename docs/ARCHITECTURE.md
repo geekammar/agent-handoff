@@ -39,6 +39,7 @@ The installer applies one source-selection policy to Git and non-Git checkouts. 
 - `runner.py`: claim/execute/capture/upload/publish state machine, restart recovery, and per-record error isolation.
 - `delivery.py`: verified upload reconciliation, direct Drive URL resolution, `UPLOAD-RECEIPT.json`, remote `COMPLETE.json` re-upload, comment rendering, and publication backoff.
 - `security.py`: C1 identity, allowlisted child environment, dedicated model-auth, and canonical workspace/protected-path/dirty-tree validation. It never creates an OS account or workspace.
+- `coding/`: optional C2 coding workflow. `config.py` parses trusted coding policy; `workspace.py` prepares a disposable clean clone at a verified base commit; `testrunner.py` runs owner-configured argv tests under the isolated identity; `changes.py` validates paths/diff/secrets; `publication.py` builds a parent-owned commit and publishes one branch and one Draft PR; `pipeline.py` implements durable stages and recovery; `report.py` renders coding evidence into the existing report contract.
 - `adapters/base.py`: small execution-adapter protocol so a future CLI adapter can be added without changing the ledger, GitHub transport, project routing, upload, or delivery.
 - `adapters/opencode.py`: the only v1.1 execution adapter. Sets both `cwd` and `PWD` to the canonical workspace, uses `--pure`, applies a read-only or explicitly enabled write permission policy, streams JSON events to a mode-600 session file, preserves the session ID as soon as it appears, emits bounded execution heartbeats without prompt content, and terminates its process group on timeout or orderly shutdown. When C1 isolation is enabled for the effective project policy, it launches after identity, model-auth, workspace, ancestor, Git-metadata, and trusted-executable preflight with the configured non-root UID/GID, empty supplementary groups, and an allowlisted environment. Legacy read-only projects can remain non-isolated in the same dispatcher; write-capable projects must resolve to isolation.
 
@@ -138,7 +139,9 @@ NEW -> CLAIMED -> RUNNING -> EXECUTION_COMPLETED
     -> REPORT_CAPTURED / UPLOAD_PENDING -> UPLOAD_VERIFIED -> ISSUE_UPDATED
 ```
 
-`REJECTED` and `NEEDS_ATTENTION` are terminal/exceptional outcomes. A record that reached `CLAIMED` or later is never automatically executed again.
+Coding records add `coding.stage`: `REQUEST_ACCEPTED`, `WORKSPACE_PREPARED`, `AGENT_RUNNING`, `AGENT_COMPLETED`, `TESTING`, `VALIDATING_DIFF`, `COMMIT_PREPARED`, `BRANCH_PUBLISHED`, `PR_CREATED`, plus the existing report/upload states. Milestones distinguish agent completion, tests passed, Draft PR publication, and report delivery.
+
+`REJECTED` and `NEEDS_ATTENTION` are terminal/exceptional outcomes. A record that reached `CLAIMED` or later is never automatically executed again. Coding stages can resume tests/publication and idempotent Git/GitHub operations, but never rerun OpenCode without persisted output.
 
 ## Notification outbox
 

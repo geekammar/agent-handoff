@@ -178,6 +178,14 @@ class NotificationService:
             for item in dispatch_projects.values():
                 if isinstance(item, dict) and item.get("workspace"):
                     values.add(str(item["workspace"]))
+                if isinstance(item, dict):
+                    coding = item.get("coding") or {}
+                    for key in ("workspace_root", "staging_root", "source_workspace"):
+                        if coding.get(key):
+                            values.add(str(coding[key]))
+        coding_global = (config.get("dispatch") or {}).get("coding") or {}
+        if isinstance(coding_global, dict) and coding_global.get("staging_root"):
+            values.add(str(coding_global["staging_root"]))
         return sorted((item for item in values if len(item) > 1), key=len, reverse=True)
 
     def _clean(self, value: Any, limit: int = 500) -> str:
@@ -203,6 +211,9 @@ class NotificationService:
         upload = record.get("upload") or {}
         publication = record.get("publication") or {}
         execution = record.get("execution") or {}
+        coding = record.get("coding") or {}
+        coding_publication = coding.get("publication") or {}
+        coding_milestones = coding.get("milestones") or {}
         issue_number = record.get("issue_number")
         title = text_value(
             self._clean(record.get("issue_title") or f"Agent Handoff issue #{issue_number}", 240),
@@ -222,6 +233,23 @@ class NotificationService:
             "report_url": report_url,
             "receipt_url": safe_url(upload.get("receipt_url")) if upload.get("verified") else None,
             "outcome": execution.get("outcome"),
+            "task_type": record.get("task_type") or "read_only",
+            "coding_outcome": (
+                "blocked" if coding.get("blocked") else ("draft_pr_published" if coding_publication.get("pr_url") else None)
+            )
+            if record.get("task_type") == "coding"
+            else None,
+            "pr_url": safe_url(coding_publication.get("pr_url")),
+            "base_commit": coding.get("base_commit"),
+            "tests_status": (coding.get("tests") or {}).get("status"),
+            "milestones": {
+                "agent_completed": bool(coding_milestones.get("AGENT_COMPLETED")),
+                "tests_passed": bool(coding_milestones.get("TESTS_PASSED")),
+                "pr_published": bool(coding_milestones.get("PR_PUBLISHED")),
+                "report_delivered": bool(coding_milestones.get("REPORT_DELIVERED")),
+            }
+            if record.get("task_type") == "coding"
+            else None,
             "status": record.get("status"),
             "publication_status": publication.get("status"),
             "reason": self._clean(reason, 500) if reason else None,

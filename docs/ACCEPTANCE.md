@@ -174,3 +174,40 @@ C1 focused coverage (`tests/test_c1_isolation.py`):
 - real mixed-project dispatcher run under `nobody`: Rabet/Yakfi execute legacy read-only as root while AgentHandoff executes isolated `workspace_write` with the dedicated UID/GID, empty supplementary groups, dedicated HOME, no parent GitHub token, and effective isolation persisted in the ledger. These OS-level proofs were **skipped** on non-root CI runners because dropping to another UID requires root.
 
 Live staging acceptance of an actual isolated OpenCode coding task was **not performed** in this change. It requires a separately approved Unix account, provider credential, and disposable workspace. Production Rabet/Yakfi remain `read_only`, production isolation remains disabled, and the production service was not restarted.
+
+## C2 isolated coding workflow deterministic acceptance
+
+Date: 2026-11-21
+
+Commands:
+
+```bash
+python3 -m compileall -q lib setup tests
+sh -n setup/install.sh setup/upgrade.sh setup/rollback.sh setup/gdrive-auth.sh
+PYTHONPATH=lib python3 -m unittest discover -s tests -p "test_*.py" -v
+PYTHONPATH=lib python3 -m unittest tests.test_c2_coding -v
+git diff --check
+```
+
+Deterministic result: **169 tests passed, 0 failed**. The focused C2 module ran **30 tests, 0 failed**. The suite uses fake GitHub, fake OpenCode, synthetic credentials, a local trusted Git remote, and fake rclone. It does not prove a live dedicated Unix account, live provider credential, real private GitHub repository, or production enablement.
+
+C2 focused coverage (`tests/test_c2_coding.py`, mapped to T01-T40 in test names):
+
+- legacy read-only request contract and existing C1/dispatcher/notification tests remain unchanged;
+- coding is disabled by default and requires global + project opt-in and effective non-root isolation;
+- unauthorized authors are rejected without execution;
+- Issue metadata cannot add commands, profiles, tests, identity, paths, or unknown task types;
+- valid coding requests require a trusted model alias;
+- dedicated non-root test identity and no parent secrets in test/child environments;
+- unique clean workspaces at the verified base commit; dirty/existing and symlink workspaces are refused;
+- concurrent task workspaces are isolated;
+- realistic simulated code changes, trusted argv test execution, timeout/failure recording, and root-test refusal;
+- protected paths, allowlists, secret scanning with redaction, and empty-change refusal;
+- branch collision refusal, no default-branch push, commit SHA recording, one Draft PR, and no force-push;
+- lost push and PR responses recover without duplicates;
+- restart after publication and upload failure do not rerun OpenCode or duplicate the PR/comment;
+- report, receipt, Issue comment, and Telegram payload include the verified report URL and Draft PR when present;
+- JSON progress and existing notification behavior remain covered by the full suite;
+- config validation does not mutate files, unrelated historical queue items are not processed, and Rabet/Yakfi-style projects remain legacy read-only.
+
+Not performed: a live C2 staging coding Issue, real dedicated Unix UID/GID drop for the C2 test runner, real provider/model execution, real private-repository push, real Draft PR creation, and Telegram delivery. These require explicit owner provisioning and are listed in the C2 staging acceptance procedure. Production coding remains disabled and the production service was not restarted.

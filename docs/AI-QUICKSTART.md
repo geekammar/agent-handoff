@@ -103,6 +103,10 @@ agent-handoff dispatch status --json
 
 For continuous operation, use a systemd user service only after the user explicitly consents. The template is in `docs/DISPATCH.md`; it must be installed and enabled by the user, not by the assistant during tests.
 
+## Optional C2 coding workflow
+
+C2 is disabled by default. Do not enable it during a normal install. An owner must separately approve the dedicated Unix identity, model credential, isolated workspace root, parent-owned publication staging root, trusted test profile, allowed model aliases, and a staging-only project policy. A coding Issue uses `task: coding`; it cannot supply commands, tests, identity, paths, repository, base branch, or isolation settings. C2 creates one Draft PR only and never merges or deploys. Until a live isolated staging acceptance is performed, report C2 as **implemented but not accepted or enabled in production**, not as production-ready.
+
 ## What the assistant must say when it cannot act
 
 Use language like:

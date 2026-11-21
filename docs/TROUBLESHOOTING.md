@@ -478,3 +478,31 @@ When `dispatch.execution.isolation.enabled` is true, the dispatcher refuses to s
 - the Git tree has uncommitted or untracked changes.
 
 The record becomes `NEEDS_ATTENTION` without an OpenCode run. Nothing is reset, and the dispatcher never falls back to root or the parent identity. Fix the staging layout or authentication, then submit a new request. Do not edit the ledger to force a rerun. See `docs/SECURE-CODING.md`.
+
+## Coding task is rejected as disabled
+
+C2 coding requires both `dispatch.coding.enabled: true` and `coding.enabled: true` on the selected project, plus effective C1 isolation. If any is missing, the Issue is rejected with no agent run. Do not enable production coding to "test" it. Use an owner-approved staging project and follow `docs/SECURE-CODING.md`.
+
+## Coding workspace preparation failed
+
+The disposable workspace must be new, under the configured `coding.workspace_root`, owned by the dedicated identity, outside the source checkout, and cloned from a source whose `origin` matches the configured repository. Existing task directories, symlinks, dirty clones, a wrong base commit, or a mismatched remote fail closed. The active developer checkout is not reset or cleaned. Inspect the preserved task directory and durable stage; correct the trusted configuration or remove only the managed staging directory after review.
+
+## Trusted coding tests failed
+
+A failing or timed-out trusted test blocks commit, push, and Draft PR creation. The dispatcher preserves the workspace and test evidence, records `coding.blocked_stage=TESTING`, and still delivers an honest report with no PR. Fix the code/tests and submit a new Issue. The dispatcher does not promise a publishable PR for failing changes and does not rerun the agent indefinitely.
+
+## Diff validation blocked the coding task
+
+Changed paths may be protected, outside an allowlist, binary, symlinked, submodule-related, too large, or may contain obvious secret material. Secret values are redacted from evidence, but secret scanning is not proof of safety. Review the report and the preserved workspace. Adjust the trusted policy only if the change is genuinely intended; do not blindly add credential files or CI workflows to an allowlist.
+
+## Draft PR creation or branch push failed
+
+Publication retries are bounded. `dispatch status --json` shows `coding.stage`, `publication.attempts`, `next_attempt_at`, and `last_error`. A transient failure retries only the publish/PR step; it never reruns OpenCode or trusted tests. An existing branch with a different commit, a non-Draft PR, or multiple matching PRs fails closed and is never force-pushed or silently replaced. After retries are exhausted, use the preserved evidence and create a new task if a different code result is required.
+
+## Coding task restarted during execution
+
+If persisted OpenCode events exist, the dispatcher resumes from them and does not rerun the model. If no recoverable output exists, the record becomes `NEEDS_ATTENTION`; the workspace and session evidence are preserved. Do not delete the ledger or force a duplicate run. Inspect the host and submit a new Issue only if the work must be repeated.
+
+## Upload failed after a Draft PR was created
+
+The PR is already a durable review artifact. Upload/publication retries reuse the PR and the verified upload contract; the agent is not re-executed. If the report cannot be verified, the PR remains a Draft and the task is not claimed as delivered. Do not merge or deploy based on an unverified report.

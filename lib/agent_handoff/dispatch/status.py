@@ -182,7 +182,57 @@ def record_status_view(
     else:
         next_action = "Inspect this record; its state is not recognized by this version."
 
-    for candidate in (publication.get("next_attempt_at"), upload.get("next_attempt_at")):
+    coding = view.get("coding") or {}
+    if coding:
+        view["coding_stage"] = coding.get("stage")
+        view["pr_url"] = coding.get("pr_url")
+        view["pr_number"] = coding.get("pr_number")
+        view["tests_status"] = (coding.get("tests") or {}).get("status")
+        view["milestones"] = coding.get("milestones") or {}
+        if status == "EXECUTION_COMPLETED":
+            if coding.get("blocked"):
+                health = ATTENTION
+                phase = "coding_blocked"
+                next_action = (
+                    f"Coding stopped at {coding.get('blocked_stage')}: {coding.get('blocked_reason') or 'review required'}. "
+                    "Evidence is preserved; the agent will not be re-executed. Submit a new corrected Issue if needed."
+                )
+            elif coding.get("pr_url"):
+                health = PENDING
+                phase = "pending_coding_capture"
+                next_action = "Capture and upload the coding report: agent-handoff dispatch run --once (no re-execution)."
+            elif coding.get("publication_next_attempt_at"):
+                health = RETRYABLE
+                phase = "retry_coding_publication"
+                retry_at = coding.get("publication_next_attempt_at")
+                next_action = (
+                    f"Retry coding publication only after {retry_at}: agent-handoff dispatch run --once --force. "
+                    "OpenCode and trusted tests are not re-executed."
+                )
+            else:
+                health = PENDING
+                phase = "advancing_coding"
+                next_action = (
+                    "Continue trusted tests, diff validation, and Draft PR publication: "
+                    "agent-handoff dispatch run --once. OpenCode is not re-executed."
+                )
+        elif status == "ISSUE_UPDATED":
+            if coding.get("blocked"):
+                health = ATTENTION
+                phase = "coding_blocked"
+                next_action = (
+                    f"Coding stopped at {coding.get('blocked_stage')}: {coding.get('blocked_reason') or 'review required'}. "
+                    "The report was delivered, but no successful Draft PR was published. Review the evidence and "
+                    "submit a new Issue if needed."
+                )
+            else:
+                next_action = "Review the Draft PR and verified report. A human owner must merge; C2 never auto-merges."
+
+    for candidate in (
+        (coding.get("publication_next_attempt_at") if coding else None),
+        publication.get("next_attempt_at"),
+        upload.get("next_attempt_at"),
+    ):
         if candidate:
             retry_at = candidate
             break
@@ -207,10 +257,17 @@ def record_status_view(
             "next_attempt_at": retry_at,
             "captured": capture.get("status") == "CAPTURED",
             "last_error": sanitize_error(
-                upload.get("last_error") or publication.get("last_error") or record.get("attention_reason") or "",
+                upload.get("last_error")
+                or publication.get("last_error")
+                or (coding.get("blocked_reason") if coding else None)
+                or record.get("attention_reason")
+                or "",
                 400,
             )
             or None,
+            "retryable": health == RETRYABLE,
+            "pr_url": view.get("pr_url"),
+            "coding_stage": view.get("coding_stage"),
             "notifications": list(notifications or []),
         }
     )
@@ -241,6 +298,17 @@ def format_status_view(view: dict[str, Any]) -> list[str]:
         lines.append(f"      report: {view['upload']['report_url']}")
         if (view.get("upload") or {}).get("receipt_url"):
             lines.append(f"      receipt: {view['upload']['receipt_url']}")
+    if view.get("pr_url"):
+        lines.append(f"      Draft PR: {view['pr_url']}")
+    if view.get("coding_stage"):
+        milestones = view.get("milestones") or {}
+        tests_status = view.get("tests_status") or "not_run"
+        lines.append(
+            f"      coding stage: {view['coding_stage']} · tests={tests_status} "
+            f"· agent={bool(milestones.get('agent_completed'))} "
+            f"· pr={bool(milestones.get('pr_published'))} "
+            f"· report={bool(milestones.get('report_delivered'))}"
+        )
     if (view.get("publication") or {}).get("comment_url"):
         lines.append(f"      delivery comment: {view['publication']['comment_url']}")
     if view.get("next_attempt_at"):

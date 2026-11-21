@@ -266,6 +266,9 @@ def build_issue_comment(record: dict[str, Any]) -> str:
     upload = record.get("upload") or {}
     execution = record.get("execution") or {}
     session = record.get("session") or {}
+    coding = record.get("coding") or {}
+    publication = coding.get("publication") or {}
+    milestones = coding.get("milestones") or {}
     report_url = upload.get("report_url")
     receipt_url = upload.get("receipt_url")
     lines = [
@@ -282,9 +285,31 @@ def build_issue_comment(record: dict[str, Any]) -> str:
         f"- Upload: verified at `{upload.get('verified_at')}`",
         f"- Report: {report_url}",
     ]
+    if record.get("task_type") == "coding":
+        coding_outcome = "blocked" if coding.get("blocked") else "draft_pr_published"
+        lines.extend(
+            [
+                "- Task type: `coding`",
+                f"- Coding outcome: `{coding_outcome}`",
+                f"- Base commit: `{coding.get('base_commit') or 'not captured'}`",
+                f"- Branch: `{publication.get('branch') or 'not created'}`",
+                f"- Commit: `{publication.get('commit') or 'not created'}`",
+                f"- Draft PR: {publication.get('pr_url') or 'not created'}",
+                f"- Milestones: AGENT_COMPLETED=`{bool(milestones.get('AGENT_COMPLETED'))}`, "
+                f"TESTS_PASSED=`{bool(milestones.get('TESTS_PASSED'))}`, "
+                f"PR_PUBLISHED=`{bool(milestones.get('PR_PUBLISHED'))}`, "
+                f"REPORT_DELIVERED=`{bool(milestones.get('REPORT_DELIVERED'))}`",
+            ]
+        )
     if receipt_url:
         lines.append(f"- Upload receipt: {receipt_url}")
     lines.append("")
+    if record.get("task_type") == "coding":
+        lines.append(
+            "The report link above was verified by MD5/read-back before this comment was posted. "
+            "Any Draft Pull Request is a review artifact only: it is not merged, deployed, or accepted "
+            "automatically. Tests passing is not proof of correctness or production readiness."
+        )
     lines.append(
         "The link above was produced only after the report upload passed MD5/read-back verification "
         "and a direct Google Drive file id was resolved. This comment is idempotent; do not rerun the agent."

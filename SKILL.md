@@ -94,6 +94,8 @@ session: new
 Task instructions go here.
 ```
 
+Coding tasks add `task: coding`. Coding is disabled by default and requires owner-configured C2 policy, isolation, a trusted test profile, a model allowlist, and a Draft-PR-only publisher. See `docs/SECURE-CODING.md`.
+
 Reject `session: same`; v1.1 does not support continuation. Never derive a path or shell command from issue text.
 
 ## Recovery

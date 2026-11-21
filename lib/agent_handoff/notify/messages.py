@@ -69,11 +69,15 @@ def _completed(payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
     title = _escape(payload.get("task_title") or "Untitled task", 120)
     report_url = safe_url(payload.get("report_url"))
     issue_url = safe_url(payload.get("issue_url"))
+    pr_url = safe_url(payload.get("pr_url"))
     outcome = text_value(payload.get("outcome") or "not recorded", 40)
+    coding_outcome = text_value(payload.get("coding_outcome") or "", 60)
+    tests_status = text_value(payload.get("tests_status") or "", 30)
     if not report_url:
         raise NotificationMessageError("a verified report URL is required for a completion notification")
 
-    heading = "✅ تم تسليم تقرير المهمة" if outcome == "succeeded" else "📄 تم تسليم تقرير المهمة"
+    healthy = outcome == "succeeded" and coding_outcome in ("", "draft_pr_published") and tests_status in ("", "passed")
+    heading = "✅ تم تسليم تقرير المهمة" if healthy else "📄 تم تسليم تقرير المهمة (يلزم مراجعة النتيجة)"
     lines = [
         heading,
         "",
@@ -81,10 +85,14 @@ def _completed(payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
         f"Task: <b>{title}</b>",
         "Status: Verified &amp; Delivered",
         f"Execution outcome: <b>{html.escape(outcome, quote=False)}</b>",
-        "",
-        "Report:",
-        _link(report_url),
     ]
+    if coding_outcome:
+        lines.append(f"Coding outcome: <b>{html.escape(coding_outcome, quote=False)}</b>")
+    if tests_status:
+        lines.append(f"Trusted tests: <b>{html.escape(tests_status, quote=False)}</b>")
+    lines.extend(["", "Report:", _link(report_url)])
+    if pr_url:
+        lines.extend(["", "Draft PR (not merged):", _link(pr_url)])
     if issue_url:
         lines.extend(["", "GitHub Issue:", _link(issue_url)])
     prompt = build_chatgpt_prompt(
@@ -101,6 +109,7 @@ def _completed(payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
     )
     buttons = [
         [*_button("View Report", report_url)],
+        [*_button("View Draft PR", pr_url)],
         [*_button("View GitHub Issue", issue_url)],
     ]
     return "\n".join(lines), _reply_markup(buttons)

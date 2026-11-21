@@ -17,7 +17,9 @@ ALLOWED_KEYS = {
     "agent",
     "model",
     "session",
+    "task",
 }
+SUPPORTED_TASKS = {"read_only", "coding"}
 REQUIRED_KEYS = {"handoff-version", "project", "agent", "session"}
 SUPPORTED_VERSION = "1"
 
@@ -33,6 +35,7 @@ class IssueRequest:
     agent: str
     model_alias: str | None
     session: str
+    task: str
     instructions: str
     body_sha256: str
 
@@ -103,6 +106,11 @@ def parse_issue_request(body: str) -> IssueRequest | None:
         )
     if session != "new":
         raise RequestError("session must be 'new'; other session modes are not supported")
+    task = (metadata.get("task") or "read_only").strip().lower()
+    if task not in SUPPORTED_TASKS:
+        raise RequestError(
+            f"unknown task type {task!r}; supported values are read_only and coding"
+        )
 
     return IssueRequest(
         version=metadata["handoff-version"],
@@ -110,6 +118,7 @@ def parse_issue_request(body: str) -> IssueRequest | None:
         agent=metadata["agent"].strip().lower(),
         model_alias=metadata.get("model"),
         session=session,
+        task=task,
         instructions=instructions,
         body_sha256=_sha256(text),
     )
@@ -123,6 +132,20 @@ def resolve_request(request: IssueRequest, dispatch: dict[str, Any]) -> Resolved
     project = resolve_dispatch_project(dispatch, request.project)
     if not project:
         raise RequestError(f"unknown project {request.project!r}; the dispatcher only routes explicitly configured projects")
+    if request.task == "coding":
+        coding = project.get("coding") or {}
+        if not coding.get("enabled"):
+            raise RequestError(
+                "coding tasks are disabled for this project; an owner must explicitly enable "
+                "dispatch.coding and the project coding policy"
+            )
+        selected_alias = (request.model_alias or dispatch.get("default_model") or "").strip()
+        allowed = list(coding.get("allowed_model_aliases") or [])
+        if not selected_alias or selected_alias not in allowed:
+            raise RequestError(
+                f"coding tasks require an explicitly allowed model alias from {allowed}; "
+                f"requested {selected_alias or 'the default'}"
+            )
     model, error = resolve_model(dispatch, request.model_alias)
     if error or not model:
         raise RequestError(error or "model resolution failed")
@@ -142,6 +165,7 @@ def request_fingerprint(request: IssueRequest) -> str:
                 request.agent.lower(),
                 (request.model_alias or "").lower(),
                 request.session.lower(),
+                request.task.lower(),
                 request.instructions,
             ]
         )

@@ -13,6 +13,11 @@ from ..upload import Uploader
 from ..util import FileLock, new_id, safe_title, sanitize_error, utcnow_iso, utcnow_iso_precise
 from .adapters.base import ExecutionRequest, ExecutionResult
 from .adapters.opencode import OpenCodeAdapter
+from .coding.pipeline import CodingOrchestrator, PER_STAGE_ORDER, PUBLICATION_LIMITATIONS
+from .coding.publication import TrustedPublisher, build_pr_body
+from .coding.report import coding_next_action, coding_outcome, coding_report_sections
+from .coding.testrunner import test_evidence_for_report
+from .coding.workspace import cleanup_workspace
 from .delivery import (
     build_issue_comment,
     delivery_marker,
@@ -25,7 +30,7 @@ from .delivery import (
     upload_due,
 )
 from .github import GithubError, GithubTransport
-from .ledger import Ledger, new_dispatch_record
+from .ledger import Ledger, new_coding_state, new_dispatch_record
 from .progress import ProgressReporter
 from .security import (
     WorkspaceSecurityError,
@@ -76,6 +81,14 @@ class DispatchRunner:
             for item in (dispatch.get("projects") or {}).values():
                 if isinstance(item, dict) and item.get("workspace"):
                     paths.append(str(item["workspace"]))
+                if isinstance(item, dict):
+                    coding = item.get("coding") or {}
+                    for key in ("workspace_root", "staging_root", "source_workspace"):
+                        if coding.get(key):
+                            paths.append(str(coding[key]))
+            coding_global = dispatch.get("coding") or {}
+            if coding_global.get("staging_root"):
+                paths.append(str(coding_global["staging_root"]))
             self.progress.add_redactions(paths)
 
     def _progress(self, stage: str, message: str, record: dict[str, Any] | None = None) -> None:
@@ -233,6 +246,10 @@ class DispatchRunner:
     def _recover_inflight(self, *, force: bool) -> None:
         for record in self.ledger.all():
             status = record.get("status")
+            if record.get("task_type") == "coding":
+                if status in ("CLAIMED", "RUNNING", "EXECUTION_COMPLETED"):
+                    self._recover_coding(record, force=force)
+                continue
             if status in ("CLAIMED", "RUNNING"):
                 self._recover_uncertain_execution(record, force=force)
             elif status == "EXECUTION_COMPLETED":
@@ -314,6 +331,14 @@ class DispatchRunner:
             status = record.get("status")
             if status in ("NEW", "CLAIMED", "RUNNING", "REJECTED", "NEEDS_ATTENTION", "ISSUE_UPDATED"):
                 continue
+            if record.get("task_type") == "coding":
+                if status == "EXECUTION_COMPLETED":
+                    self._advance_coding(record, force=force)
+                elif status in ("REPORT_CAPTURED", "UPLOAD_PENDING"):
+                    self._upload_and_publish(record, force=force)
+                elif status == "UPLOAD_VERIFIED":
+                    self._publish(record, force=force)
+                continue
             if status in ("EXECUTION_COMPLETED",):
                 self._recover_capture(record, force=force)
             elif status in ("REPORT_CAPTURED", "UPLOAD_PENDING"):
@@ -374,19 +399,44 @@ class DispatchRunner:
                 "model_alias": request.model_alias,
                 "model": resolved.model,
                 "session": request.session,
+                "task": request.task,
                 "instruction_bytes": len(request.instructions.encode("utf-8", errors="replace")),
                 "body_sha256": request.body_sha256,
                 "instructions": request.instructions,
             },
+            task_type=request.task,
+            coding=new_coding_state(resolved.project) if request.task == "coding" else None,
         )
         record, created = self.ledger.create(record)
         if not created:
             if record.get("status") == "NEW":
+                self._reserve_coding_ids(record)
                 self._execute(record, force=force)
             return
+        self._reserve_coding_ids(record)
+        record = self.ledger.get(repository, number) or record
         self._progress("claimed", "durable claim persisted before execution", record)
         self._log(f"claimed issue #{number} project={resolved.project.get('name')} model={resolved.model}")
         self._execute(record, force=force)
+
+    def _reserve_coding_ids(self, record: dict[str, Any]) -> dict[str, Any]:
+        if record.get("task_type") != "coding":
+            return record
+        capture = record.get("capture") or {}
+        if capture.get("task_id") and capture.get("run_id"):
+            return record
+        task_id = capture.get("task_id") or new_id("t-")
+        run_id = capture.get("run_id") or new_id("r-")
+
+        def apply(item: dict[str, Any]) -> None:
+            item.setdefault("capture", {}).update({"task_id": task_id, "run_id": run_id})
+
+        return self.ledger.update(
+            record["repository"],
+            int(record["issue_number"]),
+            apply,
+            note="reserved Agent Handoff task/run ids before coding workspace preparation",
+        )
 
     def _record_rejection(self, issue: dict[str, Any], reason: str, *, comment: bool) -> None:
         repository = self.dispatch["repository"]
@@ -519,6 +569,9 @@ class DispatchRunner:
         return safe_workspace
 
     def _execute(self, record: dict[str, Any], *, force: bool) -> None:
+        if record.get("task_type") == "coding":
+            self._execute_coding(record, force=force)
+            return
         repository = record["repository"]
         number = int(record["issue_number"])
         request_data = record.get("request") or {}
@@ -672,6 +725,408 @@ class DispatchRunner:
         current = self.ledger.get(repository, number) or current
         self._upload_and_publish(current, force=force)
 
+    def _effective_coding_execution(self, project: dict[str, Any]) -> dict[str, Any]:
+        global_execution = self.dispatch.get("execution") or {}
+        isolation = resolve_effective_isolation(global_execution.get("isolation"), project.get("execution"))
+        return {
+            "timeout_seconds": float(global_execution.get("timeout_seconds", 1200)),
+            "max_prompt_bytes": int(global_execution.get("max_prompt_bytes", 50000)),
+            "permission_profile": "workspace_write",
+            "allow_write": True,
+            "isolation": isolation,
+        }
+
+    def _coding_attention(self, record: dict[str, Any], reason: str, stage: str) -> None:
+        safe_reason = sanitize_error(reason, 1200)
+        if self.progress is not None:
+            safe_reason = self.progress.redact(safe_reason)
+        updated = self.ledger.set_status(
+            record["repository"],
+            int(record["issue_number"]),
+            "NEEDS_ATTENTION",
+            note=f"coding attention required at {stage}",
+            updates={
+                "attention_reason": safe_reason,
+                "execution": {"status": "FAILED", "last_error": safe_reason, "runner_pid": None},
+                "coding": {
+                    "blocked": True,
+                    "blocked_stage": stage,
+                    "blocked_reason": safe_reason,
+                    "artifacts_preserved": True,
+                    "agent": {"status": "uncertain"},
+                },
+            },
+        )
+        self._notify_attention(
+            updated,
+            safe_reason,
+            "Inspect the preserved workspace and session evidence. The coding agent is never re-run automatically.",
+        )
+        self.summary["needs_attention"] += 1
+        self.summary["ok"] = False
+        self._progress("needs_attention", "coding task requires operator attention; no automatic re-execution", updated)
+        self._log(f"issue #{record.get('issue_number')} coding attention at {stage}: {safe_reason}")
+
+    def _coding_adapter(self, execution: dict[str, Any]) -> OpenCodeAdapter:
+        return self._adapter_for(execution)
+
+    def _coding_orchestrator(
+        self,
+        record: dict[str, Any],
+        project: dict[str, Any],
+        execution: dict[str, Any],
+        adapter: OpenCodeAdapter,
+    ) -> CodingOrchestrator:
+        isolation = execution.get("isolation") or {}
+        identity = isolation.get("identity") or {}
+        return CodingOrchestrator(
+            config=self.config,
+            dispatch=self.dispatch,
+            ledger=self.ledger,
+            record=record,
+            project=project,
+            identity=identity,
+            adapter=adapter,
+            progress=lambda stage, message: self._progress(stage, message, record),
+            log=self._log,
+        )
+
+    def _run_coding_agent(
+        self,
+        orchestrator: CodingOrchestrator,
+        record: dict[str, Any],
+        execution: dict[str, Any],
+    ) -> ExecutionResult:
+        repository = record["repository"]
+        number = int(record["issue_number"])
+        current = self.ledger.get(repository, number) or record
+        coding = current.get("coding") or {}
+        workspace = str(coding.get("workspace") or "")
+        if not workspace:
+            raise RuntimeError("the disposable coding workspace is not available")
+        stamp = utcnow_iso().replace(":", "").replace("-", "")
+        events_path = str(self.ledger.event_path(repository, number, stamp))
+        orchestrator.mark_agent_running(events_path)
+        adapter = orchestrator.adapter
+        timeout_seconds = float(execution.get("timeout_seconds", 1200))
+        title = safe_title(
+            f"Agent Handoff issue #{number}: {current.get('issue_title') or current.get('project', {}).get('name', '')}"
+        )
+        self._progress(
+            "executing",
+            f"OpenCode coding session started with model={current.get('model')} profile=workspace_write "
+            f"(bounded timeout {timeout_seconds:g}s; no total ETA)",
+            current,
+        )
+        try:
+            result = adapter.run(
+                ExecutionRequest(
+                    model=str(current.get("model")),
+                    workspace=workspace,
+                    title=title,
+                    instructions=str((current.get("request") or {}).get("instructions") or ""),
+                    permission_profile="workspace_write",
+                    allow_write=True,
+                    timeout_seconds=timeout_seconds,
+                ),
+                events_path=events_path,
+                on_session=lambda session_id: self.ledger.update(
+                    repository,
+                    number,
+                    lambda item: item.setdefault("session", {}).update({"id": session_id}),
+                    note=f"session {session_id} started",
+                ),
+                on_progress=lambda stage, message: self._progress(stage, message, current),
+            )
+        except Exception as exc:
+            error = sanitize_error(str(exc))
+            recovered = None
+            try:
+                recovered = adapter.recover(events_path)
+            except Exception:
+                recovered = None
+            if recovered:
+                self._log(f"recovered coding session output for issue #{number} without re-execution")
+                result = recovered
+            else:
+                result = ExecutionResult(
+                    session_id=None,
+                    final_text="",
+                    termination_reason=None,
+                    exit_code=None,
+                    timed_out=False,
+                    outcome="failed",
+                    events_path=events_path,
+                    event_count=0,
+                    error=error,
+                    started_at=utcnow_iso(),
+                    finished_at=utcnow_iso(),
+                )
+        self.summary["executed"] += 1
+        self._progress(
+            "executed",
+            f"coding execution finished outcome={result.outcome} exit={result.exit_code} "
+            f"events={result.event_count}; trusted tests are next",
+            current,
+        )
+        self._log(
+            f"issue #{number} coding execution finished outcome={result.outcome} exit={result.exit_code} "
+            f"session={result.session_id or 'none'}"
+        )
+        orchestrator.mark_agent_completed(result)
+        return result
+
+    def _coding_result_for_capture(self, record: dict[str, Any]) -> ExecutionResult:
+        repository = record["repository"]
+        number = int(record["issue_number"])
+        current = self.ledger.get(repository, number) or record
+        session = current.get("session") or {}
+        execution = current.get("execution") or {}
+        coding = current.get("coding") or {}
+        events_path = session.get("events_path") or coding.get("events_path")
+        if events_path and Path(events_path).is_file():
+            try:
+                recovered = self.adapter.recover(str(events_path))
+            except Exception:
+                recovered = None
+            if recovered:
+                return recovered
+        return ExecutionResult(
+            session_id=session.get("id"),
+            final_text="",
+            termination_reason=execution.get("termination_reason"),
+            exit_code=execution.get("exit_code"),
+            timed_out=bool(execution.get("timed_out")),
+            outcome=str(execution.get("outcome") or ("blocked" if coding.get("blocked") else "unknown")),
+            events_path=events_path,
+            event_count=0,
+            error=execution.get("last_error") or coding.get("blocked_reason"),
+            started_at=execution.get("started_at") or utcnow_iso(),
+            finished_at=execution.get("finished_at") or utcnow_iso(),
+        )
+
+    def _finish_coding(
+        self,
+        record: dict[str, Any],
+        result: ExecutionResult | None,
+        *,
+        force: bool,
+    ) -> None:
+        current = self.ledger.get(record["repository"], int(record["issue_number"])) or record
+        coding = current.get("coding") or {}
+        publication = coding.get("publication") or {}
+        agent_done = bool((coding.get("milestones") or {}).get("AGENT_COMPLETED"))
+        if result is None:
+            result = self._coding_result_for_capture(current)
+        terminal_for_report = bool(coding.get("blocked")) or bool(publication.get("pr_url"))
+        if not terminal_for_report and agent_done and not publication.get("next_attempt_at"):
+            terminal_for_report = True
+        if not terminal_for_report:
+            if publication.get("next_attempt_at"):
+                self._progress(
+                    "waiting",
+                    f"coding publication retry is not due before {publication.get('next_attempt_at')}; "
+                    "the agent will not be re-executed",
+                    current,
+                )
+            return
+        capture = current.get("capture") or {}
+        if capture.get("status") == "CAPTURED":
+            self._upload_and_publish(current, force=force)
+            return
+        if self._capture(current, result, force=force):
+            current = self.ledger.get(record["repository"], int(record["issue_number"])) or current
+            self._upload_and_publish(current, force=force)
+
+    def _execute_coding(self, record: dict[str, Any], *, force: bool) -> None:
+        repository = record["repository"]
+        number = int(record["issue_number"])
+        current = self.ledger.get(repository, number) or record
+        project = self._dispatch_project_for(current)
+        project_coding = project.get("coding") or {}
+        if not project_coding.get("enabled"):
+            self._coding_attention(
+                current,
+                "coding is not enabled for this project in trusted configuration; no agent was started",
+                "REQUEST_ACCEPTED",
+            )
+            return
+        execution = self._effective_coding_execution(project)
+        isolation = execution.get("isolation") or {}
+        identity = isolation.get("identity") if isolation.get("enabled") else None
+        if not isolation.get("enabled") or not identity:
+            self._coding_attention(
+                current,
+                "coding requires effective isolation with a validated non-root identity; "
+                "root fallback is refused and no agent was started",
+                "REQUEST_ACCEPTED",
+            )
+            return
+        current = self.ledger.set_status(
+            repository,
+            number,
+            "CLAIMED",
+            note="coding request claimed before workspace preparation",
+            updates={
+                "execution": {
+                    "status": "CLAIMED",
+                    "runner_pid": os.getpid(),
+                    "permission_profile": "workspace_write",
+                    "allow_write": True,
+                    "isolation": self._isolation_ledger_state(execution),
+                },
+                "coding": {
+                    "limits": dict(project_coding.get("limits") or {}),
+                    "repository": project_coding.get("repository"),
+                    "base_branch": project_coding.get("base_branch"),
+                    "source_workspace": project_coding.get("source_workspace"),
+                    "workspace_root": project_coding.get("workspace_root"),
+                    "test_profile": project_coding.get("test_profile"),
+                    "allowed_model_aliases": list(project_coding.get("allowed_model_aliases") or []),
+                },
+            },
+        )
+        adapter = self._coding_adapter(execution)
+        orchestrator = self._coding_orchestrator(current, project, execution, adapter)
+        try:
+            current = orchestrator.prepare()
+            current = self.ledger.get(repository, number) or current
+            coding = current.get("coding") or {}
+            if coding.get("blocked"):
+                self._finish_coding(current, None, force=force)
+                return
+            stage = str(coding.get("stage") or "")
+            if stage in ("REQUEST_ACCEPTED", "CLAIMED", "WORKSPACE_PREPARED"):
+                result = self._run_coding_agent(orchestrator, current, execution)
+            else:
+                result = self._coding_result_for_capture(current)
+            current = self.ledger.get(repository, number) or current
+            current = orchestrator.continue_after_agent(force=force)
+            self._finish_coding(current, result, force=force)
+        except Exception as exc:
+            error = sanitize_error(str(exc))
+            self._coding_attention(
+                self.ledger.get(repository, number) or current,
+                f"coding pipeline raised an unexpected error: {error}",
+                "INTERNAL",
+            )
+
+    def _recover_coding(self, record: dict[str, Any], *, force: bool) -> None:
+        repository = record["repository"]
+        number = int(record["issue_number"])
+        current = self.ledger.get(repository, number) or record
+        status = current.get("status")
+        project = self._dispatch_project_for(current)
+        execution = self._effective_coding_execution(project)
+        adapter = self._coding_adapter(execution)
+        orchestrator = self._coding_orchestrator(current, project, execution, adapter)
+        if status == "CLAIMED":
+            self._progress(
+                "recovering",
+                "coding was interrupted before agent start; resuming workspace preparation without duplicate execution",
+                current,
+            )
+            self._execute_coding(current, force=force)
+            return
+        if status == "RUNNING":
+            session = current.get("session") or {}
+            events_path = session.get("events_path")
+            if events_path and Path(events_path).is_file():
+                recovered = adapter.recover(str(events_path))
+                if recovered:
+                    self._progress(
+                        "recovering",
+                        "coding session output found; resuming tests and publication without re-running OpenCode",
+                        current,
+                    )
+                    orchestrator.mark_agent_completed(recovered)
+                    current = self.ledger.get(repository, number) or current
+                    current = orchestrator.continue_after_agent(force=force)
+                    self._finish_coding(current, recovered, force=force)
+                    return
+            self._coding_attention(
+                current,
+                "dispatcher restarted during coding execution without recoverable session output; "
+                "the agent was not re-run",
+                "AGENT_RUNNING",
+            )
+            return
+        if status == "EXECUTION_COMPLETED":
+            self._advance_coding(current, force=force)
+            return
+        if status in ("REPORT_CAPTURED", "UPLOAD_PENDING"):
+            self._upload_and_publish(current, force=force)
+            return
+        if status == "UPLOAD_VERIFIED":
+            self._publish(current, force=force)
+
+    def _advance_coding(self, record: dict[str, Any], *, force: bool) -> None:
+        repository = record["repository"]
+        number = int(record["issue_number"])
+        current = self.ledger.get(repository, number) or record
+        coding = current.get("coding") or {}
+        publication = coding.get("publication") or {}
+        capture = current.get("capture") or {}
+        if capture.get("status") == "CAPTURED":
+            self._upload_and_publish(current, force=force)
+            return
+        if coding.get("blocked") or publication.get("pr_url"):
+            result = self._coding_result_for_capture(current)
+            self._finish_coding(current, result, force=force)
+            return
+        if publication.get("next_attempt_at") and not force:
+            from datetime import datetime
+
+            from ..util import utcnow
+
+            try:
+                due = datetime.fromisoformat(str(publication["next_attempt_at"]).replace("Z", "+00:00")) <= utcnow()
+            except ValueError:
+                due = True
+            if not due:
+                self._progress(
+                    "waiting",
+                    f"coding publication retry is not due before {publication.get('next_attempt_at')}; "
+                    "OpenCode is not re-executed",
+                    current,
+                )
+                return
+        project = self._dispatch_project_for(current)
+        execution = self._effective_coding_execution(project)
+        adapter = self._coding_adapter(execution)
+        orchestrator = self._coding_orchestrator(current, project, execution, adapter)
+        result = self._coding_result_for_capture(current)
+        current = orchestrator.continue_after_agent(force=force)
+        self._finish_coding(current, result, force=force)
+
+    def _cleanup_coding_after_capture(self, record: dict[str, Any]) -> None:
+        project = self._dispatch_project_for(record)
+        project_coding = project.get("coding") or {}
+        if not project_coding.get("cleanup_on_success", True):
+            return
+        execution = self._effective_coding_execution(project)
+        isolation = execution.get("isolation") or {}
+        identity = isolation.get("identity") if isolation.get("enabled") else None
+        coding = record.get("coding") or {}
+        workspace = str(coding.get("workspace") or "")
+        root = str(project_coding.get("workspace_root") or "")
+        if not identity or not workspace or not root:
+            return
+        try:
+            removed = cleanup_workspace(root, workspace, identity=identity)
+        except OSError as exc:
+            self.summary["warnings"].append(f"coding workspace cleanup failed: {sanitize_error(str(exc))}")
+            return
+        if removed:
+            self.ledger.update(
+                record["repository"],
+                int(record["issue_number"]),
+                lambda item: item.setdefault("coding", {}).update(
+                    {"workspace": None, "cleaned_up": True, "artifacts_preserved": False}
+                ),
+                note="disposable coding workspace removed after verified report capture",
+            )
+
     def _apply_execution_result(self, record: dict[str, Any], result: ExecutionResult) -> None:
         self.ledger.set_status(
             record["repository"],
@@ -740,6 +1195,40 @@ class DispatchRunner:
         request_data = current.get("request") or {}
         session = current.get("session") or {}
         instructions = str(request_data.get("instructions") or "")
+        coding = current.get("coding") or {}
+        is_coding = current.get("task_type") == "coding"
+        if is_coding:
+            tests_payload = test_evidence_for_report(coding.get("tests") or {})
+            deployment_payload = {
+                "status": "not_applicable",
+                "details": "C2 does not deploy. A human owner must review and merge the Draft PR.",
+            }
+            publication = coding.get("publication") or {}
+            report_repository = coding.get("repository")
+            report_branch = publication.get("branch")
+            report_commit = publication.get("commit")
+            report_pr_url = publication.get("pr_url")
+            report_remaining = coding_next_action(current)
+            report_blockers = coding.get("blocked_reason") if coding.get("blocked") else None
+            report_error = result.error or coding.get("blocked_reason")
+            report_outcome = result.outcome
+        else:
+            tests_payload = {
+                "status": "not_verified",
+                "details": "Task executed through the Agent Handoff dispatcher; no independent test evidence.",
+            }
+            deployment_payload = {
+                "status": "not_verified",
+                "details": "No independent deployment evidence was captured.",
+            }
+            report_repository = None
+            report_branch = None
+            report_commit = None
+            report_pr_url = None
+            report_remaining = None
+            report_blockers = None
+            report_error = result.error
+            report_outcome = result.outcome
         try:
             project, task_path, meta, run_path, complete = self.store.run_record(project, task_id, run_id)
         except FileNotFoundError:
@@ -772,34 +1261,40 @@ class DispatchRunner:
                             task_id=task_id,
                         )
                     run_path = task_path / "RUNS" / run_id
-                    git = git_info(str((current.get("project") or {}).get("workspace") or ""))
+                    if is_coding:
+                        git = {
+                            "repository": report_repository,
+                            "branch": report_branch,
+                            "commit": report_commit,
+                        }
+                    else:
+                        git = git_info(str((current.get("project") or {}).get("workspace") or ""))
+                    summary_text = result.final_text or (
+                        coding.get("blocked_reason") if is_coding else None
+                    ) or "No final assistant output was captured."
                     report_text = auto_report(
                         task_id=task_id,
                         run_id=run_id,
                         agent="opencode",
                         session_id=session.get("id"),
                         model=str(current.get("model")),
-                        outcome=result.outcome,
-                        summary=result.final_text or "No final assistant output was captured.",
-                        repository=git.get("repository"),
-                        branch=git.get("branch"),
-                        commit=git.get("commit"),
-                        pr_url=None,
-                        tests={
-                            "status": "not_verified",
-                            "details": "Task executed through the Agent Handoff dispatcher; no independent test evidence.",
-                        },
-                        deployment={
-                            "status": "not_verified",
-                            "details": "No independent deployment evidence was captured.",
-                        },
-                        error=result.error,
+                        outcome=report_outcome,
+                        summary=summary_text,
+                        repository=report_repository or git.get("repository"),
+                        branch=report_branch or git.get("branch"),
+                        commit=report_commit or git.get("commit"),
+                        pr_url=report_pr_url,
+                        tests=tests_payload,
+                        deployment=deployment_payload,
+                        error=report_error,
                         termination_reason=result.termination_reason,
-                        remaining_issues=None,
-                        blockers=None,
+                        remaining_issues=report_remaining,
+                        blockers=report_blockers,
                         run_dir=str(run_path),
                         remote_report_path=f"TASKS/{meta['task_folder']}/RUNS/{run_id}/REPORT.md",
                     )
+                    if is_coding:
+                        report_text += coding_report_sections(current)
                     dispatch_context = [
                         "",
                         "## Dispatch context",
@@ -809,31 +1304,33 @@ class DispatchRunner:
                         f"- Route: project `{(current.get('project') or {}).get('name')}`, agent `opencode`, model `{current.get('model')}`",
                         f"- Session: `{session.get('id') or 'not captured'}`",
                         f"- Execution outcome: `{result.outcome}`",
+                        f"- Task type: `{current.get('task_type') or 'read_only'}`",
                     ]
+                    if is_coding:
+                        dispatch_context.extend(
+                            [
+                                f"- Coding outcome: `{coding_outcome(current)}`",
+                                f"- Draft PR: {report_pr_url or 'not created'}",
+                            ]
+                        )
                     run_path, complete = self.store.add_run(
                         project,
                         task_path,
                         meta,
-                        outcome=result.outcome,
+                        outcome=report_outcome,
                         report_text=report_text + "\n".join(dispatch_context) + "\n",
                         run_prompt_text=instructions,
-                        tests={
-                            "status": "not_verified",
-                            "details": "Task executed through the Agent Handoff dispatcher; no independent test evidence.",
-                        },
-                        deployment={
-                            "status": "not_verified",
-                            "details": "No independent deployment evidence was captured.",
-                        },
-                        summary=result.final_text[:50000] if result.final_text else "No final assistant output was captured.",
-                        error=result.error,
+                        tests=tests_payload,
+                        deployment=deployment_payload,
+                        summary=summary_text[:50000],
+                        error=report_error,
                         termination_reason=result.termination_reason,
-                        remaining_issues=None,
-                        blockers=None,
-                        repository=git.get("repository"),
-                        branch=git.get("branch"),
-                        commit=git.get("commit"),
-                        pr_url=None,
+                        remaining_issues=report_remaining,
+                        blockers=report_blockers,
+                        repository=report_repository or git.get("repository"),
+                        branch=report_branch or git.get("branch"),
+                        commit=report_commit or git.get("commit"),
+                        pr_url=report_pr_url,
                         session_id=session.get("id"),
                         model=str(current.get("model")),
                         run_id=run_id,
@@ -841,19 +1338,40 @@ class DispatchRunner:
                         auto_generated=True,
                         event_key=f"dispatch:{repository}#{number}:{run_id}",
                     )
-                    self.store.update_complete(
-                        run_path,
-                        {
-                            "dispatch": {
-                                "repository": repository,
-                                "issue_number": number,
-                                "issue_url": current.get("issue_url"),
-                                "dispatch_id": current.get("dispatch_id"),
-                                "workspace": (current.get("project") or {}).get("workspace"),
-                                "events_path": session.get("events_path"),
-                            }
-                        },
-                    )
+                    dispatch_metadata = {
+                        "repository": repository,
+                        "issue_number": number,
+                        "issue_url": current.get("issue_url"),
+                        "dispatch_id": current.get("dispatch_id"),
+                        "workspace": (current.get("project") or {}).get("workspace"),
+                        "events_path": session.get("events_path"),
+                        "task_type": current.get("task_type") or "read_only",
+                    }
+                    complete_updates: dict[str, Any] = {"dispatch": dispatch_metadata}
+                    if is_coding:
+                        complete_updates["coding"] = {
+                            "outcome": coding_outcome(current),
+                            "stage": coding.get("stage"),
+                            "repository": coding.get("repository"),
+                            "base_branch": coding.get("base_branch"),
+                            "base_commit": coding.get("base_commit"),
+                            "workspace": coding.get("workspace"),
+                            "branch": report_branch,
+                            "commit": report_commit,
+                            "pr_url": report_pr_url,
+                            "pr_number": (coding.get("publication") or {}).get("pr_number"),
+                            "draft": (coding.get("publication") or {}).get("draft"),
+                            "tests": {"status": (coding.get("tests") or {}).get("status")},
+                            "diff": {
+                                "status": (coding.get("diff") or {}).get("status"),
+                                "changed_count": (coding.get("diff") or {}).get("changed_count"),
+                            },
+                            "blocked": bool(coding.get("blocked")),
+                            "blocked_stage": coding.get("blocked_stage"),
+                            "blocked_reason": coding.get("blocked_reason"),
+                            "milestones": coding.get("milestones"),
+                        }
+                    self.store.update_complete(run_path, complete_updates)
                     self.store.write_local_index(project)
                     self.store.queue_run(project, task_path, meta, run_path, run_id)
             except Exception as exc:
@@ -887,7 +1405,80 @@ class DispatchRunner:
             },
         )
         self._progress("captured", f"report captured as task={task_id} run={run_id}; upload is pending", current)
+        if is_coding and (coding.get("publication") or {}).get("pr_url") and not coding.get("blocked"):
+            self._cleanup_coding_after_capture(current)
         return True
+
+    def _update_coding_pr_report_link(self, record: dict[str, Any]) -> None:
+        if record.get("task_type") != "coding":
+            return
+        coding = record.get("coding") or {}
+        publication = coding.get("publication") or {}
+        upload = record.get("upload") or {}
+        report_url = upload.get("report_url") if upload.get("verified") else None
+        pr_number = publication.get("pr_number")
+        pr_url = publication.get("pr_url")
+        if not report_url or not pr_number or not pr_url or publication.get("report_link_updated"):
+            return
+        project = self._dispatch_project_for(record)
+        project_coding = project.get("coding") or {}
+        project_publication = project_coding.get("publication") or {}
+        global_coding = self.dispatch.get("coding") or {}
+        try:
+            publisher = TrustedPublisher(
+                repository=str(project_coding.get("repository") or ""),
+                base_branch=str(project_coding.get("base_branch") or ""),
+                branch_prefix=str(project_publication.get("branch_prefix") or "agent-handoff/"),
+                staging_root=str(global_coding.get("staging_root") or ""),
+                gh_command=str((self.dispatch.get("github") or {}).get("command") or "gh"),
+                token_env=project_publication.get("token_env"),
+                max_file_bytes=int((project_coding.get("limits") or {}).get("max_file_bytes", 200_000)),
+            )
+            capture = record.get("capture") or {}
+            body = build_pr_body(
+                task_id=str(capture.get("task_id") or ""),
+                run_id=str(capture.get("run_id") or ""),
+                title=str(record.get("issue_title") or f"Agent Handoff issue #{record.get('issue_number')}"),
+                issue_url=record.get("issue_url"),
+                base_commit=str(coding.get("base_commit") or ""),
+                branch=str(publication.get("branch") or ""),
+                validation=coding.get("diff") or {},
+                tests=coding.get("tests") or {},
+                report_url=report_url,
+                limitations=PUBLICATION_LIMITATIONS,
+            )
+            publisher.update_pr_body(pr_number=int(pr_number), body=body)
+        except Exception as exc:
+            message = sanitize_error(f"could not add the verified report link to the Draft PR: {exc}", 500)
+            self.summary.setdefault("warnings", []).append(message)
+            self._log(message)
+            return
+        self.ledger.update(
+            record["repository"],
+            int(record["issue_number"]),
+            lambda item: item.setdefault("coding", {}).setdefault("publication", {}).update(
+                {"report_link_updated": True, "report_link_updated_at": utcnow_iso_precise()}
+            ),
+            note="verified report link added to the Draft PR body",
+        )
+
+    def _mark_coding_milestone(self, record: dict[str, Any], stage: str, milestone: str | None = None, note: str = "") -> None:
+        if record.get("task_type") != "coding":
+            return
+
+        def apply(item: dict[str, Any]) -> None:
+            coding = item.setdefault("coding", {})
+            current = str(coding.get("stage") or "")
+            if PER_STAGE_ORDER.get(stage, -1) >= PER_STAGE_ORDER.get(current, -1):
+                coding["stage"] = stage
+            if milestone:
+                coding.setdefault("milestones", {})[milestone] = True
+            if stage == "UPLOAD_VERIFIED":
+                coding["upload_verified_at"] = utcnow_iso_precise()
+            if stage == "ISSUE_UPDATED":
+                coding["report_delivered_at"] = utcnow_iso_precise()
+
+        self.ledger.update(record["repository"], int(record["issue_number"]), apply, note=note or f"coding milestone {stage}")
 
     def _upload_and_publish(self, record: dict[str, Any], *, force: bool) -> None:
         current = self.ledger.get(record["repository"], int(record["issue_number"])) or record
@@ -1008,11 +1599,16 @@ class DispatchRunner:
         )
         self.summary["uploaded"] += 1
         current = self.ledger.get(current["repository"], int(current["issue_number"])) or current
+        self._mark_coding_milestone(current, "UPLOAD_VERIFIED", note="coding report upload verified")
+        current = self.ledger.get(current["repository"], int(current["issue_number"])) or current
         self._progress("verified", "report upload and receipt passed MD5/read-back verification", current)
         self._publish(current, force=force)
 
     def _publish(self, record: dict[str, Any], *, force: bool) -> None:
         current = self.ledger.get(record["repository"], int(record["issue_number"])) or record
+        if current.get("task_type") == "coding":
+            self._update_coding_pr_report_link(current)
+            current = self.ledger.get(current["repository"], int(current["issue_number"])) or current
         if current.get("status") == "ISSUE_UPDATED":
             return
         publication = current.get("publication") or {}
@@ -1100,6 +1696,8 @@ class DispatchRunner:
                         "attention_reason": None,
                     },
                 )
+                self._mark_coding_milestone(updated, "ISSUE_UPDATED", milestone="REPORT_DELIVERED", note="coding report delivery confirmed")
+                updated = self.ledger.get(updated["repository"], int(updated["issue_number"])) or updated
                 self._notify_completed(updated)
                 self._progress("completed", "existing delivery comment was already present; no duplicate was posted", current)
                 return
@@ -1123,6 +1721,8 @@ class DispatchRunner:
                     "attention_reason": None,
                 },
             )
+            self._mark_coding_milestone(updated, "ISSUE_UPDATED", milestone="REPORT_DELIVERED", note="coding report delivered to the originating issue")
+            updated = self.ledger.get(updated["repository"], int(updated["issue_number"])) or updated
             self._notify_completed(updated)
             self.summary["published"] += 1
             self._progress("completed", "verified report URL published to the originating issue", current)
