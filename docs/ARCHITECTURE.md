@@ -38,8 +38,9 @@ The installer applies one source-selection policy to Git and non-Git checkouts. 
 - `github.py`: `gh`-based transport for repository verification, issue polling, comments, and idempotency-marker lookup.
 - `runner.py`: claim/execute/capture/upload/publish state machine, restart recovery, and per-record error isolation.
 - `delivery.py`: verified upload reconciliation, direct Drive URL resolution, `UPLOAD-RECEIPT.json`, remote `COMPLETE.json` re-upload, comment rendering, and publication backoff.
+- `security.py`: C1 identity, allowlisted child environment, dedicated model-auth, and canonical workspace/protected-path/dirty-tree validation. It never creates an OS account or workspace.
 - `adapters/base.py`: small execution-adapter protocol so a future CLI adapter can be added without changing the ledger, GitHub transport, project routing, upload, or delivery.
-- `adapters/opencode.py`: the only v1.1 execution adapter. Sets both `cwd` and `PWD` to the canonical workspace, uses `--pure`, applies a read-only or explicitly enabled write permission policy, streams JSON events to a mode-600 session file, preserves the session ID as soon as it appears, emits bounded execution heartbeats without prompt content, and terminates its process group on timeout or orderly shutdown.
+- `adapters/opencode.py`: the only v1.1 execution adapter. Sets both `cwd` and `PWD` to the canonical workspace, uses `--pure`, applies a read-only or explicitly enabled write permission policy, streams JSON events to a mode-600 session file, preserves the session ID as soon as it appears, emits bounded execution heartbeats without prompt content, and terminates its process group on timeout or orderly shutdown. When C1 isolation is enabled for the effective project policy, it launches after identity, model-auth, workspace, ancestor, Git-metadata, and trusted-executable preflight with the configured non-root UID/GID, empty supplementary groups, and an allowlisted environment. Legacy read-only projects can remain non-isolated in the same dispatcher; write-capable projects must resolve to isolation.
 
 ### Optional notifications (`lib/agent_handoff/notify`)
 
@@ -93,7 +94,8 @@ gh transport: repository private + author allowed + metadata parsed
 durable ledger: NEW -> CLAIMED -> RUNNING
         |
         v
-OpenCode adapter (cwd == PWD == configured workspace, exact configured model)
+OpenCode adapter (effective project policy; optional C1 UID/GID drop and allowlisted env;
+                  cwd == PWD == validated workspace; exact configured model)
         |
         v
 raw JSON event file + session ID persisted incrementally

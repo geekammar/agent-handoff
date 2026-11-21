@@ -8,6 +8,7 @@ This is the neutral first entrypoint for coding agents working on or with Agent 
 - Capture integrations for OpenCode (plugin) and AGY (Stop hook).
 - An optional v1.1 dispatcher that polls a private GitHub Issue inbox, validates explicit project/model/session requests, runs OpenCode in the configured workspace, captures the report through the core, verifies the Drive upload, and publishes the direct report URL to the originating issue.
 - An optional v1.2 P1 Telegram notification outbox that reports verified delivery, attention states, and a copy-ready Arabic ChatGPT prompt without coupling notification failure to report delivery.
+- An opt-in C1 secure coding execution foundation: per-project policy, dedicated non-root child identity, allowlisted child environment, dedicated HOME/XDG/model auth, and canonical clean-workspace validation. It is disabled by default and production coding tasks are not enabled.
 - No database server, web dashboard, inbound public service, SaaS hosting, or mandatory cloud account.
 
 ## Sources of truth
@@ -17,6 +18,7 @@ This is the neutral first entrypoint for coding agents working on or with Agent 
 | Product overview and quick start | `README.md` |
 | Architecture and runtime boundaries | `docs/ARCHITECTURE.md` |
 | Dispatcher behavior, state machine, security | `docs/DISPATCH.md` |
+| C1 secure coding foundation and staging acceptance | `docs/SECURE-CODING.md` |
 | AI-assisted setup | `docs/AI-QUICKSTART.md` |
 | Acceptance evidence | `docs/ACCEPTANCE.md` |
 | Failure recovery | `docs/TROUBLESHOOTING.md` |
@@ -45,6 +47,7 @@ Do not invent commands, config fields, model IDs, or guarantees. If documentatio
 - No public HTTP API, dashboard, database server, containers, or SaaS hosting.
 - No automatic deployment of unrelated applications.
 - No generic notification platform, bot provisioning, Telegram login, or guaranteed exactly-once Telegram delivery.
+- No C1 coding-task enablement, OS account creation, provider-key creation, workspace provisioning, test execution, commit automation, or Draft PR automation. C2 is deferred.
 
 ## Safe setup sequence
 

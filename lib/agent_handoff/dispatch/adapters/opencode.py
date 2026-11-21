@@ -12,6 +12,12 @@ from typing import Any, Callable, Iterable, Mapping
 
 from ...notify.config import DEFAULT_TOKEN_ENV
 from ...util import ensure_dir, sanitize_error, utc_from_timestamp, utcnow_iso
+from ..security import (
+    build_isolated_environment,
+    popen_isolation_kwargs,
+    resolve_opencode_binary,
+    validate_model_auth,
+)
 from .base import ExecutionRequest, ExecutionResult
 
 EXECUTION_HEARTBEAT_SECONDS = 10.0
@@ -147,17 +153,27 @@ def _outcome(parser: OpenCodeEventParser, exit_code: int | None, timed_out: bool
 class OpenCodeAdapter:
     name = "opencode"
 
-    def __init__(self, execution: dict[str, Any], *, secret_env_names: Iterable[str] | None = None):
+    def __init__(
+        self,
+        execution: dict[str, Any],
+        *,
+        secret_env_names: Iterable[str] | None = None,
+        identity: Mapping[str, Any] | None = None,
+    ):
         self.execution = execution
-        self.permission_profile = execution.get("permission_profile", "read_only")
+        self.permission_profile = str(execution.get("permission_profile", "read_only"))
         self.allow_write = bool(execution.get("allow_write", False))
         self.timeout_seconds = float(execution.get("timeout_seconds", 1200))
         names = (DEFAULT_TOKEN_ENV,) if secret_env_names is None else tuple(secret_env_names)
         self.secret_env_names = tuple(name for name in names if name)
+        self.identity = dict(identity) if identity else None
 
     def _command(self, request: ExecutionRequest) -> list[str]:
-        binary = os.environ.get("AGENT_HANDOFF_OPENCODE_BIN") or "opencode"
-        agent = "build" if self.permission_profile == "workspace_write" else "plan"
+        if self.identity:
+            binary = resolve_opencode_binary(self.identity, os.environ, workspace=request.workspace)
+        else:
+            binary = os.environ.get("AGENT_HANDOFF_OPENCODE_BIN") or "opencode"
+        agent = "build" if request.permission_profile == "workspace_write" else "plan"
         prompt = "Task submitted through Agent Handoff:\n\n" + request.instructions
         return [
             binary,
@@ -175,9 +191,17 @@ class OpenCodeAdapter:
         ]
 
     def _environment(self, request: ExecutionRequest) -> dict[str, str]:
+        policy = _policy(request.permission_profile, request.allow_write)
+        if self.identity:
+            return build_isolated_environment(
+                self.identity,
+                workspace=request.workspace,
+                policy=policy,
+                parent_env=os.environ,
+            )
         env = filter_agent_environment(os.environ, self.secret_env_names)
         env["PWD"] = request.workspace
-        env["OPENCODE_CONFIG_CONTENT"] = json.dumps(_policy(self.permission_profile, self.allow_write))
+        env["OPENCODE_CONFIG_CONTENT"] = json.dumps(policy)
         return env
 
     def run(
@@ -238,6 +262,9 @@ class OpenCodeAdapter:
         wait_started = time.monotonic()
         deadline = wait_started + request.timeout_seconds
         try:
+            isolation_kwargs = popen_isolation_kwargs(self.identity)
+            if self.identity:
+                validate_model_auth(self.identity)
             process = subprocess.Popen(
                 self._command(request),
                 cwd=workspace,
@@ -248,6 +275,7 @@ class OpenCodeAdapter:
                 text=True,
                 bufsize=1,
                 start_new_session=True,
+                **isolation_kwargs,
             )
             stdout_thread = threading.Thread(target=read_stdout, args=(process.stdout,), daemon=True)
             stderr_thread = threading.Thread(target=read_stderr, args=(process.stderr,), daemon=True)
