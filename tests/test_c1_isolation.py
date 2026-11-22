@@ -38,7 +38,6 @@ from agent_handoff.dispatch.ledger import new_dispatch_record  # noqa: E402
 from agent_handoff.dispatch.requests import RequestError, parse_issue_request  # noqa: E402
 from agent_handoff.dispatch.runner import DispatchRunner  # noqa: E402
 from agent_handoff.dispatch.security import (  # noqa: E402
-    DEFAULT_CHILD_PATH,
     IdentityError,
     IsolationError,
     WorkspaceSecurityError,
@@ -70,6 +69,7 @@ SECRET_NAMES = (
 )
 UID = 4242
 GID = 4242
+TEST_CHILD_PATH = "/usr/bin:/bin"
 
 
 def fake_identity(
@@ -89,7 +89,7 @@ def fake_identity(
         "data_home": f"{home}/.local/share",
         "cache_home": f"{home}/.cache",
         "tmp_dir": f"{home}/tmp",
-        "child_path": DEFAULT_CHILD_PATH,
+        "child_path": TEST_CHILD_PATH,
         "model_auth_path": f"{home}/.local/share/opencode/auth.json",
     }
 
@@ -109,7 +109,7 @@ def isolation_config(harness: Harness, *, roots: list[str] | None = None) -> dic
             "home": "/srv/agent-handoff/home/agent-handoff-dev",
         },
         "workspace_roots": roots or [str(harness.workspace)],
-        "child_path": DEFAULT_CHILD_PATH,
+        "child_path": TEST_CHILD_PATH,
     }
     return config
 
@@ -166,7 +166,7 @@ def mixed_project_config(
             "home": "/srv/agent-handoff/home/agent-handoff-dev",
         },
         "workspace_roots": [str(harness.workspace)],
-        "child_path": DEFAULT_CHILD_PATH,
+        "child_path": TEST_CHILD_PATH,
     }
     return config
 
@@ -570,7 +570,7 @@ class C1IdentityAndEnvironmentTests(unittest.TestCase):
         for name in SECRET_NAMES:
             self.assertNotIn(name, env)
         self.assertNotIn("PATH", {key for key in env if env[key].startswith("/root")})
-        self.assertEqual(env["PATH"], DEFAULT_CHILD_PATH)
+        self.assertEqual(env["PATH"], TEST_CHILD_PATH)
         self.assertEqual(env["LANG"], "C.UTF-8")
         self.assertEqual(env["PWD"], "/srv/work/repo")
         self.assertEqual(json.loads(env["OPENCODE_CONFIG_CONTENT"]), READ_ONLY_POLICY)
@@ -911,7 +911,7 @@ class C1OsPrivilegeTests(unittest.TestCase):
             result = subprocess.run(
                 [sys.executable, "-c", script, str(secret)],
                 cwd=str(root),
-                env={"PATH": DEFAULT_CHILD_PATH},
+                env={"PATH": TEST_CHILD_PATH},
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1254,7 +1254,7 @@ class C1MixedProjectDispatchTests(unittest.TestCase):
             "identity": {"user": "nobody", "home": str(home)},
             "workspace_roots": [str(work_root)],
             "denied_projects": ["Rabet", "Yakfi"],
-            "child_path": f"{h.fake_bin}:/usr/local/bin:/usr/bin:/bin",
+            "child_path": f"{h.fake_bin}:{TEST_CHILD_PATH}",
         }
         h.config = config
         h.write_config()

@@ -74,7 +74,6 @@ from agent_handoff.dispatch.requests import (  # noqa: E402
 )
 from agent_handoff.dispatch.runner import DispatchRunner  # noqa: E402
 from agent_handoff.dispatch.security import (  # noqa: E402
-    DEFAULT_CHILD_PATH,
     IdentityError,
     IsolationError,
     build_isolated_environment,
@@ -89,6 +88,7 @@ from agent_handoff.util import utcnow_iso  # noqa: E402
 UID = 4242
 GID = 4242
 PROJECT_REPO = "dev/coding-repo"
+TEST_CHILD_PATH = "/usr/bin:/bin"
 
 
 def fake_identity() -> dict:
@@ -104,7 +104,7 @@ def fake_identity() -> dict:
         "data_home": f"{home}/.local/share",
         "cache_home": f"{home}/.cache",
         "tmp_dir": f"{home}/tmp",
-        "child_path": DEFAULT_CHILD_PATH,
+        "child_path": TEST_CHILD_PATH,
         "model_auth_path": f"{home}/.local/share/opencode/auth.json",
     }
 
@@ -383,7 +383,7 @@ class TestCodingConfigAndRequests(unittest.TestCase):
                 "home": "/srv/agent-handoff/home/agent-handoff-dev",
             },
             "workspace_roots": [str(h.workspace)],
-            "child_path": DEFAULT_CHILD_PATH,
+            "child_path": TEST_CHILD_PATH,
         }
         config["dispatch"]["coding"] = {
             **coding_global(),
@@ -996,7 +996,7 @@ class TestTrustedChildPath(unittest.TestCase):
         }
 
     def test_safe_default_path_is_accepted_and_resolves(self) -> None:
-        entries = validate_child_path(DEFAULT_CHILD_PATH, fake_identity())
+        entries = validate_child_path(TEST_CHILD_PATH, fake_identity())
         self.assertIn("/usr/bin", entries)
         self.assertIn("/bin", entries)
         resolved = resolve_trusted_path_executable("python3", fake_identity())
