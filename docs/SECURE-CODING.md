@@ -385,9 +385,19 @@ For each coding task:
 4. Clone the source into that directory as the dedicated non-root identity, detach at the verified base SHA, reject any symlink, and require a clean tree.
 5. Run OpenCode only in this disposable workspace. The active developer checkout is only a source of committed Git objects.
 6. On success and after verified report capture, remove the workspace when `cleanup_on_success` is true. Failed or blocked tasks preserve the workspace and durable evidence for review.
-7. Cleanup refuses paths outside the managed root, symlinks, unexpected names, and directories not owned by the dedicated identity.
+7. Cleanup refuses paths outside the managed root, symlinks, unexpected names, and directories not owned by the dedicated identity. A task cannot clean another task's directory: the expected `issue-<number>-<task_id>` basename is checked again at cleanup time.
 
-The publisher never runs Git hooks or repository-controlled filters with parent privileges. It verifies the configured repository identity through GitHub, checks the staging root and its ancestors are parent-owned and non-child-writable, creates a fresh parent-owned staging repository, fetches the base from the trusted GitHub repository, copies only digest-verified regular files (using `O_NOFOLLOW`), stages them explicitly, and commits with hooks disabled and `--no-verify`. Git global/system configuration, hooks, fsmonitor, replacement objects, pager, and credential helpers are disabled for privileged Git operations. `protocol.file.allow=always` is enabled only for the documented local workspace-clone path and tests, not for the publication fetch/push path.
+Resume revalidates the persisted workspace before OpenCode or its artifacts are used:
+
+- the original path is inspected with `lstat` before any `realpath`, so a symlink/path swap is rejected;
+- the basename must equal the expected `issue-<number>-<task_id>`, and the canonical path must be a direct child of the managed root;
+- directory UID/GID and private permissions, `.git` type/UID/GID/mode, origin identity, base ref, and base commit are verified;
+- before the agent starts the tree must be clean; after a genuine interrupted task the workspace may be modified, but only when the persisted validated manifest still matches the actual files exactly;
+- any mismatch blocks publication instead of rerunning the agent or adopting another task's workspace.
+
+The publisher never runs Git hooks or repository-controlled filters with parent privileges. It verifies the configured repository identity through GitHub, checks the staging root and its ancestors are parent-owned and non-child-writable, creates a fresh parent-owned staging repository, fetches the base from the trusted GitHub repository, copies only digest-verified regular files (using `O_NOFOLLOW` and symlink-free destination parents), stages them explicitly, and commits with hooks disabled and `--no-verify`. Git global/system configuration, hooks, fsmonitor, replacement objects, pager, and credential helpers are disabled for privileged Git operations. `protocol.file.allow=always` is enabled only for the documented local workspace-clone path and tests, not for the publication fetch/push path.
+
+Git authentication helpers are never placed inside the publication staging tree. For each authenticated Git operation the parent creates a fresh `.auth-*` directory under the validated staging root, creates `.askpass.sh` with `O_CREAT|O_EXCL|O_NOFOLLOW` and mode `0700`, verifies its ownership/content/mode, and removes the directory in a `finally` block. The token is passed only as a short-lived environment variable to the trusted Git process; it is never written to disk, the staging tree, a report, a log, or the OpenCode/test child environment. `.askpass.sh`, `.git-credentials`, `.gitconfig`, `.netrc`, and `.auth-*` names are reserved and rejected in every validation manifest.
 
 ### Trusted test execution
 
@@ -401,7 +411,7 @@ Tests run in the same disposable workspace under the same dedicated non-root ide
 - exit code, duration, timeout state, and truncated logs recorded;
 - fail-fast on the first failing command.
 
-If any trusted test fails or times out, C2 records the evidence, does not create a commit/branch/PR, does not claim acceptance, and still generates and delivers an honest report. It never reruns the agent indefinitely or publishes failing code automatically.
+If any trusted test fails or times out, C2 persists the failure evidence and the blocked state in one durable ledger transition. A mandatory test gate runs before diff validation, commit, push, and PR creation, and again on every resume. Only an explicit `tests.status == passed` with a matching configured profile, non-empty executed commands, verified zero exit codes, no timeout, and no orphaned process group satisfies the gate. `failed`, `timed_out`, `interrupted`, `orphans`, `error`, missing, unknown, or malformed evidence fails closed. A stale `TESTS_PASSED` milestone is cleared and cannot override failure evidence. C2 still generates and delivers an honest report, but never reruns the agent or publishes failing code automatically.
 
 ### Artifact integrity from validation to commit
 
@@ -412,7 +422,9 @@ If any trusted test fails or times out, C2 records the evidence, does not create
 3. After `git add`, the staged index blob and mode are verified against the manifest.
 4. After commit, the committed tree path set, blob content digest, and mode are verified against the manifest.
 5. Deleted paths must be absent from the index and committed tree.
-6. Unexpected staged or committed paths fail closed.
+6. Copy (`C`) and rename (`R`) statuses are distinguished: a rename removes its source path, a copy must leave its source present and unchanged, and a modified copy source is validated as its own changed file. Protected copy sources are refused.
+7. Staged and committed path sets are compared with rename detection disabled, so a rename is always verified as one deletion plus one addition against the exact manifest.
+8. Unexpected staged or committed paths fail closed.
 
 A concurrent mutation is a publication failure, not a warning. The agent and trusted-test process groups are checked after execution; a lingering group is terminated and the task is blocked from publication.
 
@@ -421,12 +433,12 @@ A concurrent mutation is a publication failure, not a warning. The agent and tru
 Before commit, C2 records changed paths and rejects:
 
 - absolute paths, `..`, control characters, or `.git` metadata;
-- protected paths and paths outside an optional allowlist;
+- protected paths and paths outside an optional allowlist. Mandatory protected paths always apply and configuration can only add patterns, never remove them: root-level and nested `.ssh`, `credentials`, `.env*`, `auth.json`, `rclone.conf`, `.askpass.sh`, `.gitconfig`, `.git-credentials`, `.netrc`, `.gitattributes`, keys/certificates, and `.git`/GitHub workflow metadata;
 - symlinks, submodules, binary files, and unsupported Git modes;
 - excess changed files, diff bytes, file sizes, or workspace size;
 - obvious secret material (defense in depth; values are redacted from evidence).
 
-The publisher validates the repository, branch namespace, base commit ancestry, commit parent, and committed path set. It pushes without force, refuses protected/default branches, verifies the remote branch SHA, and creates or recovers exactly one Draft PR by a stable body marker. After the report upload is verified, the dispatcher updates that same Draft PR body with the verified report link; an update failure is recorded as a warning and does not block Issue/report delivery. Multiple matching PRs, a non-Draft PR, or an existing branch with a different commit fail closed.
+The publisher validates the repository, branch namespace, base commit ancestry, commit parent, and committed path set. It pushes without force, refuses protected/default branches, verifies the remote branch SHA, and creates or recovers exactly one Draft PR by a stable body marker. Before reuse or a body update it requires the PR to be open, Draft, on the expected branch/base, and at the verified head SHA; a moved, closed, merged, non-Draft, or mismatched PR fails closed. After the report upload is verified, the dispatcher updates that same Draft PR body with the verified report link; an update failure is recorded as a warning and does not block Issue/report delivery. Multiple matching PRs, or an existing branch with a different commit, fail closed. Transient commit/push/PR failures use bounded retry/backoff. A lost staging repository is recovered by remote SHA when the branch already exists, or by safely rebuilding an unpublished commit when the remote branch is absent; an altered remote branch is never overwritten. Interrupted staging cleanup is retried from durable evidence.
 
 ### Durable stages and recovery
 
@@ -442,14 +454,16 @@ The record persists the task/run IDs, source issue, repository, base branch/comm
 
 Recovery rules:
 
-- a claimed request that never started OpenCode may resume workspace preparation; a clean, verified, child-owned workspace left by an interrupted preparation is adopted only after ownership, base-commit, symlink, and cleanliness checks;
+- a claimed request that never started OpenCode may resume workspace preparation; the workspace is revalidated with lstat-first identity/base/manifest checks before use;
 - a commit created before its SHA was persisted may be safely recreated in a fresh parent-owned staging repository because no branch or PR has been published yet;
 - a running OpenCode session with persisted events resumes tests/publication without rerunning the agent;
 - a running session without recoverable output becomes `NEEDS_ATTENTION`;
-- interrupted tests or diff validation rerun from the preserved workspace, never the model;
-- a prepared commit is reused; a pushed branch is recognized by remote SHA even if the publication staging directory disappeared; a created PR is recovered by branch/marker;
+- interrupted tests or diff validation rerun from the preserved workspace only if the mandatory test gate has explicit passing evidence; failing or missing evidence blocks instead of publishing;
+- a prepared commit is reused; a pushed branch is recognized by remote SHA even if the publication staging directory disappeared; a created PR is recovered by branch/marker and verified open/Draft/head-SHA;
+- milestones are reconciled from authoritative evidence after a restart: verified upload implies `REPORT_VERIFIED`, a published acknowledged Issue comment implies `ISSUE_DELIVERED`, an existing verified PR implies `PR_CREATED`/`PR_PUBLISHED`, and a durable `SENT` Telegram notification implies `TELEGRAM_SENT` without sending it again;
 - a failed Draft PR body update after verified report upload is retried with bounded backoff against the same PR; it never creates another PR;
 - upload, GitHub comment, and Telegram failures retry only their own stage;
+- manual `dispatch deliver` and automatic publication share a per-Issue durable lock, so concurrent attempts produce at most one delivery comment;
 - an existing published branch/PR is never replaced by a different code result.
 
 ### Security limitations

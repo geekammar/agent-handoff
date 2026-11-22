@@ -65,32 +65,66 @@ PROJECT_KEYS = {
 PUBLICATION_KEYS = {"base_branch", "branch_prefix", "draft", "token_env", "max_attempts", "pr_title_prefix"}
 PROFILE_KEYS = {"commands", "timeout_seconds", "env", "description"}
 DEFAULT_BRANCH_PREFIX = "agent-handoff/"
-DEFAULT_PROTECTED_PATHS = (
+# These patterns are always enforced. Configuration may add patterns but can
+# never remove or weaken this set, because the publisher runs with parent
+# credentials and must never accept agent-controlled Git/auth material.
+MANDATORY_PROTECTED_PATHS = (
     ".git",
     ".git/**",
     ".gitmodules",
+    ".gitattributes",
+    "**/.gitattributes",
+    ".gitconfig",
+    "**/.gitconfig",
+    ".git-credentials",
+    "**/.git-credentials",
+    ".netrc",
+    "**/.netrc",
+    ".askpass.sh",
+    "**/.askpass.sh",
     ".github/workflows/**",
     ".github/actions/**",
     ".github/CODEOWNERS",
     ".env",
     ".env.*",
+    ".env*",
     "**/.env",
     "**/.env.*",
+    "**/.env*",
     "*.pem",
+    "**/*.pem",
     "*.key",
+    "**/*.key",
     "*.p12",
+    "**/*.p12",
     "*.pfx",
+    "**/*.pfx",
     "id_rsa",
     "id_rsa*",
+    "**/id_rsa",
     "**/id_rsa*",
     "auth.json",
     "**/auth.json",
     "rclone.conf",
     "**/rclone.conf",
     "config/config.json",
-    "**/credentials/**",
+    ".ssh",
+    ".ssh/**",
+    "**/.ssh",
     "**/.ssh/**",
+    "credentials",
+    "credentials/**",
+    "**/credentials",
+    "**/credentials/**",
 )
+DEFAULT_PROTECTED_PATHS = MANDATORY_PROTECTED_PATHS
+RESERVED_PUBLICATION_NAMES = {
+    ".askpass.sh",
+    ".git-credentials",
+    ".gitconfig",
+    ".netrc",
+}
+INTERNAL_AUTH_PREFIX = ".auth-"
 SECRET_ENV_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE_KEY")
 FORBIDDEN_PROFILE_ENV = {
     "PATH",
@@ -582,4 +616,19 @@ def coding_enabled(project: dict[str, Any]) -> bool:
 
 
 def is_protected_path(path: str, patterns: Iterable[str]) -> bool:
-    return pattern_matches(path, list(patterns or []))
+    configured = list(patterns or [])
+    mandatory = list(MANDATORY_PROTECTED_PATHS)
+    for pattern in mandatory:
+        if pattern not in configured:
+            configured.append(pattern)
+    return pattern_matches(path, configured)
+
+
+def is_reserved_publication_path(path: str) -> bool:
+    """Reject names reserved for trusted publication internals."""
+
+    parts = [part for part in str(path or "").replace("\\", "/").split("/") if part]
+    for part in parts:
+        if part in RESERVED_PUBLICATION_NAMES or part.startswith(INTERNAL_AUTH_PREFIX):
+            return True
+    return False

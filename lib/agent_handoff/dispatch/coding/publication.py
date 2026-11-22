@@ -6,22 +6,36 @@ import re
 import shutil
 import stat
 import tempfile
-from typing import Any, Callable, Mapping, Sequence
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.parse import quote
 
 from ...util import run_command, sanitize_error, utcnow_iso
 from .changes import (
     SafeGit,
     normalized_publication_mode,
-    qualified_path,
     read_regular_file,
     safe_relative_path,
     sha256_bytes,
+    workspace_entry_path,
 )
-from .config import PROTECTED_BRANCHES, prefix_valid, validate_branch_name
+from .config import (
+    INTERNAL_AUTH_PREFIX,
+    PROTECTED_BRANCHES,
+    is_reserved_publication_path,
+    prefix_valid,
+    validate_branch_name,
+)
 
 PR_MARKER = "<!-- agent-handoff-coding:{task_id}:{run_id} -->"
 STAGING_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,96}$")
+ASKPASS_SCRIPT = (
+    "#!/bin/sh\n"
+    "case \"$1\" in\n"
+    "  *Username*) printf '%s\\n' x-access-token ;;\n"
+    "  *) printf '%s\\n' \"$AH_PUBLISH_TOKEN\" ;;\n"
+    "esac\n"
+)
 
 
 class PublicationError(RuntimeError):
@@ -185,10 +199,12 @@ def _validated_manifest(validation: Mapping[str, Any]) -> tuple[dict[str, dict[s
         if not isinstance(item, dict):
             raise PublicationError("the validation manifest contains an invalid entry")
         path = safe_relative_path(str(item.get("path") or ""))
+        if is_reserved_publication_path(path):
+            raise PublicationError(f"the validation manifest targets a reserved publication name: {path}")
         if path in entries:
             raise PublicationError(f"the validation manifest contains a duplicate path: {path}")
         status = str(item.get("status") or "")
-        if status not in ("added", "modified", "renamed", "deleted"):
+        if status not in ("added", "modified", "renamed", "copied", "deleted"):
             raise PublicationError(f"the validation manifest has an unsupported status for {path}")
         if status == "deleted":
             entries[path] = {"path": path, "status": status}
@@ -219,6 +235,31 @@ def _validated_manifest(validation: Mapping[str, Any]) -> tuple[dict[str, dict[s
     return entries, actual_digest
 
 
+def _prepare_destination_directory(staging: str, relative: str) -> str:
+    """Create missing parent directories without following symlinks."""
+
+    safe = safe_relative_path(relative)
+    current = os.path.realpath(staging)
+    if not current:
+        raise PublicationError("publication staging is unavailable")
+    for part in safe.split("/")[:-1]:
+        current = os.path.join(current, part)
+        if os.path.lexists(current):
+            info = os.lstat(current)
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise PublicationError(f"publication destination parent is not a safe directory: {relative}")
+        else:
+            os.mkdir(current, 0o700)
+    destination = os.path.join(current, safe.split("/")[-1])
+    if os.path.lexists(destination):
+        info = os.lstat(destination)
+        if stat.S_ISLNK(info.st_mode):
+            raise PublicationError(f"publication destination is a symlink: {relative}")
+        if not stat.S_ISREG(info.st_mode):
+            raise PublicationError(f"publication destination is not a regular file: {relative}")
+    return destination
+
+
 def _copy_verified_file(
     source: str,
     destination: str,
@@ -241,7 +282,8 @@ def _copy_verified_file(
             "(content, size, or mode mismatch)"
         )
     parent = os.path.dirname(destination)
-    os.makedirs(parent, mode=0o700, exist_ok=True)
+    if not os.path.isdir(parent) or os.path.islink(parent):
+        raise PublicationError(f"publication destination parent is unsafe: {entry['path']}")
     flags_out = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     if hasattr(os, "O_NOFOLLOW"):
         flags_out |= os.O_NOFOLLOW
@@ -348,7 +390,11 @@ class TrustedPublisher:
         self._remote_url = remote_url or f"https://github.com/{repository}.git"
         self._owner = repository.split("/", 1)[0]
         self._staging: str | None = None
-        self._auth_dir: str | None = None
+
+    @staticmethod
+    def _redact_token(text: Any, token: str) -> str:
+        value = sanitize_error(str(text or ""), 1000)
+        return value.replace(token, "[REDACTED]") if token else value
 
     def token(self) -> str:
         if self._token_provider is not None:
@@ -365,35 +411,87 @@ class TrustedPublisher:
             )
         return value
 
-    def _auth_directory(self) -> str:
-        if self._staging and os.path.isdir(self._staging):
-            return self._staging
-        if self._auth_dir and os.path.isdir(self._auth_dir):
-            return self._auth_dir
-        root = self.validate_staging_root()
-        self._auth_dir = tempfile.mkdtemp(prefix=".auth-", dir=root)
-        os.chmod(self._auth_dir, 0o700)
-        return self._auth_dir
+    @staticmethod
+    def _remove_auth_directory(auth_dir: str, root: str) -> None:
+        """Remove one parent-created auth directory and never follow a swap."""
 
-    def _auth_environment(self, token: str) -> dict[str, str]:
-        auth_dir = self._auth_directory()
+        try:
+            target = os.path.realpath(auth_dir)
+        except OSError:
+            return
+        root_real = os.path.realpath(root)
+        if target == root_real or not target.startswith(root_real.rstrip("/") + "/"):
+            return
+        if not os.path.basename(target).startswith(INTERNAL_AUTH_PREFIX):
+            return
+        try:
+            info = os.lstat(target)
+        except OSError:
+            return
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in {0, os.geteuid()}:
+            return
+        shutil.rmtree(target, ignore_errors=True)
+
+    @contextmanager
+    def _auth_environment(self, token: str) -> Iterator[dict[str, str]]:
+        """Create a short-lived parent-owned Git askpass helper.
+
+        The helper directory is never the publication staging directory and is
+        never reused. It is created exclusively, verified, and removed after
+        every Git authentication operation, including failures.
+        """
+
+        root = self.validate_staging_root()
+        auth_dir = tempfile.mkdtemp(prefix=INTERNAL_AUTH_PREFIX, dir=root)
         script_path = os.path.join(auth_dir, ".askpass.sh")
-        if not os.path.exists(script_path):
-            with open(script_path, "w", encoding="utf-8") as handle:
-                handle.write(
-                    "#!/bin/sh\n"
-                    "case \"$1\" in\n"
-                    "  *Username*) printf '%s\\n' x-access-token ;;\n"
-                    "  *) printf '%s\\n' \"$AH_PUBLISH_TOKEN\" ;;\n"
-                    "esac\n"
-                )
-            os.chmod(script_path, 0o700)
-        return {
-            "GIT_ASKPASS": script_path,
-            "GIT_ASKPASS_REQUIRE": "force",
-            "GIT_TERMINAL_PROMPT": "0",
-            "AH_PUBLISH_TOKEN": token,
-        }
+        try:
+            info = os.lstat(auth_dir)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or info.st_uid not in {0, os.geteuid()}
+                or info.st_mode & 0o077
+            ):
+                raise PublicationError("the private Git authentication directory is not trusted")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(script_path, flags, 0o700)
+            try:
+                os.fchmod(descriptor, 0o700)
+                payload = ASKPASS_SCRIPT.encode("utf-8")
+                written = 0
+                while written < len(payload):
+                    written += os.write(descriptor, payload[written:])
+                os.fsync(descriptor)
+                script_stat = os.fstat(descriptor)
+                if not stat.S_ISREG(script_stat.st_mode) or script_stat.st_uid not in {0, os.geteuid()}:
+                    raise PublicationError("the Git authentication helper is not a trusted regular file")
+            finally:
+                os.close(descriptor)
+            helper_stat = os.lstat(script_path)
+            if stat.S_ISLNK(helper_stat.st_mode) or not stat.S_ISREG(helper_stat.st_mode):
+                raise PublicationError("the Git authentication helper was replaced by a symlink or special file")
+            read_flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                read_flags |= os.O_NOFOLLOW
+            reader = os.open(script_path, read_flags)
+            try:
+                helper_data = os.read(reader, len(ASKPASS_SCRIPT.encode("utf-8")) + 1)
+            finally:
+                os.close(reader)
+            if helper_data != ASKPASS_SCRIPT.encode("utf-8"):
+                raise PublicationError("the Git authentication helper content is not trusted")
+            if stat.S_IMODE(helper_stat.st_mode) != 0o700:
+                raise PublicationError("the Git authentication helper mode is not private")
+            yield {
+                "GIT_ASKPASS": script_path,
+                "GIT_ASKPASS_REQUIRE": "force",
+                "GIT_TERMINAL_PROMPT": "0",
+                "AH_PUBLISH_TOKEN": token,
+            }
+        finally:
+            self._remove_auth_directory(auth_dir, root)
 
     def _gh(self, args: list[str], token: str, *, timeout: float | None = None) -> str:
         result = run_command(
@@ -402,7 +500,9 @@ class TrustedPublisher:
             env={"GH_TOKEN": token, "GITHUB_TOKEN": token, "GH_PROMPT_DISABLED": "1"},
         )
         if result.returncode != 0:
-            detail = sanitize_error(result.stderr or result.stdout or f"gh exited {result.returncode}", 800)
+            detail = self._redact_token(
+                result.stderr or result.stdout or f"gh exited {result.returncode}", token
+            )
             raise PublicationError(detail)
         return result.stdout
 
@@ -445,14 +545,32 @@ class TrustedPublisher:
         return self._staging
 
     def adopt_staging(self, path: str) -> str:
-        root = os.path.realpath(self.staging_root)
+        root = self.validate_staging_root()
+        try:
+            entry = os.lstat(path)
+        except OSError as exc:
+            raise PublicationError("the persisted publication staging directory is missing") from exc
+        if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
+            raise PublicationError("the persisted publication staging must be a real directory, not a symlink")
+        if entry.st_uid not in {0, os.geteuid()} or entry.st_mode & 0o022:
+            raise PublicationError("the persisted publication staging ownership/mode is not trusted")
         target = os.path.realpath(path)
         if target == root or not target.startswith(root.rstrip("/") + "/"):
             raise PublicationError("the persisted publication staging path escaped the managed root")
-        if os.path.islink(path) or not os.path.isdir(target):
-            raise PublicationError("the persisted publication staging directory is missing")
         if not STAGING_NAME_RE.fullmatch(os.path.basename(target)):
             raise PublicationError("the persisted publication staging name is unsafe")
+        git_entry = os.path.join(target, ".git")
+        try:
+            git_stat = os.lstat(git_entry)
+        except OSError as exc:
+            raise PublicationError("the persisted publication staging has no Git metadata") from exc
+        if (
+            stat.S_ISLNK(git_stat.st_mode)
+            or not stat.S_ISDIR(git_stat.st_mode)
+            or git_stat.st_uid not in {0, os.geteuid()}
+            or git_stat.st_mode & 0o022
+        ):
+            raise PublicationError("the persisted publication staging Git metadata is not trusted")
         self._staging = target
         return target
 
@@ -476,26 +594,26 @@ class TrustedPublisher:
         token = self.token()
         self.verify_repository()
         staging = self._prepare_staging(task_id, run_id)
-        auth = self._auth_environment(token)
-        self.git.run(["init", "--quiet"], cwd=staging, env=auth)
-        self.git.run(["remote", "add", "origin", self._remote_url], cwd=staging)
-        self.git.run(
-            ["fetch", "--no-tags", "--quiet", "origin", self.base_branch],
-            cwd=staging,
-            timeout=max(120.0, self.timeout),
-            env=auth,
-        )
-        exists = self.git.run(
-            ["cat-file", "-e", f"{base_commit}^{{commit}}"], cwd=staging, check=False
-        )
-        if exists.returncode != 0:
-            raise PublicationError("the verified base commit is not available from the trusted repository")
-        ancestor = self.git.run(
-            ["merge-base", "--is-ancestor", base_commit, "FETCH_HEAD"], cwd=staging, check=False
-        )
-        if ancestor.returncode != 0:
-            raise PublicationError("the verified base commit is not an ancestor of the trusted base branch")
-        self.git.run(["checkout", "--detach", "--quiet", base_commit, "--"], cwd=staging, env=auth)
+        with self._auth_environment(token) as auth:
+            self.git.run(["init", "--quiet"], cwd=staging, env=auth)
+            self.git.run(["remote", "add", "origin", self._remote_url], cwd=staging)
+            self.git.run(
+                ["fetch", "--no-tags", "--quiet", "origin", self.base_branch],
+                cwd=staging,
+                timeout=max(120.0, self.timeout),
+                env=auth,
+            )
+            exists = self.git.run(
+                ["cat-file", "-e", f"{base_commit}^{{commit}}"], cwd=staging, check=False
+            )
+            if exists.returncode != 0:
+                raise PublicationError("the verified base commit is not available from the trusted repository")
+            ancestor = self.git.run(
+                ["merge-base", "--is-ancestor", base_commit, "FETCH_HEAD"], cwd=staging, check=False
+            )
+            if ancestor.returncode != 0:
+                raise PublicationError("the verified base commit is not an ancestor of the trusted base branch")
+            self.git.run(["checkout", "--detach", "--quiet", base_commit, "--"], cwd=staging, env=auth)
         return staging
 
     def stage_and_commit(
@@ -516,6 +634,8 @@ class TrustedPublisher:
         manifest_entries, manifest_digest = _validated_manifest(validation)
         expected: set[str] = set(manifest_entries)
         for path, entry in manifest_entries.items():
+            if is_reserved_publication_path(path):
+                raise PublicationError(f"the validation manifest targets a reserved publication name: {path}")
             if entry["status"] == "deleted":
                 result = self.git.run(
                     ["rm", "--ignore-unmatch", "-f", "--", path], cwd=staging, check=False
@@ -523,12 +643,8 @@ class TrustedPublisher:
                 if result.returncode != 0:
                     raise PublicationError(f"could not stage a validated deletion: {path}")
                 continue
-            source = qualified_path(task_workspace, path)
-            destination = qualified_path(staging, path)
-            if os.path.islink(os.path.dirname(destination)) or (
-                os.path.lexists(destination) and os.path.islink(destination)
-            ):
-                raise PublicationError(f"publication destination is a symlink: {path}")
+            source = workspace_entry_path(task_workspace, path)
+            destination = _prepare_destination_directory(staging, path)
             _copy_verified_file(
                 source,
                 destination,
@@ -537,7 +653,7 @@ class TrustedPublisher:
             )
             self.git.run(["add", "-f", "--", path], cwd=staging)
         staged = self.git.run(
-            ["diff", "--cached", "--name-only", "-z"], cwd=staging
+            ["diff", "--cached", "--name-only", "--no-renames", "-z"], cwd=staging
         )
         staged_paths = {item for item in (staged.stdout or "").split("\x00") if item}
         if staged_paths != expected:
@@ -577,7 +693,7 @@ class TrustedPublisher:
         if parent != base_commit:
             raise PublicationError("the publication commit is not based on the verified base commit")
         changed = self.git.run(
-            ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "HEAD"], cwd=staging
+            ["diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-r", "-z", "HEAD"], cwd=staging
         )
         committed_paths = {item for item in (changed.stdout or "").split("\x00") if item}
         if committed_paths != expected:
@@ -592,10 +708,8 @@ class TrustedPublisher:
         }
 
     def _remote_branch_sha(self, branch: str, token: str) -> str | None:
-        direct = not (self._staging and os.path.isdir(self._staging))
-        auth = self._auth_environment(token)
-        cwd = self._staging if not direct else self.validate_staging_root()
-        try:
+        cwd = self._staging if self._staging and os.path.isdir(self._staging) else self.validate_staging_root()
+        with self._auth_environment(token) as auth:
             result = self.git.run(
                 ["ls-remote", "--heads", self._remote_url, f"refs/heads/{branch}"],
                 cwd=cwd,
@@ -603,16 +717,12 @@ class TrustedPublisher:
                 check=False,
                 timeout=self.timeout,
             )
-        finally:
-            if direct and self._auth_dir:
-                shutil.rmtree(self._auth_dir, ignore_errors=True)
-                self._auth_dir = None
         if result.returncode != 0:
-            detail = sanitize_error(
+            detail = self._redact_token(
                 (result.stderr.decode("utf-8", errors="replace") if isinstance(result.stderr, bytes) else result.stderr)
                 or (result.stdout.decode("utf-8", errors="replace") if isinstance(result.stdout, bytes) else result.stdout)
                 or "git ls-remote failed",
-                400,
+                token,
             )
             raise PublicationError(f"could not verify the remote branch state: {detail}")
         for line in (result.stdout or "").splitlines():
@@ -644,19 +754,19 @@ class TrustedPublisher:
                 "the publication branch already exists with a different commit; refusing to force-push "
                 "or replace a previously published result"
             )
-        auth = self._auth_environment(token)
-        result = self.git.run(
-            ["push", "--porcelain", "origin", f"{commit}:refs/heads/{branch}"],
-            cwd=self._staging,
-            env=auth,
-            check=False,
-            timeout=max(120.0, self.timeout),
-        )
+        with self._auth_environment(token) as auth:
+            result = self.git.run(
+                ["push", "--porcelain", "origin", f"{commit}:refs/heads/{branch}"],
+                cwd=self._staging,
+                env=auth,
+                check=False,
+                timeout=max(120.0, self.timeout),
+            )
         if result.returncode != 0:
             recovered = self._remote_branch_sha(branch, token)
             if recovered == commit:
                 return {"branch": branch, "commit": commit, "pushed": True, "recovered": True}
-            detail = sanitize_error(result.stderr or result.stdout or "git push failed", 600)
+            detail = self._redact_token(result.stderr or result.stdout or "git push failed", token)
             raise PublicationError(f"publishing the task branch failed: {detail}")
         verified = self._remote_branch_sha(branch, token)
         if verified != commit:
@@ -691,16 +801,40 @@ class TrustedPublisher:
             return True
         return str(head.get("sha") or "") == commit
 
-    def _validate_pr(self, item: Mapping[str, Any], branch: str) -> dict[str, Any]:
+    def _validate_pr(
+        self,
+        item: Mapping[str, Any],
+        branch: str,
+        commit: str | None = None,
+    ) -> dict[str, Any]:
         head = item.get("head") or {}
         base = item.get("base") or {}
+        if str(item.get("state") or "open") != "open":
+            raise PublicationError("GitHub returned a closed or merged Pull Request; refusing to reuse it")
         if str(head.get("ref") or "") != branch:
             raise PublicationError("GitHub returned a Pull Request with an unexpected head branch")
         if str(base.get("ref") or self.base_branch) != self.base_branch:
             raise PublicationError("GitHub returned a Pull Request with an unexpected base branch")
         if item.get("draft") is not True:
             raise PublicationError("C2 refuses to publish or reuse a non-Draft Pull Request")
+        head_sha = str(head.get("sha") or "")
+        if commit and re.fullmatch(r"[0-9a-f]{40,64}", head_sha):
+            if head_sha.strip("0") and head_sha != commit:
+                raise PublicationError(
+                    "the existing Pull Request head SHA does not match the verified publication commit"
+                )
         if not item.get("html_url") or not isinstance(item.get("number"), int):
+            raise PublicationError("GitHub returned incomplete Pull Request metadata")
+        return item
+
+    def get_pr(self, pr_number: int) -> dict[str, Any]:
+        token = self.token()
+        text = self._gh(["api", f"repos/{self.repository}/pulls/{int(pr_number)}"], token)
+        try:
+            item = json.loads(text)
+        except ValueError as exc:
+            raise PublicationError("GitHub returned invalid Pull Request metadata") from exc
+        if not isinstance(item, dict) or int(item.get("number", -1)) != int(pr_number):
             raise PublicationError("GitHub returned incomplete Pull Request metadata")
         return item
 
@@ -724,7 +858,7 @@ class TrustedPublisher:
         if len(existing) > 1:
             raise PublicationError("multiple Pull Requests already use this task branch; refusing to guess")
         if existing:
-            item = self._validate_pr(existing[0], branch)
+            item = self._validate_pr(existing[0], branch, commit)
             return {
                 "pr_number": item.get("number"),
                 "pr_url": item.get("html_url"),
@@ -752,7 +886,7 @@ class TrustedPublisher:
             item = json.loads(text)
             if not isinstance(item, dict):
                 raise PublicationError("GitHub returned invalid PR creation metadata")
-            item = self._validate_pr(item, branch)
+            item = self._validate_pr(item, branch, commit)
             return {
                 "pr_number": item.get("number"),
                 "pr_url": item.get("html_url"),
@@ -766,7 +900,7 @@ class TrustedPublisher:
                 if self._pr_matches(item, branch, self.repository, commit, marker)
             ]
             if len(recovered) == 1:
-                item = self._validate_pr(recovered[0], branch)
+                item = self._validate_pr(recovered[0], branch, commit)
                 return {
                     "pr_number": item.get("number"),
                     "pr_url": item.get("html_url"),
@@ -780,8 +914,18 @@ class TrustedPublisher:
                 sanitize_error(f"creating the Draft Pull Request failed: {exc}", 800)
             ) from exc
 
-    def update_pr_body(self, *, pr_number: int, body: str) -> dict[str, Any]:
+    def update_pr_body(
+        self,
+        *,
+        pr_number: int,
+        body: str,
+        branch: str | None = None,
+        commit: str | None = None,
+    ) -> dict[str, Any]:
         token = self.token()
+        if branch:
+            existing = self.get_pr(int(pr_number))
+            self._validate_pr(existing, branch, commit)
         result = self._gh(
             [
                 "api",
@@ -801,17 +945,41 @@ class TrustedPublisher:
             raise PublicationError("GitHub did not confirm the Pull Request body update")
         return {"pr_number": pr_number, "pr_url": item.get("html_url") or None, "updated": True}
 
+    def cleanup_persisted(self, path: str, *, expected_name: str | None = None) -> bool:
+        """Best-effort cleanup of a persisted staging path after interruption."""
+
+        if not path:
+            return True
+        try:
+            root = self.validate_staging_root()
+        except PublicationError:
+            return False
+        try:
+            entry = os.lstat(path)
+        except OSError:
+            return True
+        if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
+            return False
+        if entry.st_uid not in {0, os.geteuid()} or entry.st_mode & 0o022:
+            return False
+        target = os.path.realpath(path)
+        if target == root or not target.startswith(root.rstrip("/") + "/"):
+            return False
+        if not STAGING_NAME_RE.fullmatch(os.path.basename(target)):
+            return False
+        if expected_name and os.path.basename(target) != expected_name:
+            return False
+        shutil.rmtree(target, ignore_errors=True)
+        return not os.path.lexists(target)
+
     def cleanup(self, *, preserve: bool = False) -> bool:
         staging = self._staging
         if not staging:
-            if self._auth_dir and not preserve:
-                shutil.rmtree(self._auth_dir, ignore_errors=True)
-                self._auth_dir = None
+            return True
+        if preserve:
             return True
         root = os.path.realpath(self.staging_root)
         target = os.path.realpath(staging)
-        if preserve:
-            return True
         if target == root or not target.startswith(root.rstrip("/") + "/"):
             return False
         if not STAGING_NAME_RE.fullmatch(os.path.basename(target)):
@@ -823,10 +991,4 @@ class TrustedPublisher:
         if entry.st_uid not in {0, os.geteuid()} or entry.st_mode & 0o022:
             return False
         shutil.rmtree(target, ignore_errors=True)
-        auth_dir = self._auth_dir
-        if auth_dir:
-            auth_real = os.path.realpath(auth_dir)
-            if auth_real.startswith(root.rstrip("/") + "/") and os.path.basename(auth_real).startswith(".auth-"):
-                shutil.rmtree(auth_real, ignore_errors=True)
-            self._auth_dir = None
         return not os.path.lexists(target)

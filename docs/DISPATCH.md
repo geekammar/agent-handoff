@@ -240,7 +240,7 @@ Delivery milestones have distinct meanings:
 - `TELEGRAM_SENT` means the Telegram API acknowledged a send with a message id. A queued, pending, failed, or ambiguous notification is not marked sent. The Issue comment is published before the Telegram outbox is drained, so the comment renders `TELEGRAM_SENT=pending`; the durable ledger advances after the API acknowledgement.
 - `REPORT_DELIVERED` remains a legacy alias of `ISSUE_DELIVERED` for old ledger records and older reports. New reports use the three canonical delivery milestones above.
 
-Reports and delivery comments are snapshots. A milestone that had not been reached at snapshot time renders `pending` (or `not_run` when a blocked task skipped it); it is not rewritten retroactively after later upload, Issue, or Telegram steps.
+Reports and delivery comments are snapshots. A milestone that had not been reached at snapshot time renders `pending` (or `not_run` when a blocked task skipped it); it is not rewritten retroactively after later upload, Issue, or Telegram steps. Milestone reporting is derived defensively: a stale flag cannot claim `TESTS_PASSED` unless the persisted test evidence is explicitly `passed`, and a blocked coding task reports every coding operation beyond `blocked_stage` as `not_run` without converting later report-delivery milestones to false. After a crash between a primary state update and a milestone update, the next poll reconciles the milestone from authoritative evidence (verified upload, acknowledged Issue comment, existing Draft PR, or a durable Telegram `SENT` record) without repeating the external operation.
 
 Legacy state machine:
 
@@ -299,11 +299,12 @@ Writes are atomic; ledger mutations use `flock`. Only one dispatcher runner lock
 | After execution, before report capture | Persisted events are used to create the missing report. |
 | After capture, before upload | Upload retries with the existing task/run identity. |
 | After verified upload, before publication | Publication retries without another upload or execution. |
-| After comment posted, before ledger update | The delivery marker is found and publication is recorded without a duplicate comment. |
+| After comment posted, before ledger update | The delivery marker is found and publication is recorded without a duplicate comment; a per-Issue lock serializes manual `dispatch deliver` and automatic publication. |
 | Coding: before workspace preparation | The claim is resumed; no agent has started. |
 | Coding: during OpenCode, session output recoverable | The session is parsed and tests/publication resume; OpenCode is not rerun. |
-| Coding: during tests or diff validation | Trusted tests/diff validation rerun from the preserved disposable workspace; the agent is not rerun. |
-| Coding: after commit, before push | The parent-owned staging commit is reused. |
+| Coding: tests failed/timed out/blocked, or failure persisted before the blocked flag | The mandatory test gate fails closed on resume; no commit, branch, or Draft PR is created. Failure evidence is preserved and the agent/tests are not rerun. |
+| Coding: during tests or diff validation | The persisted disposable workspace is revalidated (lstat-first identity, base, origin, and manifest), then tests/diff validation rerun; the agent is not rerun. Missing test evidence at a publication stage blocks. |
+| Coding: after commit, before push | The parent-owned staging commit is reused. If staging is lost and the remote branch is absent, an unpublished commit is safely rebuilt; if the remote branch exists with a different SHA, publication is refused. |
 | Coding: push succeeds, response lost | Remote branch SHA is queried; the same commit is accepted idempotently. |
 | Coding: PR created, response lost | The PR is recovered by task branch and body marker; no duplicate is created. |
 | Coding: report upload fails after PR publication | Only upload/publication retries; the agent and PR are not repeated. |

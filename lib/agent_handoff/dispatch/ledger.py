@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..config import storage_path
+from .coding.milestones import milestone_state
 from ..util import FileLock, atomic_write_json, ensure_dir, read_json, utcnow_iso, utcnow_iso_precise
 
 SCHEMA = 1
@@ -34,6 +35,15 @@ class Ledger:
 
     def lock(self, blocking: bool = True, timeout: float = 60.0) -> FileLock:
         return FileLock(self.root / "ledger.lock", blocking=blocking, timeout=timeout)
+
+    def publication_lock(
+        self, repository: str, issue_number: int, *, timeout: float = 120.0
+    ) -> FileLock:
+        return FileLock(
+            self.root / f"publication-{record_id(repository, issue_number)}.lock",
+            blocking=True,
+            timeout=timeout,
+        )
 
     def path(self, repository: str, issue_number: int) -> Path:
         return self.records_dir / f"{record_id(repository, issue_number)}.json"
@@ -336,21 +346,17 @@ def safe_record_summary(record: dict[str, Any]) -> dict[str, Any]:
             "blocked_stage": coding.get("blocked_stage"),
             "blocked_reason": coding.get("blocked_reason"),
             "milestones": {
-                "agent_completed": bool(milestones.get("AGENT_COMPLETED")),
-                "tests_passed": bool(milestones.get("TESTS_PASSED")),
-                "diff_validated": bool(milestones.get("DIFF_VALIDATED")),
-                "commit_created": bool(milestones.get("COMMIT_CREATED")),
-                "branch_published": bool(milestones.get("BRANCH_PUBLISHED")),
-                "pr_created": bool(milestones.get("PR_CREATED") or milestones.get("PR_PUBLISHED")),
-                "pr_published": bool(milestones.get("PR_PUBLISHED")),
-                "report_verified": bool(milestones.get("REPORT_VERIFIED")),
-                "issue_delivered": bool(
-                    milestones.get("ISSUE_DELIVERED") or milestones.get("REPORT_DELIVERED")
-                ),
-                "report_delivered": bool(
-                    milestones.get("REPORT_DELIVERED") or milestones.get("ISSUE_DELIVERED")
-                ),
-                "telegram_sent": bool(milestones.get("TELEGRAM_SENT")),
+                "agent_completed": milestone_state(coding, "AGENT_COMPLETED") == "true",
+                "tests_passed": milestone_state(coding, "TESTS_PASSED") == "true",
+                "diff_validated": milestone_state(coding, "DIFF_VALIDATED") == "true",
+                "commit_created": milestone_state(coding, "COMMIT_CREATED") == "true",
+                "branch_published": milestone_state(coding, "BRANCH_PUBLISHED") == "true",
+                "pr_created": milestone_state(coding, "PR_CREATED") == "true",
+                "pr_published": milestone_state(coding, "PR_PUBLISHED") == "true",
+                "report_verified": milestone_state(coding, "REPORT_VERIFIED") == "true",
+                "issue_delivered": milestone_state(coding, "ISSUE_DELIVERED") == "true",
+                "report_delivered": milestone_state(coding, "REPORT_DELIVERED") == "true",
+                "telegram_sent": milestone_state(coding, "TELEGRAM_SENT") == "true",
             },
             "publication_attempts": coding_publication.get("attempts", 0),
             "publication_next_attempt_at": coding_publication.get("next_attempt_at"),

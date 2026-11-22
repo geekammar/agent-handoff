@@ -60,19 +60,32 @@ def milestone_state(coding: Mapping[str, Any] | None, key: str) -> str:
     milestone can be confirmed. ``not_run`` means the task was blocked before
     that point. Historical records that only have the legacy REPORT_DELIVERED
     flag are treated as Issue-delivered evidence without rewriting the record.
+    Stale milestone flags never override a blocking stage or failed tests.
     """
 
     value = coding or {}
     milestones = value.get("milestones") or {}
-    if _confirmed(milestones, key):
-        return "true"
     current = str(value.get("stage") or "REQUEST_ACCEPTED")
     required = MILESTONE_STAGE.get(key)
     current_order = PER_STAGE_ORDER.get(current, -1)
+    blocked = bool(value.get("blocked"))
+    blocked_stage = str(value.get("blocked_stage") or current)
+    if (
+        blocked
+        and key not in DELIVERY_MILESTONES
+        and required
+        and PER_STAGE_ORDER.get(blocked_stage, -1) < PER_STAGE_ORDER.get(required, -1)
+    ):
+        return "not_run"
+    if key == "TESTS_PASSED":
+        tests = value.get("tests")
+        status = str((tests or {}).get("status") or "") if isinstance(tests, dict) else ""
+        if status and status != "passed":
+            return "false"
+        if not status and _confirmed(milestones, key):
+            return "false"
+    if _confirmed(milestones, key):
+        return "true"
     if required and current_order < PER_STAGE_ORDER.get(required, -1):
-        if value.get("blocked") and key not in DELIVERY_MILESTONES:
-            blocked_stage = str(value.get("blocked_stage") or current)
-            if PER_STAGE_ORDER.get(blocked_stage, -1) < PER_STAGE_ORDER.get(required, -1):
-                return "not_run"
         return "pending"
     return "false"

@@ -328,9 +328,82 @@ class DispatchRunner:
         self._capture(record, result, force=force)
         self._upload_and_publish(record, force=force)
 
+    def _reconcile_coding_milestones(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Reconcile milestones from authoritative evidence after a crash."""
+
+        if record.get("task_type") != "coding":
+            return record
+        coding = record.get("coding") or {}
+        milestones = coding.get("milestones") or {}
+        upload = record.get("upload") or {}
+        publication = record.get("publication") or {}
+        coding_publication = coding.get("publication") or {}
+        tests = coding.get("tests") or {}
+        diff = coding.get("diff") or {}
+        desired: list[str] = []
+        if (coding.get("agent") or {}).get("outcome") == "succeeded":
+            desired.append("AGENT_COMPLETED")
+        if tests.get("status") == "passed":
+            desired.append("TESTS_PASSED")
+        if diff.get("status") == "passed":
+            desired.append("DIFF_VALIDATED")
+        if coding_publication.get("commit"):
+            desired.append("COMMIT_CREATED")
+        if coding_publication.get("branch_pushed"):
+            desired.append("BRANCH_PUBLISHED")
+        if coding_publication.get("pr_url"):
+            desired.extend(["BRANCH_PUBLISHED", "PR_CREATED", "PR_PUBLISHED"])
+        if upload.get("verified"):
+            desired.append("REPORT_VERIFIED")
+        if (
+            publication.get("status") == "PUBLISHED"
+            and publication.get("published_at")
+            and upload.get("verified")
+        ):
+            desired.extend(["ISSUE_DELIVERED", "REPORT_DELIVERED"])
+        missing = [name for name in desired if not milestones.get(name)]
+        stale = [
+            name
+            for name in ("TESTS_PASSED", "PR_CREATED", "PR_PUBLISHED", "BRANCH_PUBLISHED", "COMMIT_CREATED", "DIFF_VALIDATED")
+            if milestones.get(name) and name not in desired
+        ]
+        if not missing and not stale:
+            return record
+
+        def apply(item: dict[str, Any]) -> None:
+            coding_item = item.setdefault("coding", {})
+            flags = coding_item.setdefault("milestones", {})
+            for name in missing:
+                flags[name] = True
+            for name in stale:
+                flags[name] = False
+            current = str(coding_item.get("stage") or "")
+            if "ISSUE_DELIVERED" in missing:
+                apply_issue_delivered(item)
+            elif "REPORT_VERIFIED" in missing:
+                apply_upload_verified(item)
+            elif "PR_PUBLISHED" in missing:
+                if PER_STAGE_ORDER.get("PR_CREATED", -1) >= PER_STAGE_ORDER.get(current, -1):
+                    coding_item["stage"] = "PR_CREATED"
+
+        updated = self.ledger.update(
+            record["repository"],
+            int(record["issue_number"]),
+            apply,
+            note="reconciled coding milestones from existing authoritative evidence",
+        )
+        self._log(
+            f"issue #{record.get('issue_number')} reconciled milestones: "
+            f"added={', '.join(missing) or 'none'} cleared={', '.join(stale) or 'none'}"
+        )
+        return updated
+
     def _advance_all(self, *, force: bool) -> None:
         for record in self.ledger.all():
             status = record.get("status")
+            if record.get("task_type") == "coding":
+                record = self._reconcile_coding_milestones(record)
+                status = record.get("status")
             if record.get("task_type") == "coding" and status == "ISSUE_UPDATED":
                 self._publish(record, force=force)
                 continue
@@ -1117,8 +1190,14 @@ class DispatchRunner:
         root = str(project_coding.get("workspace_root") or "")
         if not identity or not workspace or not root:
             return
+        capture = record.get("capture") or {}
+        expected_name = None
+        if capture.get("task_id"):
+            expected_name = f"issue-{int(record['issue_number'])}-{capture.get('task_id')}"
         try:
-            removed = cleanup_workspace(root, workspace, identity=identity)
+            removed = cleanup_workspace(
+                root, workspace, identity=identity, expected_name=expected_name
+            )
         except OSError as exc:
             self.summary["warnings"].append(f"coding workspace cleanup failed: {sanitize_error(str(exc))}")
             return
@@ -1464,7 +1543,12 @@ class DispatchRunner:
                 report_url=report_url,
                 limitations=PUBLICATION_LIMITATIONS,
             )
-            publisher.update_pr_body(pr_number=int(pr_number), body=body)
+            publisher.update_pr_body(
+                pr_number=int(pr_number),
+                body=body,
+                branch=str(publication.get("branch") or ""),
+                commit=str(publication.get("commit") or ""),
+            )
         except Exception as exc:
             message = sanitize_error(f"could not add the verified report link to the Draft PR: {exc}", 500)
             attempts = int(publication.get("report_link_attempts", 0) or 0) + 1
@@ -1644,10 +1728,56 @@ class DispatchRunner:
         self._publish(current, force=force)
 
     def _publish(self, record: dict[str, Any], *, force: bool) -> None:
+        try:
+            lock = self.ledger.publication_lock(record["repository"], int(record["issue_number"]))
+            with lock:
+                self._publish_locked(record, force=force)
+        except TimeoutError as exc:
+            self.summary["ok"] = False
+            self.summary["errors"].append(
+                sanitize_error(f"publication lock timeout for issue #{record.get('issue_number')}: {exc}")
+            )
+            self._log(f"issue #{record.get('issue_number')} publication lock timeout")
+
+    def _publish_locked(self, record: dict[str, Any], *, force: bool) -> None:
         current = self.ledger.get(record["repository"], int(record["issue_number"])) or record
+        current = self._reconcile_coding_milestones(current)
         if current.get("task_type") == "coding":
             self._update_coding_pr_report_link(current)
             current = self.ledger.get(current["repository"], int(current["issue_number"])) or current
+            coding_now = current.get("coding") or {}
+            publication_now = coding_now.get("publication") or {}
+            staging_now = publication_now.get("staging")
+            if publication_now.get("pr_url") and staging_now:
+                project_now = self._dispatch_project_for(current)
+                project_coding = project_now.get("coding") or {}
+                project_publication = project_coding.get("publication") or {}
+                global_coding = self.dispatch.get("coding") or {}
+                try:
+                    publisher_now = TrustedPublisher(
+                        repository=str(project_coding.get("repository") or ""),
+                        base_branch=str(project_coding.get("base_branch") or ""),
+                        branch_prefix=str(project_publication.get("branch_prefix") or "agent-handoff/"),
+                        staging_root=str(
+                            project_coding.get("staging_root")
+                            or global_coding.get("staging_root")
+                            or ""
+                        ),
+                        gh_command=str((self.dispatch.get("github") or {}).get("command") or "gh"),
+                        token_env=project_publication.get("token_env"),
+                    )
+                    capture_now = current.get("capture") or {}
+                    expected_name = None
+                    if capture_now.get("task_id") and capture_now.get("run_id"):
+                        expected_name = f"{capture_now['task_id']}-{capture_now['run_id']}"
+                    publisher_now.cleanup_persisted(
+                        str(staging_now), expected_name=expected_name
+                    )
+                except Exception as exc:
+                    self._log(
+                        f"issue #{current.get('issue_number')} publication staging cleanup is still pending: "
+                        f"{sanitize_error(str(exc), 300)}"
+                    )
         if current.get("status") == "ISSUE_UPDATED":
             return
         publication = current.get("publication") or {}

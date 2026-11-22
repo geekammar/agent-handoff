@@ -4,9 +4,12 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,7 +26,9 @@ from test_dispatch import DispatchHarness, GH_REPO, request_body  # noqa: E402
 
 from agent_handoff.dispatch.adapters.base import ExecutionResult  # noqa: E402
 from agent_handoff.dispatch.coding.changes import (  # noqa: E402
+    ChangeEntry,
     SafeGit,
+    parse_status,
     scan_bytes_for_secrets,
     validate_changes,
 )
@@ -51,6 +56,8 @@ from agent_handoff.dispatch.coding.testrunner import (  # noqa: E402
 )
 from agent_handoff.dispatch.coding.workspace import (  # noqa: E402
     WorkspacePreparationError,
+    _inspect_existing_workspace,
+    cleanup_workspace,
     prepare_workspace,
 )
 from agent_handoff.dispatch.config import validate_dispatch_config  # noqa: E402
@@ -62,7 +69,12 @@ from agent_handoff.dispatch.requests import (  # noqa: E402
     resolve_request,
 )
 from agent_handoff.dispatch.runner import DispatchRunner  # noqa: E402
-from agent_handoff.dispatch.security import DEFAULT_CHILD_PATH, IsolationError, popen_isolation_kwargs  # noqa: E402
+from agent_handoff.dispatch.security import (  # noqa: E402
+    DEFAULT_CHILD_PATH,
+    IsolationError,
+    build_isolated_environment,
+    popen_isolation_kwargs,
+)
 from agent_handoff.notify.messages import DELIVERY_COMPLETED, build_telegram_message  # noqa: E402
 from agent_handoff.notify.service import NotificationService  # noqa: E402
 from agent_handoff.util import utcnow_iso  # noqa: E402
@@ -722,6 +734,27 @@ class TestWorkspaceAndDiff(unittest.TestCase):
         )
         self.assertEqual(evidence["status"], "passed", evidence)
         self.assertFalse(marker.exists())
+
+    def test_s5_git_diff_driver_cannot_execute_as_parent(self) -> None:
+        prepared = self._prepare(issue=33, task_id="t-diff-driver")
+        workspace = Path(prepared["workspace"])
+        marker = self.root / "diff-driver-ran"
+        script = self.root / "evil-diff.sh"
+        script.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n", encoding="utf-8")
+        os.chmod(script, 0o755)
+        config = workspace / ".git" / "config"
+        with config.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n[diff \"evil\"]\n\tcommand = {script}\n")
+        (workspace / ".gitattributes").write_text("*.py diff=evil\n", encoding="utf-8")
+        (workspace / "src" / "app.py").write_text("value = 8\n", encoding="utf-8")
+        evidence = validate_changes(
+            str(workspace),
+            git=SafeGit(identity=None, allow_file_protocol=True),
+            limits={"max_files_changed": 10, "max_file_bytes": 50000, "max_diff_bytes": 200000, "max_workspace_bytes": 1000000},
+            protected_paths=[],
+        )
+        self.assertEqual(evidence["status"], "blocked")
+        self.assertFalse(marker.exists(), "repository diff drivers must not run as the parent")
 
     def test_t12_no_force_push_and_file_protocol_is_restricted(self) -> None:
         safe = SafeGit(identity=None)
@@ -1559,6 +1592,26 @@ class TestTelegramMilestones(unittest.TestCase):
         self.assertEqual(self._current()["coding"]["telegram_message_id"], 6)
         self.assertEqual(len(self.transport.calls), 1)
 
+    def test_s7_sent_notification_milestone_is_reconciled_without_resend(self) -> None:
+        self.service.enqueue_completed(self._current())
+        self.transport.result = {"ok": True, "message_id": 11}
+        self.service.drain(force=True)
+        self.assertEqual(len(self.transport.calls), 1)
+        self.assertTrue(self._current()["coding"]["milestones"]["TELEGRAM_SENT"])
+        self.ledger.update(
+            GH_REPO,
+            7,
+            lambda item: item["coding"].update(
+                {"stage": "ISSUE_UPDATED", "milestones": {**item["coding"]["milestones"], "TELEGRAM_SENT": False}}
+            ),
+            note="simulate crash between Telegram API send and milestone write",
+        )
+        self.service.reconcile([self._current()])
+        restored = self._current()
+        self.assertTrue(restored["coding"]["milestones"]["TELEGRAM_SENT"])
+        self.assertEqual(restored["coding"]["telegram_message_id"], 11)
+        self.assertEqual(len(self.transport.calls), 1, "reconciliation must not resend")
+
     def test_t09_old_records_without_telegram_key_accept_new_acknowledgement(self) -> None:
         record = self._current()
         record["coding"]["milestones"] = {"REPORT_DELIVERED": True, "ISSUE_DELIVERED": True}
@@ -1581,10 +1634,11 @@ class CodingIntegrationTests(unittest.TestCase):
         self.repo = make_repository(self.root)
         self.work = self.root / "coding-work"
         self.work.mkdir()
+        os.chmod(self.work, 0o700)
         self.staging = self.root / "coding-staging"
         self.staging.mkdir()
         os.chmod(self.staging, 0o700)
-        self.identity = fake_identity()
+        self.identity = {**fake_identity(), "uid": os.getuid(), "gid": os.getgid()}
         self.dispatch_cfg = self._dispatch_config()
         self.ledger = Ledger(self.h.config)
         self.h.gh_dir.joinpath("repo.json").write_text(
@@ -1670,6 +1724,32 @@ class CodingIntegrationTests(unittest.TestCase):
     def _prepare_workspace(self, **kwargs):
         target = Path(kwargs["workspace_root"]) / f"issue-{kwargs['issue_number']}-{kwargs['task_id']}"
         if target.exists():
+            if kwargs.get("allow_existing"):
+                sha = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=target, capture_output=True, text=True
+                ).stdout.strip()
+                if sha != kwargs["base_commit"]:
+                    listing = sorted(item.name for item in target.iterdir()) if target.exists() else ["<missing>"]
+                    raise WorkspacePreparationError(
+                        f"wrong base {sha!r} != {kwargs['base_commit']} cwd={target} listing={listing}"
+                    )
+                status = subprocess.run(
+                    ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                    cwd=target,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                if status and kwargs.get("require_clean", True):
+                    raise WorkspacePreparationError("dirty")
+                return {
+                    "workspace": str(target),
+                    "workspace_name": target.name,
+                    "base_commit": sha,
+                    "base_branch": kwargs["base_branch"],
+                    "repository": kwargs["repository"],
+                    "recovered": True,
+                    "modified": bool(status),
+                }
             raise WorkspacePreparationError("exists")
         target.mkdir()
         subprocess.run(
@@ -1680,6 +1760,10 @@ class CodingIntegrationTests(unittest.TestCase):
         sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=target, capture_output=True, text=True).stdout.strip()
         if sha != kwargs["base_commit"]:
             raise WorkspacePreparationError("wrong base")
+        os.chmod(target, 0o700)
+        if os.geteuid() == 0:
+            os.chown(target, kwargs["identity"]["uid"], kwargs["identity"]["gid"])
+            os.chown(target / ".git", kwargs["identity"]["uid"], kwargs["identity"]["gid"])
         return {
             "workspace": str(target),
             "workspace_name": target.name,
@@ -2161,6 +2245,1079 @@ class CodingIntegrationTests(unittest.TestCase):
         report = (self.h.task_dir_for("Alpha", record["capture"]["task_id"]) / "RUNS" / record["capture"]["run_id"] / "REPORT.md").read_text(encoding="utf-8")
         self.assertIn("blocked:TESTING", report)
         self.assertIn("no commit, push, or Draft PR", report)
+
+
+
+    def test_s8_lost_staging_before_push_rebuilds_commit_safely(self) -> None:
+        first = self._run()
+        self.assertEqual(first["executed"], 1)
+        record = self.ledger.get(GH_REPO, 21)
+        branch = record["coding"]["publication"]["branch"]
+        old_commit = record["coding"]["publication"]["commit"]
+        git(["update-ref", "-d", f"refs/heads/{branch}"], self.repo["bare"])
+
+        def simulate_pre_push_loss(item: dict) -> None:
+            item["status"] = "EXECUTION_COMPLETED"
+            item["capture"]["status"] = "PENDING"
+            item["upload"].update({"status": "PENDING", "verified": False, "report_url": None, "receipt_url": None, "attempts": 0, "next_attempt_at": None})
+            item["publication"].update({"status": "PENDING", "comment_url": None, "attempts": 0, "next_attempt_at": None})
+            pub = item["coding"]["publication"]
+            pub.update({
+                "branch": branch,
+                "commit": old_commit,
+                "branch_pushed": False,
+                "pr_url": None,
+                "pr_number": None,
+                "staging": None,
+                "status": "COMMITTED",
+                "report_link_updated": False,
+                "attempts": 0,
+                "next_attempt_at": None,
+            })
+            item["coding"]["stage"] = "PR_CREATED"
+            item["coding"]["milestones"]["REPORT_DELIVERED"] = False
+
+        self.ledger.update(GH_REPO, 21, simulate_pre_push_loss, note="simulated staging loss before push")
+        runner = self.last_runner
+        runner.summary = {
+            "ok": True, "busy": False, "executed": 0, "rejected": 0, "needs_attention": 0,
+            "uploaded": 0, "published": 0, "errors": [], "warnings": [],
+        }
+        env = self.h.env()
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch(
+            "agent_handoff.upload.load_config", return_value=self.h.config
+        ), mock.patch.object(
+            DispatchRunner, "_coding_orchestrator", autospec=True, side_effect=self._fake_orchestrator
+        ), mock.patch.object(DispatchRunner, "_coding_adapter", autospec=True, side_effect=self._adapter):
+            runner._advance_all(force=True)
+        self.assertEqual(runner.summary["executed"], 0)
+        recovered = self.ledger.get(GH_REPO, 21)
+        self.assertFalse(recovered["coding"].get("blocked"), recovered["coding"].get("blocked_reason"))
+        self.assertTrue(recovered["coding"]["publication"]["branch_pushed"])
+        self.assertTrue(recovered["coding"]["publication"]["pr_url"])
+        remote_sha = git(["rev-parse", f"refs/heads/{branch}"], self.repo["bare"]).stdout.strip()
+        self.assertEqual(remote_sha, recovered["coding"]["publication"]["commit"])
+        self.assertEqual(len(json.loads((self.h.gh_dir / "pulls.json").read_text(encoding="utf-8"))), 1)
+        self.assertEqual(len(self.h.comments(21)), 1)
+
+    def test_s8_interrupted_publication_cleanup_is_retried_without_new_comment(self) -> None:
+        with mock.patch.object(TrustedPublisher, "cleanup", return_value=True), mock.patch.object(
+            TrustedPublisher, "cleanup_persisted", return_value=False
+        ):
+            first = self._run()
+        self.assertEqual(first["executed"], 1)
+        record = self.ledger.get(GH_REPO, 21)
+        staging = record["coding"]["publication"].get("staging")
+        self.assertTrue(staging and Path(staging).is_dir(), "simulated interrupted cleanup must leave staging")
+        runner = self.last_runner
+        runner.summary = {
+            "ok": True, "busy": False, "executed": 0, "rejected": 0, "needs_attention": 0,
+            "uploaded": 0, "published": 0, "errors": [], "warnings": [],
+        }
+        env = self.h.env()
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch(
+            "agent_handoff.upload.load_config", return_value=self.h.config
+        ), mock.patch.object(DispatchRunner, "_coding_adapter", side_effect=AssertionError("agent must not run")):
+            runner._advance_all(force=True)
+        self.assertFalse(Path(staging).exists(), "retry must remove interrupted publication staging")
+        self.assertEqual(len(self.h.comments(21)), 1)
+        self.assertEqual(len(json.loads((self.h.gh_dir / "pulls.json").read_text(encoding="utf-8"))), 1)
+
+
+class TestPublicationAuthIsolation(unittest.TestCase):
+    """S1: parent Git authentication never shares agent-controlled paths."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.work = self.root / "work"
+        self.work.mkdir()
+        self.repo = make_repository(self.root)
+        self.staging = self.root / "publication"
+        self.staging.mkdir()
+        os.chmod(self.staging, 0o700)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _publisher(self) -> TrustedPublisher:
+        return TrustedPublisher(
+            repository=PROJECT_REPO,
+            base_branch="main",
+            branch_prefix="agent-handoff/",
+            staging_root=str(self.staging),
+            token_provider=lambda: "synthetic-github-token-0123456789",
+            remote_url=f"file://{self.repo['bare']}",
+            git=SafeGit(identity=None, allow_file_protocol=True),
+        )
+
+    def _prepared(self) -> tuple[TrustedPublisher, dict, Path]:
+        workspace = self.root / "task"
+        shutil.copytree(self.repo["source"], workspace)
+        (workspace / "src" / "app.py").write_text("value = 44\n", encoding="utf-8")
+        evidence = validate_changes(
+            str(workspace),
+            git=SafeGit(identity=None, allow_file_protocol=True),
+            limits={"max_files_changed": 10, "max_file_bytes": 50000, "max_diff_bytes": 200000, "max_workspace_bytes": 1000000},
+            protected_paths=[],
+        )
+        self.assertEqual(evidence["status"], "passed", evidence)
+        publisher = self._publisher()
+        with mock.patch.object(publisher, "verify_repository", return_value={"repository": PROJECT_REPO}):
+            publisher.prepare(base_commit=self.repo["base"], task_id="t-auth", run_id="r-auth")
+        return publisher, evidence, workspace
+
+    def test_s1_askpass_helper_is_private_ephemeral_and_outside_staging(self) -> None:
+        publisher = self._publisher()
+        staging = Path(publisher._prepare_staging("t-auth", "r-auth"))
+        marker = self.root / "hostile-askpass-ran"
+        hostile = staging / ".askpass.sh"
+        hostile.write_text(f"#!/bin/sh\ntouch {marker}\nprintf '%s\\n' hostile\n", encoding="utf-8")
+        os.chmod(hostile, 0o755)
+        script_path: Path | None = None
+        with publisher._auth_environment("synthetic-github-token-0123456789") as env:
+            script_path = Path(env["GIT_ASKPASS"])
+            self.assertNotEqual(script_path.parent, staging)
+            self.assertNotIn(staging, script_path.parents)
+            self.assertTrue(script_path.parent.name.startswith(".auth-"))
+            self.assertEqual(stat.S_IMODE(script_path.stat().st_mode), 0o700)
+            result = subprocess.run(
+                [str(script_path), "Password for 'https://x-access-token@github.com':"],
+                capture_output=True,
+                text=True,
+                env={**os.environ, "AH_PUBLISH_TOKEN": "synthetic-github-token-0123456789"},
+                check=True,
+            )
+            self.assertEqual(result.stdout.strip(), "synthetic-github-token-0123456789")
+            self.assertFalse(marker.exists(), "the staging askpass helper must never be executed")
+        self.assertIsNotNone(script_path)
+        self.assertFalse(script_path.parent.exists(), "the private auth helper must not survive its operation")
+
+    def test_s1_hostile_and_symlinked_staging_askpass_are_ignored(self) -> None:
+        publisher, evidence, workspace = self._prepared()
+        staging = Path(publisher._staging)
+        marker = self.root / "hostile-askpass-ran"
+        script = self.root / "evil-askpass.sh"
+        script.write_text(f"#!/bin/sh\ntouch {marker}\nprintf '%s\\n' evil\n", encoding="utf-8")
+        os.chmod(script, 0o755)
+        (staging / ".askpass.sh").write_text(script.read_text(encoding="utf-8"), encoding="utf-8")
+        os.chmod(staging / ".askpass.sh", 0o755)
+        committed = publisher.stage_and_commit(
+            validation=evidence,
+            task_workspace=str(workspace),
+            project="Alpha",
+            title="Auth isolation",
+            issue_number=61,
+            task_id="t-auth",
+            run_id="r-auth",
+            base_commit=self.repo["base"],
+        )
+        branch = build_branch("agent-handoff/", "Alpha", 61, "t-auth")
+        publisher.push(branch=branch, commit=committed["commit"])
+        self.assertFalse(marker.exists())
+        (staging / ".askpass.sh").unlink()
+        os.symlink(script, staging / ".askpass.sh")
+        publisher2 = self._publisher()
+        with mock.patch.object(publisher2, "verify_repository", return_value={"repository": PROJECT_REPO}):
+            publisher2.prepare(base_commit=self.repo["base"], task_id="t-auth2", run_id="r-auth2")
+        committed2 = publisher2.stage_and_commit(
+            validation=evidence,
+            task_workspace=str(workspace),
+            project="Alpha",
+            title="Auth isolation 2",
+            issue_number=62,
+            task_id="t-auth2",
+            run_id="r-auth2",
+            base_commit=self.repo["base"],
+        )
+        branch2 = build_branch("agent-handoff/", "Alpha", 62, "t-auth2")
+        publisher2.push(branch=branch2, commit=committed2["commit"])
+        self.assertFalse(marker.exists())
+
+    def test_s1_reserved_askpass_manifest_is_rejected(self) -> None:
+        publisher, evidence, workspace = self._prepared()
+        hostile = workspace / ".askpass.sh"
+        hostile.write_text("#!/bin/sh\ntouch /tmp/should-not-run\n", encoding="utf-8")
+        tampered = json.loads(json.dumps(evidence))
+        digest = __import__("hashlib").sha256(hostile.read_bytes()).hexdigest()
+        tampered["files"].append(
+            {"path": ".askpass.sh", "status": "added", "size": hostile.stat().st_size, "mode": "0755", "raw_mode": "0755", "sha256": digest}
+        )
+        tampered["manifest"]["files"].append(
+            {"path": ".askpass.sh", "status": "added", "size": hostile.stat().st_size, "mode": "0755", "raw_mode": "0755", "sha256": digest}
+        )
+        canonical = json.dumps(tampered["manifest"], sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        tampered["manifest_sha256"] = __import__("hashlib").sha256(canonical).hexdigest()
+        with self.assertRaises(PublicationError) as ctx:
+            publisher.stage_and_commit(
+                validation=tampered,
+                task_workspace=str(workspace),
+                project="Alpha",
+                title="Reserved path",
+                issue_number=63,
+                task_id="t-auth",
+                run_id="r-auth",
+                base_commit=self.repo["base"],
+            )
+        self.assertIn("reserved", str(ctx.exception))
+
+    def test_s1_publication_token_never_reaches_the_opencode_child(self) -> None:
+        parent = {
+            "AH_PUBLISH_TOKEN": "synthetic-github-token-0123456789",
+            "GH_TOKEN": "synthetic-github-token-0123456789",
+            "GITHUB_TOKEN": "synthetic-github-token-0123456789",
+            "AGENT_HANDOFF_TELEGRAM_TOKEN": "synthetic-telegram-token",
+        }
+        env = build_isolated_environment(
+            fake_identity(),
+            workspace="/tmp/work",
+            policy={"share": "disabled"},
+            parent_env=parent,
+        )
+        for name in parent:
+            self.assertNotIn(name, env)
+        self.assertNotIn("synthetic-github-token-0123456789", json.dumps(env))
+
+    def test_s1_push_errors_are_redacted(self) -> None:
+        publisher, evidence, workspace = self._prepared()
+        token = "synthetic-github-token-0123456789"
+        committed = publisher.stage_and_commit(
+            validation=evidence,
+            task_workspace=str(workspace),
+            project="Alpha",
+            title="Redaction",
+            issue_number=64,
+            task_id="t-auth",
+            run_id="r-auth",
+            base_commit=self.repo["base"],
+        )
+        branch = build_branch("agent-handoff/", "Alpha", 64, "t-auth")
+        with mock.patch.object(publisher, "_remote_branch_sha", return_value=None):
+            with mock.patch.object(
+                publisher.git,
+                "run",
+                return_value=SimpleNamespace(returncode=1, stdout="", stderr=f"fatal: {token}"),
+            ):
+                with self.assertRaises(PublicationError) as ctx:
+                    publisher.push(branch=branch, commit=committed["commit"])
+        self.assertNotIn(token, str(ctx.exception))
+        self.assertIn("[REDACTED]", str(ctx.exception))
+
+
+class TestCodingTestGate(unittest.TestCase):
+    """S2: only explicitly persisted passing tests may reach publication."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.repo = make_repository(self.root)
+        self.work = self.root / "work"
+        self.work.mkdir()
+        os.chmod(self.work, 0o700)
+        self.identity = {**fake_identity(), "uid": os.getuid(), "gid": os.getgid()}
+        self.workspace = prepare_workspace(
+            workspace_root=str(self.work),
+            repository=PROJECT_REPO,
+            base_branch="main",
+            base_commit=self.repo["base"],
+            source=str(self.repo["source"]),
+            issue_number=71,
+            task_id="t-gate",
+            identity=self.identity,
+            git=SafeGit(identity=None, allow_file_protocol=True),
+        )
+        self.h = DispatchHarness(self.root / "harness")
+        self.ledger = Ledger(self.h.config)
+        self.project = {
+            "name": "Alpha",
+            "workspace": str(self.repo["source"]),
+            "coding": {
+                "enabled": True,
+                "repository": PROJECT_REPO,
+                "base_branch": "main",
+                "workspace_root": str(self.work),
+                "source_workspace": str(self.repo["source"]),
+                "limits": {"test_timeout_seconds": 10, "max_files_changed": 10, "max_diff_bytes": 200000, "max_file_bytes": 50000},
+                "test_definition": {"name": "safe", "commands": [["true"]], "timeout_seconds": 10, "env": {}},
+                "protected_paths": [],
+                "allowed_paths": [],
+                "publication": {"branch_prefix": "agent-handoff/", "draft": True},
+                "cleanup_on_success": False,
+            },
+        }
+        base = new_dispatch_record(
+            repository=GH_REPO,
+            issue={"number": 71, "title": "gate", "html_url": "https://github.test/issues/71"},
+            project=self.project,
+            agent="opencode",
+            model="provider/model-fast",
+            request={"task": "coding", "instructions": "change"},
+            task_type="coding",
+            coding=new_coding_state(self.project),
+        )
+        coding = base["coding"]
+        coding.update(
+            {
+                "workspace": self.workspace["workspace"],
+                "workspace_name": self.workspace["workspace_name"],
+                "base_commit": self.repo["base"],
+                "base_branch": "main",
+                "repository": PROJECT_REPO,
+                "source_workspace": str(self.repo["source"]),
+                "agent": {"status": "completed", "outcome": "succeeded", "orphans_detected": False},
+                "stage": "TESTING",
+            }
+        )
+        base["status"] = "EXECUTION_COMPLETED"
+        base["capture"].update({"status": "PENDING", "task_id": "t-gate", "run_id": "r-gate"})
+        self.record, _ = self.ledger.create(base)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _orchestrator(self) -> CodingOrchestrator:
+        return CodingOrchestrator(
+            config=self.h.config,
+            dispatch={"coding": {"enabled": True}, "github": {"command": "gh"}, "execution": {"isolation": {"workspace_roots": [str(self.work)]}}},
+            ledger=self.ledger,
+            record=self.ledger.get(GH_REPO, 71) or self.record,
+            project=self.project,
+            identity=self.identity,
+            adapter=SimpleNamespace(),
+            git=SafeGit(identity=None, allow_file_protocol=True),
+        )
+
+    def _set_tests(self, tests: dict, *, stage: str = "COMMIT_PREPARED", blocked: bool = False) -> dict:
+        def apply(item: dict) -> None:
+            item["coding"]["tests"] = tests
+            item["coding"]["stage"] = stage
+            item["coding"]["blocked"] = blocked
+            item["coding"]["blocked_stage"] = None
+            item["coding"]["blocked_reason"] = None
+
+        return self.ledger.update(GH_REPO, 71, apply, note="test fixture")
+
+    def _failure(self, status: str = "failed") -> dict:
+        return {
+            "status": status,
+            "profile": "safe",
+            "timeout_seconds": 10,
+            "commands": [
+                {
+                    "argv": ["false"],
+                    "status": status,
+                    "exit_code": 1 if status == "failed" else None,
+                    "timed_out": status == "timed_out",
+                    "orphans_detected": status == "orphans",
+                    "duration_seconds": 0.1,
+                }
+            ],
+        }
+
+    def _passing(self) -> dict:
+        return {
+            "status": "passed",
+            "profile": "safe",
+            "timeout_seconds": 10,
+            "commands": [
+                {"argv": ["true"], "status": "passed", "exit_code": 0, "timed_out": False, "orphans_detected": False, "duration_seconds": 0.1}
+            ],
+        }
+
+    def _assert_no_publication(self) -> None:
+        record = self.ledger.get(GH_REPO, 71) or {}
+        coding = record.get("coding") or {}
+        publication = coding.get("publication") or {}
+        self.assertFalse(publication.get("commit"))
+        self.assertFalse(publication.get("pr_url"))
+        self.assertFalse(any((coding.get("milestones") or {}).get(name) for name in ("COMMIT_CREATED", "BRANCH_PUBLISHED", "PR_CREATED", "PR_PUBLISHED")))
+
+    def test_s2_resume_with_failed_tests_and_no_blocked_flag_never_publishes(self) -> None:
+        self._set_tests(self._failure("failed"))
+        orchestrator = self._orchestrator()
+        with mock.patch.object(TrustedPublisher, "stage_and_commit", side_effect=AssertionError("must not publish")), mock.patch.object(
+            TrustedPublisher, "push", side_effect=AssertionError("must not publish")
+        ):
+            updated = orchestrator.continue_after_agent()
+        self.assertTrue(updated["coding"]["blocked"])
+        self.assertEqual(updated["coding"]["blocked_stage"], "TESTING")
+        self.assertEqual(updated["coding"]["tests"]["status"], "failed")
+        self._assert_no_publication()
+
+    def test_s2_crash_after_timeout_evidence_blocks_resume(self) -> None:
+        self._set_tests(self._failure("timed_out"))
+        updated = self._orchestrator().continue_after_agent()
+        self.assertTrue(updated["coding"]["blocked"])
+        self.assertEqual(updated["coding"]["tests"]["status"], "timed_out")
+        self._assert_no_publication()
+
+    def test_s2_resume_with_missing_tests_at_publication_stage_blocks(self) -> None:
+        self._set_tests({"status": "not_run", "commands": []}, stage="VALIDATING_DIFF")
+        updated = self._orchestrator().continue_after_agent()
+        self.assertTrue(updated["coding"]["blocked"])
+        self.assertEqual(updated["coding"]["blocked_stage"], "TESTING")
+        self._assert_no_publication()
+
+    def test_s2_stale_tests_passed_milestone_does_not_override_failure(self) -> None:
+        self._set_tests(self._failure("failed"))
+        self.ledger.update(
+            GH_REPO,
+            71,
+            lambda item: item["coding"].setdefault("milestones", {}).update({"TESTS_PASSED": True}),
+            note="stale milestone",
+        )
+        updated = self._orchestrator().continue_after_agent()
+        self.assertTrue(updated["coding"]["blocked"])
+        self.assertEqual(milestone_state(updated["coding"], "TESTS_PASSED"), "false")
+        self._assert_no_publication()
+
+    def test_s2_orphaned_test_process_group_blocks(self) -> None:
+        tests = self._failure("failed")
+        tests["status"] = "passed"
+        tests["commands"][0].update({"status": "passed", "exit_code": 0, "orphans_detected": True})
+        self._set_tests(tests)
+        updated = self._orchestrator().continue_after_agent()
+        self.assertTrue(updated["coding"]["blocked"])
+        self.assertIn("orphan", str(updated["coding"]["blocked_reason"]).lower())
+        self._assert_no_publication()
+
+    def test_s2_failed_evidence_and_block_are_one_atomic_transition(self) -> None:
+        self._set_tests({"status": "not_run", "commands": []}, stage="AGENT_COMPLETED")
+        orchestrator = self._orchestrator()
+        writes: list[str] = []
+        original = self.ledger.update
+
+        def counted(repository, issue_number, mutator, *, note=None):
+            writes.append(str(note))
+            return original(repository, issue_number, mutator, note=note)
+
+        with mock.patch.object(self.ledger, "update", side_effect=counted):
+            updated = orchestrator._record_test_failure(
+                self.ledger.get(GH_REPO, 71), reason="failed evidence", stored=self._failure("failed")
+            )
+        self.assertTrue(updated["coding"]["blocked"])
+        self.assertEqual(updated["coding"]["tests"]["status"], "failed")
+        failure_writes = [note for note in writes if "coding blocked" in note]
+        self.assertEqual(len(failure_writes), 1, writes)
+
+    def test_s2_explicit_pass_continues_without_rerunning_tests(self) -> None:
+        self._set_tests(self._passing(), stage="AGENT_COMPLETED")
+        orchestrator = self._orchestrator()
+        with mock.patch("agent_handoff.dispatch.coding.pipeline.run_test_profile", side_effect=AssertionError("tests must not rerun")):
+            updated = orchestrator._ensure_tests(self.ledger.get(GH_REPO, 71))
+        self.assertFalse(updated["coding"]["blocked"])
+        self.assertEqual(updated["coding"]["tests"]["status"], "passed")
+
+
+class TestWorkspaceAdoptionSafety(unittest.TestCase):
+    """S3: lstat-first workspace adoption and task identity binding."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.work = self.root / "work"
+        self.work.mkdir()
+        os.chmod(self.work, 0o700)
+        self.repo = make_repository(self.root)
+        self.identity = {**fake_identity(), "uid": os.getuid(), "gid": os.getgid()}
+        self.git = SafeGit(identity=None, allow_file_protocol=True)
+        self.workspace = prepare_workspace(
+            workspace_root=str(self.work),
+            repository=PROJECT_REPO,
+            base_branch="main",
+            base_commit=self.repo["base"],
+            source=str(self.repo["source"]),
+            issue_number=81,
+            task_id="t-one",
+            identity=self.identity,
+            git=self.git,
+        )
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _adopt(self, *, issue: int = 81, task_id: str = "t-one", target: str | None = None):
+        return prepare_workspace(
+            workspace_root=str(self.work),
+            repository=PROJECT_REPO,
+            base_branch="main",
+            base_commit=self.repo["base"],
+            source=str(self.repo["source"]),
+            issue_number=issue,
+            task_id=task_id,
+            identity=self.identity,
+            git=self.git,
+            allow_existing=True,
+            require_clean=True,
+        )
+
+    def test_s3_adopts_correct_existing_workspace(self) -> None:
+        adopted = self._adopt()
+        self.assertTrue(adopted["recovered"])
+        self.assertEqual(adopted["workspace"], self.workspace["workspace"])
+
+    def test_s3_rejects_symlink_to_another_task(self) -> None:
+        link = self.work / "issue-82-t-two"
+        os.symlink(self.workspace["workspace"], link)
+        with self.assertRaises(WorkspacePreparationError):
+            self._adopt(issue=82, task_id="t-two")
+
+    def test_s3_rejects_incorrect_task_basename(self) -> None:
+        other = self.work / "issue-81-other"
+        shutil.copytree(self.workspace["workspace"], other, symlinks=True)
+        with self.assertRaises(WorkspacePreparationError):
+            _inspect_existing_workspace(
+                target=str(other),
+                expected_name="issue-81-t-one",
+                workspace_root=str(self.work),
+                repository=PROJECT_REPO,
+                base_branch="main",
+                base_commit=self.repo["base"],
+                source=str(self.repo["source"]),
+                identity=self.identity,
+                git=self.git,
+                require_clean=True,
+            )
+
+    def test_s3_rejects_escaped_path(self) -> None:
+        outside = self.root / "outside"
+        shutil.copytree(self.workspace["workspace"], outside, symlinks=True)
+        with self.assertRaises(WorkspacePreparationError):
+            _inspect_existing_workspace(
+                target=str(outside),
+                expected_name="issue-81-t-one",
+                workspace_root=str(self.work),
+                repository=PROJECT_REPO,
+                base_branch="main",
+                base_commit=self.repo["base"],
+                source=str(self.repo["source"]),
+                identity=self.identity,
+                git=self.git,
+                require_clean=True,
+            )
+
+    def test_s3_rejects_unsafe_git_permissions(self) -> None:
+        os.chmod(Path(self.workspace["workspace"]) / ".git", 0o777)
+        with self.assertRaises(WorkspacePreparationError):
+            self._adopt()
+
+    def test_s3_rejects_foreign_owner(self) -> None:
+        with self.assertRaises(WorkspacePreparationError):
+            prepare_workspace(
+                workspace_root=str(self.work),
+                repository=PROJECT_REPO,
+                base_branch="main",
+                base_commit=self.repo["base"],
+                source=str(self.repo["source"]),
+                issue_number=81,
+                task_id="t-one",
+                identity={**self.identity, "uid": 424242, "gid": 424242},
+                git=self.git,
+                allow_existing=True,
+            )
+
+    def test_s3_rejects_mismatched_base_commit(self) -> None:
+        git(["commit", "--allow-empty", "-q", "-m", "advance"], Path(self.workspace["workspace"]))
+        with self.assertRaises(WorkspacePreparationError):
+            self._adopt()
+
+    def test_s3_rejects_changed_repository_identity(self) -> None:
+        git(["remote", "set-url", "origin", "https://github.com/other/repository.git"], Path(self.workspace["workspace"]))
+        with self.assertRaises(WorkspacePreparationError):
+            self._adopt()
+
+    def test_s3_cleanup_never_removes_another_task(self) -> None:
+        other = self.work / "issue-81-other"
+        shutil.copytree(self.workspace["workspace"], other, symlinks=True)
+        removed = cleanup_workspace(
+            str(self.work), str(self.workspace["workspace"]), expected_name="issue-81-other"
+        )
+        self.assertFalse(removed)
+        self.assertTrue(Path(self.workspace["workspace"]).exists())
+
+    def test_s3_resume_adoption_uses_modified_workspace_only_with_manifest(self) -> None:
+        workspace = Path(self.workspace["workspace"])
+        (workspace / "src" / "app.py").write_text("value = 99\n", encoding="utf-8")
+        with self.assertRaises(WorkspacePreparationError):
+            self._adopt()
+        adopted = prepare_workspace(
+            workspace_root=str(self.work),
+            repository=PROJECT_REPO,
+            base_branch="main",
+            base_commit=self.repo["base"],
+            source=str(self.repo["source"]),
+            issue_number=81,
+            task_id="t-one",
+            identity=self.identity,
+            git=self.git,
+            allow_existing=True,
+            require_clean=False,
+        )
+        self.assertTrue(adopted["modified"])
+
+
+class TestCopyRenameSemantics(unittest.TestCase):
+    """S4: copies never delete their source; renames do."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.repo = make_repository(self.root)
+        self.workspace = self.root / "task"
+        shutil.copytree(self.repo["source"], self.workspace)
+        self.git = SafeGit(identity=None, allow_file_protocol=True)
+        self.limits = {"max_files_changed": 10, "max_file_bytes": 50000, "max_diff_bytes": 200000, "max_workspace_bytes": 1000000}
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _validate(self, entries: list[ChangeEntry], *, protected: list[str] | None = None) -> dict:
+        with mock.patch("agent_handoff.dispatch.coding.changes.collect_status", return_value=entries):
+            return validate_changes(
+                str(self.workspace),
+                git=self.git,
+                limits=self.limits,
+                protected_paths=protected or [],
+            )
+
+    def _publisher(self) -> TrustedPublisher:
+        staging = self.root / "publication"
+        staging.mkdir(exist_ok=True)
+        os.chmod(staging, 0o700)
+        publisher = TrustedPublisher(
+            repository=PROJECT_REPO,
+            base_branch="main",
+            branch_prefix="agent-handoff/",
+            staging_root=str(staging),
+            token_provider=lambda: "fake-token",
+            remote_url=f"file://{self.repo['bare']}",
+            git=SafeGit(identity=None, allow_file_protocol=True),
+        )
+        with mock.patch.object(publisher, "verify_repository", return_value={"repository": PROJECT_REPO}):
+            publisher.prepare(base_commit=self.repo["base"], task_id="t-copy", run_id="r-copy")
+        return publisher
+
+    def _commit(self, publisher: TrustedPublisher, evidence: dict) -> dict:
+        return publisher.stage_and_commit(
+            validation=evidence,
+            task_workspace=str(self.workspace),
+            project="Alpha",
+            title="Copy rename",
+            issue_number=91,
+            task_id="t-copy",
+            run_id="r-copy",
+            base_commit=self.repo["base"],
+        )
+
+    def test_s4_parse_status_distinguishes_copy_and_rename(self) -> None:
+        entries = parse_status("C  src/copy.py\x00src/app.py\x00R  src/renamed.py\x00src/old.py\x00")
+        self.assertEqual(entries[0].status, "C ")
+        self.assertEqual(entries[0].old_path, "src/app.py")
+        self.assertEqual(entries[1].status, "R ")
+        self.assertEqual(entries[1].old_path, "src/old.py")
+
+    def test_s4_copy_only_keeps_source_and_commits_copy(self) -> None:
+        shutil.copy2(self.workspace / "src" / "app.py", self.workspace / "src" / "copied.py")
+        evidence = self._validate([ChangeEntry(path="src/copied.py", status="C ", old_path="src/app.py")])
+        self.assertEqual(evidence["status"], "passed", evidence)
+        statuses = {item["path"]: item["status"] for item in evidence["files"]}
+        self.assertEqual(statuses.get("src/copied.py"), "copied")
+        self.assertNotIn("src/app.py", statuses)
+        publisher = self._publisher()
+        committed = self._commit(publisher, evidence)
+        tree = git(["ls-tree", "-r", "--name-only", "HEAD"], Path(committed["staging"])).stdout.split()
+        self.assertIn("src/app.py", tree)
+        self.assertIn("src/copied.py", tree)
+        self.assertEqual(
+            (Path(committed["staging"]) / "src" / "app.py").read_text(encoding="utf-8"),
+            "value = 1\n",
+        )
+
+    def test_s4_rename_only_deletes_source(self) -> None:
+        git(["mv", "src/app.py", "src/renamed.py"], self.workspace)
+        evidence = self._validate(
+            [ChangeEntry(path="src/renamed.py", status="R ", old_path="src/app.py")]
+        )
+        self.assertEqual(evidence["status"], "passed", evidence)
+        statuses = {item["path"]: item["status"] for item in evidence["files"]}
+        self.assertEqual(statuses.get("src/renamed.py"), "renamed")
+        self.assertEqual(statuses.get("src/app.py"), "deleted")
+        publisher = self._publisher()
+        committed = self._commit(publisher, evidence)
+        tree = git(["ls-tree", "-r", "--name-only", "HEAD"], Path(committed["staging"])).stdout.split()
+        self.assertIn("src/renamed.py", tree)
+        self.assertNotIn("src/app.py", tree)
+
+    def test_s4_copy_with_source_modification_keeps_both_changes(self) -> None:
+        source = self.workspace / "src" / "app.py"
+        (self.workspace / "src" / "copied.py").write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        source.write_text("value = 123\n", encoding="utf-8")
+        evidence = self._validate([ChangeEntry(path="src/copied.py", status="C ", old_path="src/app.py")])
+        self.assertEqual(evidence["status"], "passed", evidence)
+        statuses = {item["path"]: item["status"] for item in evidence["files"]}
+        self.assertEqual(statuses.get("src/copied.py"), "copied")
+        self.assertEqual(statuses.get("src/app.py"), "modified")
+
+    def test_s4_rename_with_destination_modification(self) -> None:
+        git(["mv", "src/app.py", "src/renamed.py"], self.workspace)
+        (self.workspace / "src" / "renamed.py").write_text("value = 456\n", encoding="utf-8")
+        evidence = self._validate([ChangeEntry(path="src/renamed.py", status="RM", old_path="src/app.py")])
+        self.assertEqual(evidence["status"], "passed", evidence)
+        statuses = {item["path"]: item["status"] for item in evidence["files"]}
+        self.assertEqual(statuses.get("src/renamed.py"), "renamed")
+        self.assertEqual(statuses.get("src/app.py"), "deleted")
+
+    def test_s4_copy_from_and_to_protected_paths_is_blocked(self) -> None:
+        (self.workspace / ".ssh").mkdir()
+        (self.workspace / ".ssh" / "config").write_text("Host x\n", encoding="utf-8")
+        (self.workspace / "src" / "copied.py").write_text("x = 1\n", encoding="utf-8")
+        from_protected = self._validate(
+            [ChangeEntry(path="src/copied.py", status="C ", old_path=".ssh/config")]
+        )
+        self.assertEqual(from_protected["status"], "blocked")
+        self.assertTrue(any(".ssh/config" in item for item in from_protected["blocked"]))
+        tracked_source = self._validate(
+            [ChangeEntry(path="src/copied.py", status="C ", old_path="src/app.py")],
+            protected=["src/app.py"],
+        )
+        self.assertEqual(tracked_source["status"], "blocked")
+        self.assertTrue(any("copied from" in item for item in tracked_source["blocked"]))
+
+        (self.workspace / "src" / "ordinary.py").write_text("y = 1\n", encoding="utf-8")
+        (self.workspace / "credentials").mkdir()
+        (self.workspace / "credentials" / "auth").write_text("z = 1\n", encoding="utf-8")
+        to_protected = self._validate(
+            [ChangeEntry(path="credentials/auth", status="C ", old_path="src/ordinary.py")]
+        )
+        self.assertEqual(to_protected["status"], "blocked")
+        self.assertTrue(any("credentials/auth" in item for item in to_protected["blocked"]))
+
+    def test_s4_committed_tree_matches_manifest_exactly(self) -> None:
+        shutil.copy2(self.workspace / "src" / "app.py", self.workspace / "src" / "copied.py")
+        evidence = self._validate(
+            [
+                ChangeEntry(path="src/copied.py", status="C ", old_path="src/app.py"),
+                ChangeEntry(path="src/extra.py", status="??"),
+            ]
+        )
+        (self.workspace / "src" / "extra.py").write_text("EXTRA = 1\n", encoding="utf-8")
+        evidence = self._validate(
+            [
+                ChangeEntry(path="src/copied.py", status="C ", old_path="src/app.py"),
+                ChangeEntry(path="src/extra.py", status="??"),
+            ]
+        )
+        self.assertEqual(evidence["status"], "passed", evidence)
+        publisher = self._publisher()
+        committed = self._commit(publisher, evidence)
+        tree = set(git(["ls-tree", "-r", "--name-only", "HEAD"], Path(committed["staging"])).stdout.split())
+        changed = {item["path"] for item in evidence["manifest"]["files"]}
+        self.assertTrue(changed.issubset(tree))
+        self.assertEqual(git(["status", "--porcelain"], Path(committed["staging"])).stdout.strip(), "")
+
+
+class TestProtectedPathCoverage(unittest.TestCase):
+    """S5: root-level and nested sensitive paths are always protected."""
+
+    def test_s5_root_and_nested_sensitive_paths(self) -> None:
+        from agent_handoff.dispatch.coding.config import is_protected_path
+
+        paths = [
+            ".ssh/config",
+            "sub/.ssh/config",
+            "credentials/auth",
+            "sub/credentials/auth",
+            ".askpass.sh",
+            "sub/.askpass.sh",
+            ".env",
+            ".env.local",
+            "sub/.env",
+            "auth.json",
+            "sub/auth.json",
+            "rclone.conf",
+            "sub/rclone.conf",
+            ".gitconfig",
+            "sub/.gitconfig",
+            ".git-credentials",
+            ".netrc",
+            ".gitattributes",
+        ]
+        for path in paths:
+            self.assertTrue(is_protected_path(path, []), path)
+        self.assertFalse(is_protected_path("src/ordinary.py", []))
+        self.assertFalse(is_protected_path("docs/environment.md", []))
+
+    def test_s5_validate_changes_blocks_root_and_nested_paths_but_allows_source(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            root = Path(tmp.name)
+            repo = make_repository(root)
+            workspace = root / "task"
+            shutil.copytree(repo["source"], workspace)
+            (workspace / ".ssh").mkdir()
+            (workspace / ".ssh" / "config").write_text("Host x\n", encoding="utf-8")
+            (workspace / "nested").mkdir()
+            (workspace / "nested" / ".ssh").mkdir()
+            (workspace / "nested" / ".ssh" / "config").write_text("Host y\n", encoding="utf-8")
+            (workspace / "src" / "ordinary.py").write_text("OK = True\n", encoding="utf-8")
+            evidence = validate_changes(
+                str(workspace),
+                git=SafeGit(identity=None, allow_file_protocol=True),
+                limits={"max_files_changed": 10, "max_file_bytes": 50000, "max_diff_bytes": 200000, "max_workspace_bytes": 1000000},
+                protected_paths=[],
+            )
+            self.assertEqual(evidence["status"], "blocked")
+            blocked = " ".join(evidence["blocked"])
+            self.assertIn(".ssh/config", blocked)
+            self.assertIn("nested/.ssh/config", blocked)
+        finally:
+            tmp.cleanup()
+
+
+
+class TestDurableMilestoneReconciliation(unittest.TestCase):
+    """S7: reconcile milestones from authoritative evidence after a crash."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.h = DispatchHarness(self.root)
+        self.ledger = Ledger(self.h.config)
+        self.runner = DispatchRunner(
+            self.h.config,
+            {
+                "repository": GH_REPO,
+                "allowed_users": ["dev"],
+                "github": {"command": "gh", "require_private": True},
+                "execution": {},
+                "projects": {},
+            },
+            progress=None,
+        )
+        self.runner.summary = {
+            "ok": True, "busy": False, "executed": 0, "rejected": 0, "needs_attention": 0,
+            "uploaded": 0, "published": 0, "errors": [], "warnings": [],
+        }
+        project = {"name": "Alpha", "core_name": "Alpha", "core_key": "alpha", "coding": {"enabled": True}}
+        record = new_dispatch_record(
+            repository=GH_REPO,
+            issue={"number": 101, "title": "reconcile", "html_url": "https://github.test/issues/101"},
+            project=project,
+            agent="opencode",
+            model="provider/model-fast",
+            request={"instructions": "test"},
+            task_type="coding",
+            coding=new_coding_state(project),
+        )
+        record["capture"].update({"status": "CAPTURED", "task_id": "t-rec", "run_id": "r-rec"})
+        record["coding"]["base_commit"] = "a" * 40
+        record["coding"]["publication"].update(
+            {"branch": "agent-handoff/alpha/issue-101-t-rec", "commit": "b" * 40, "branch_pushed": True,
+             "pr_number": 8, "pr_url": "https://github.test/dev/coding-repo/pull/8"}
+        )
+        record["coding"]["tests"] = {"status": "passed", "commands": [{"status": "passed", "exit_code": 0}]}
+        record["coding"]["diff"] = {"status": "passed"}
+        self.record, _ = self.ledger.create(record)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _update(self, mutator) -> dict:
+        return self.ledger.update(GH_REPO, 101, mutator, note="simulate crash")
+
+    def test_s7_report_verified_reconciled_from_verified_upload(self) -> None:
+        self._update(lambda item: item.update({"status": "UPLOAD_VERIFIED"}))
+        self._update(
+            lambda item: item["upload"].update(
+                {"status": "VERIFIED", "verified": True, "verified_at": "2026-01-01T00:00:00Z",
+                 "report_url": "https://drive.google.com/file/d/rec/view"}
+            )
+        )
+        updated = self.runner._reconcile_coding_milestones(self.ledger.get(GH_REPO, 101))
+        self.assertTrue(updated["coding"]["milestones"]["REPORT_VERIFIED"])
+        self.assertEqual(updated["coding"]["stage"], "UPLOAD_VERIFIED")
+
+    def test_s7_issue_delivered_reconciled_after_primary_status_update(self) -> None:
+        self._update(
+            lambda item: item.update(
+                {
+                    "status": "ISSUE_UPDATED",
+                    "upload": {"verified": True, "report_url": "https://drive.google.com/file/d/rec/view"},
+                    "publication": {"status": "PUBLISHED", "published_at": "2026-01-01T00:00:10Z"},
+                }
+            )
+        )
+        updated = self.runner._reconcile_coding_milestones(self.ledger.get(GH_REPO, 101))
+        self.assertTrue(updated["coding"]["milestones"]["ISSUE_DELIVERED"])
+        self.assertTrue(updated["coding"]["milestones"]["REPORT_DELIVERED"])
+        self.assertEqual(updated["coding"]["stage"], "ISSUE_UPDATED")
+
+    def test_s7_pr_milestones_reconciled_without_duplicate_pr(self) -> None:
+        updated = self.runner._reconcile_coding_milestones(self.ledger.get(GH_REPO, 101))
+        self.assertTrue(updated["coding"]["milestones"]["PR_CREATED"])
+        self.assertTrue(updated["coding"]["milestones"]["PR_PUBLISHED"])
+        self.assertEqual(updated["coding"]["publication"]["pr_url"], "https://github.test/dev/coding-repo/pull/8")
+
+    def test_s7_failed_tests_never_gain_tests_passed_milestone(self) -> None:
+        self._update(
+            lambda item: (
+                item["coding"].update({"tests": {"status": "failed"}}),
+                item["coding"]["milestones"].update({"TESTS_PASSED": True}),
+            )
+        )
+        updated = self.runner._reconcile_coding_milestones(self.ledger.get(GH_REPO, 101))
+        self.assertFalse(updated["coding"]["milestones"].get("TESTS_PASSED"))
+        self.assertEqual(milestone_state(updated["coding"], "TESTS_PASSED"), "false")
+
+
+class TestPublisherRecoveryGuards(unittest.TestCase):
+    """S8: PR state/SHA checks and corrupt staging refusal."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.staging = self.root / "publication"
+        self.staging.mkdir()
+        os.chmod(self.staging, 0o700)
+        self.publisher = TrustedPublisher(
+            repository=PROJECT_REPO,
+            base_branch="main",
+            branch_prefix="agent-handoff/",
+            staging_root=str(self.staging),
+            token_provider=lambda: "fake-token",
+            git=SafeGit(identity=None, allow_file_protocol=True),
+        )
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _pr(self, **overrides) -> dict:
+        value = {
+            "number": 5,
+            "html_url": "https://github.test/dev/coding-repo/pull/5",
+            "state": "open",
+            "draft": True,
+            "head": {"ref": "agent-handoff/alpha/issue-1-t", "sha": "c" * 40, "repo": {"full_name": PROJECT_REPO}},
+            "base": {"ref": "main"},
+        }
+        value.update(overrides)
+        return value
+
+    def test_s8_closed_or_moved_pr_is_rejected(self) -> None:
+        with self.assertRaises(PublicationError):
+            self.publisher._validate_pr(self._pr(state="closed"), "agent-handoff/alpha/issue-1-t", "c" * 40)
+        with self.assertRaises(PublicationError):
+            self.publisher._validate_pr(self._pr(head={"ref": "agent-handoff/alpha/issue-1-t", "sha": "d" * 40}), "agent-handoff/alpha/issue-1-t", "c" * 40)
+        with self.assertRaises(PublicationError):
+            self.publisher._validate_pr(self._pr(draft=False), "agent-handoff/alpha/issue-1-t", "c" * 40)
+
+    def test_s8_corrupt_persisted_staging_is_refused(self) -> None:
+        corrupt = self.staging / "t-corrupt-r-corrupt"
+        corrupt.mkdir()
+        with self.assertRaises(PublicationError):
+            self.publisher.adopt_staging(str(corrupt))
+
+    def test_s8_symlinked_persisted_staging_is_refused(self) -> None:
+        target = self.root / "elsewhere"
+        target.mkdir()
+        link = self.staging / "t-link-r-link"
+        os.symlink(target, link)
+        with self.assertRaises(PublicationError):
+            self.publisher.adopt_staging(str(link))
+
+
+class TestDeliveryConcurrency(unittest.TestCase):
+    """S9: manual and automatic delivery share a durable Issue lock."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.h = DispatchHarness(self.root)
+        self.ledger = Ledger(self.h.config)
+        self.runner = DispatchRunner(
+            self.h.config,
+            {
+                "repository": GH_REPO,
+                "allowed_users": ["dev"],
+                "github": {"command": "gh", "require_private": True},
+                "execution": {},
+                "projects": {},
+            },
+            progress=None,
+        )
+        self.runner.summary = {
+            "ok": True, "busy": False, "executed": 0, "rejected": 0, "needs_attention": 0,
+            "uploaded": 0, "published": 0, "errors": [], "warnings": [],
+        }
+        project = {"name": "Alpha", "core_name": "Alpha", "core_key": "alpha"}
+        self.record = new_dispatch_record(
+            repository=GH_REPO,
+            issue={"number": 111, "title": "concurrent", "html_url": "https://github.test/issues/111"},
+            project=project,
+            agent="opencode",
+            model="provider/model-fast",
+            request={"instructions": "test"},
+        )
+        self.record["status"] = "UPLOAD_VERIFIED"
+        self.record["capture"].update({"status": "CAPTURED", "task_id": "t-con", "run_id": "r-con"})
+        self.record["upload"].update(
+            {"status": "VERIFIED", "verified": True, "verified_at": "2026-01-01T00:00:00Z",
+             "report_url": "https://drive.google.com/file/d/con/view"}
+        )
+        self.record, _ = self.ledger.create(self.record)
+
+        class Transport:
+            def __init__(self) -> None:
+                self.comments: list[dict] = []
+                self.lock = threading.Lock()
+
+            def find_comment(self, issue_number, marker):
+                with self.lock:
+                    for comment in self.comments:
+                        if marker in comment["body"]:
+                            return comment
+                return None
+
+            def comment(self, issue_number, body):
+                time.sleep(0.05)
+                with self.lock:
+                    comment = {
+                        "body": body,
+                        "html_url": f"https://github.test/issues/{issue_number}#issuecomment-{len(self.comments) + 1}",
+                        "created_at": utcnow_iso(),
+                    }
+                    self.comments.append(comment)
+                    return comment
+
+        self.transport = Transport()
+        self.runner.transport = self.transport
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_s9_concurrent_delivery_posts_exactly_one_comment(self) -> None:
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def deliver() -> None:
+            try:
+                barrier.wait(timeout=5)
+                self.runner._publish(self.record, force=True)
+            except BaseException as exc:  # noqa: BLE001 - collected for the assertion
+                errors.append(exc)
+
+        threads = [threading.Thread(target=deliver) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(self.transport.comments), 1)
+        final = self.ledger.get(GH_REPO, 111)
+        self.assertEqual(final["status"], "ISSUE_UPDATED")
+        self.assertEqual(final["publication"]["status"], "PUBLISHED")
+
+
 
 
 class TestProductionPreservation(unittest.TestCase):

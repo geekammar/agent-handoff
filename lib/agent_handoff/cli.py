@@ -1430,39 +1430,57 @@ def _cmd_dispatch_deliver(args: argparse.Namespace) -> int:
         apply_upload_verified(item)
     record = ledger.update(repository, issue_number, apply_reconcile, note="verified upload metadata reconciled")
     marker = delivery_marker(args.run)
-    reporter.emit("publishing", "checking for an existing idempotent delivery comment")
-    existing_comment = transport.find_comment(issue_number, marker)
-    comment_url = (existing_comment or {}).get("html_url")
-    if not existing_comment:
-        from .dispatch.delivery import build_issue_comment
-
-        response = transport.comment(issue_number, build_issue_comment(record))
-        comment_url = response.get("url")
-    published_at = (existing_comment or {}).get("created_at") or utcnow_iso()
     notifier = NotificationService(config, log=lambda message: reporter.emit("notifying", message))
-    final_record = ledger.set_status(
-        repository,
-        issue_number,
-        "ISSUE_UPDATED",
-        note="operator published verified delivery",
-        updates={
-            "publication": {
-                "status": "PUBLISHED",
-                "published_at": published_at,
-                "comment_url": comment_url,
-                "last_error": None,
-                "next_attempt_at": None,
-            },
-            "attention_reason": None,
-        },
-    )
-    if final_record.get("task_type") == "coding":
-        final_record = ledger.update(
-            repository,
-            issue_number,
-            apply_issue_delivered,
-            note="coding Issue delivery milestone recorded",
-        )
+    with ledger.publication_lock(repository, issue_number):
+        record = ledger.get(repository, issue_number) or record
+        if record.get("status") == "ISSUE_UPDATED" and (record.get("publication") or {}).get("status") == "PUBLISHED":
+            existing_comment = transport.find_comment(issue_number, marker)
+            comment_url = (record.get("publication") or {}).get("comment_url") or (existing_comment or {}).get("html_url")
+            final_record = record
+            coding_record = record.get("coding") or {}
+            milestones = coding_record.get("milestones") or {}
+            if record.get("task_type") == "coding" and not (
+                milestones.get("ISSUE_DELIVERED") or milestones.get("REPORT_DELIVERED")
+            ):
+                final_record = ledger.update(
+                    repository,
+                    issue_number,
+                    apply_issue_delivered,
+                    note="coding Issue delivery milestone reconciled from published state",
+                )
+        else:
+            reporter.emit("publishing", "checking for an existing idempotent delivery comment")
+            existing_comment = transport.find_comment(issue_number, marker)
+            comment_url = (existing_comment or {}).get("html_url")
+            if not existing_comment:
+                from .dispatch.delivery import build_issue_comment
+
+                response = transport.comment(issue_number, build_issue_comment(record))
+                comment_url = response.get("url")
+            published_at = (existing_comment or {}).get("created_at") or utcnow_iso()
+            final_record = ledger.set_status(
+                repository,
+                issue_number,
+                "ISSUE_UPDATED",
+                note="operator published verified delivery",
+                updates={
+                    "publication": {
+                        "status": "PUBLISHED",
+                        "published_at": published_at,
+                        "comment_url": comment_url,
+                        "last_error": None,
+                        "next_attempt_at": None,
+                    },
+                    "attention_reason": None,
+                },
+            )
+            if final_record.get("task_type") == "coding":
+                final_record = ledger.update(
+                    repository,
+                    issue_number,
+                    apply_issue_delivered,
+                    note="coding Issue delivery milestone recorded",
+                )
     notification_data: dict[str, Any] = {
         "enabled": notifier.enabled,
         "configured_enabled": notifier.configured_enabled,

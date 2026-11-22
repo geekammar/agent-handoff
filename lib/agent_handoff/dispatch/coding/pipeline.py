@@ -139,6 +139,7 @@ class CodingOrchestrator:
         top_status: str | None = None,
         updates: dict[str, Any] | None = None,
         milestone: str | None = None,
+        milestones: list[str] | None = None,
     ) -> dict[str, Any]:
         def mutate(coding: dict[str, Any]) -> None:
             current = str(coding.get("stage") or "REQUEST_ACCEPTED")
@@ -151,17 +152,26 @@ class CodingOrchestrator:
             history.append({"at": utcnow_iso(), "stage": stage_value, "note": note})
             if len(history) > 120:
                 coding["stage_history"] = history[-120:]
-            if milestone:
-                coding.setdefault("milestones", {})[milestone] = True
+            for name in [*(milestones or []), *([milestone] if milestone else [])]:
+                coding.setdefault("milestones", {})[name] = True
 
         updated = self._set_coding(mutate, note=note, top_status=top_status, updates=updates)
         self.record = updated
         return updated
 
-    def _block(self, stage: str, reason: str, *, preserve: bool = True) -> dict[str, Any]:
+    def _block(
+        self,
+        stage: str,
+        reason: str,
+        *,
+        preserve: bool = True,
+        extra: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         safe_reason = self._safe_text(reason, 1500)
 
         def mutate(coding: dict[str, Any]) -> None:
+            if extra is not None:
+                extra(coding)
             coding["blocked"] = True
             coding["blocked_stage"] = stage
             coding["blocked_reason"] = safe_reason
@@ -202,13 +212,128 @@ class CodingOrchestrator:
             )
         return self._publisher
 
+    def _expected_workspace_name(self) -> str:
+        return f"issue-{int(self.record['issue_number'])}-{self.task_id}"
+
+    def _agent_started(self, coding: Mapping[str, Any]) -> bool:
+        agent = coding.get("agent") or {}
+        stage = str(coding.get("stage") or "")
+        return str(agent.get("status") or "") in ("running", "completed", "uncertain") or stage in (
+            "AGENT_RUNNING",
+            "AGENT_COMPLETED",
+            "TESTING",
+            "VALIDATING_DIFF",
+            "COMMIT_PREPARED",
+            "BRANCH_PUBLISHED",
+            "PR_CREATED",
+        )
+
+    def revalidate_workspace(self, current: dict[str, Any]) -> dict[str, Any]:
+        """Revalidate persisted workspace identity and artifacts on every resume."""
+
+        coding = current.get("coding") or {}
+        if coding.get("blocked"):
+            return current
+        workspace = str(coding.get("workspace") or "")
+        if not workspace:
+            return self._block(
+                "WORKSPACE_PREPARED",
+                "the persisted coding workspace path is missing; publication is refused",
+            )
+        agent_started = self._agent_started(coding)
+        try:
+            validate_coding_root(
+                self.workspace_root,
+                identity=self.identity,
+                workspace_roots=list(
+                    ((self.dispatch.get("execution") or {}).get("isolation") or {}).get("workspace_roots") or []
+                ),
+                source_workspace=self.source_workspace,
+                base_dir=str(BASE_DIR),
+                check_paths=True,
+            )
+            source = verify_source_repository(
+                self.source_workspace,
+                repository=self.repository,
+                base_branch=self.base_branch,
+                git=self.git,
+            )
+            base_commit = str(coding.get("base_commit") or "")
+            if not base_commit:
+                raise WorkspacePreparationError("the persisted base commit is missing")
+            exists = self.git.run(
+                ["cat-file", "-e", f"{base_commit}^{{commit}}"],
+                cwd=source["source"],
+                check=False,
+            )
+            if exists.returncode != 0:
+                raise WorkspacePreparationError("the persisted base commit no longer exists in the source repository")
+            adopted = prepare_workspace(
+                workspace_root=self.workspace_root,
+                repository=self.repository,
+                base_branch=self.base_branch,
+                base_commit=base_commit,
+                source=source["source"],
+                issue_number=int(self.record["issue_number"]),
+                task_id=self.task_id,
+                identity=self.identity,
+                git=self.git,
+                allow_existing=True,
+                require_clean=not agent_started,
+            )
+        except (WorkspacePreparationError, ChangeValidationError, OSError) as exc:
+            return self._block(
+                "WORKSPACE_PREPARED",
+                f"persisted coding workspace revalidation failed: {exc}",
+            )
+        if adopted["workspace"] != workspace or adopted["workspace_name"] != str(coding.get("workspace_name") or ""):
+            if adopted["workspace"] != workspace:
+                return self._block(
+                    "WORKSPACE_PREPARED",
+                    "the persisted coding workspace path does not match the managed task workspace",
+                )
+        diff = coding.get("diff") or {}
+        if diff.get("status") == "passed":
+            try:
+                evidence = validate_changes(
+                    adopted["workspace"],
+                    git=self.git,
+                    limits=(self.project.get("coding") or {}).get("limits") or {},
+                    protected_paths=(self.project.get("coding") or {}).get("protected_paths") or [],
+                    allowed_paths=(self.project.get("coding") or {}).get("allowed_paths") or [],
+                    secret_scan=bool((self.project.get("coding") or {}).get("secret_scan", True)),
+                )
+            except (ChangeValidationError, OSError) as exc:
+                return self._block(
+                    "VALIDATING_DIFF",
+                    f"persisted workspace artifacts could not be revalidated: {exc}",
+                )
+            if (
+                evidence.get("status") != "passed"
+                or evidence.get("manifest_sha256") != str(diff.get("manifest_sha256") or "")
+            ):
+                return self._block(
+                    "VALIDATING_DIFF",
+                    "the workspace changed after diff validation; publication is refused",
+                )
+        current = self._set_coding(
+            lambda item: item.update(
+                {"workspace": adopted["workspace"], "workspace_name": adopted["workspace_name"]}
+            ),
+            note="persisted coding workspace revalidated before resume",
+        )
+        self.record = current
+        return current
+
     def prepare(self) -> dict[str, Any]:
         current = self._fresh()
         coding = current.get("coding") or {}
         if coding.get("stage") not in (None, "REQUEST_ACCEPTED", "CLAIMED", "WORKSPACE_PREPARED"):
             return current
         if coding.get("workspace") and coding.get("base_commit"):
-            return current
+            if self._agent_started(coding) or os.path.lexists(str(coding.get("workspace"))):
+                return self.revalidate_workspace(current)
+            self._emit("coding_workspace", "persisted workspace is missing before agent start; recreating it")
         self._emit("coding_workspace", "validating the disposable coding workspace policy")
         try:
             validate_coding_root(
@@ -232,11 +357,21 @@ class CodingOrchestrator:
                 base_branch=self.base_branch,
                 git=self.git,
             )
+            requested_base = str(coding.get("base_commit") or source["base_commit"])
+            exists = self.git.run(
+                ["cat-file", "-e", f"{requested_base}^{{commit}}"],
+                cwd=source["source"],
+                check=False,
+            )
+            if exists.returncode != 0:
+                raise WorkspacePreparationError(
+                    "the persisted base commit no longer exists in the source repository"
+                )
             prepared = prepare_workspace(
                 workspace_root=self.workspace_root,
                 repository=self.repository,
                 base_branch=self.base_branch,
-                base_commit=source["base_commit"],
+                base_commit=requested_base,
                 source=source["source"],
                 issue_number=int(self.record["issue_number"]),
                 task_id=self.task_id,
@@ -355,31 +490,159 @@ class CodingOrchestrator:
                 f"the coding agent did not report success (outcome={agent.get('outcome')}); "
                 "tests and publication were not started",
             )
+        current = self.revalidate_workspace(current)
+        coding = current.get("coding") or {}
+        if coding.get("blocked"):
+            return current
         current = self._ensure_tests(current)
         coding = current.get("coding") or {}
         if coding.get("blocked"):
             return current
+        gated = self._require_test_gate(current)
+        if gated is not None:
+            return gated
         current = self._ensure_validation(current)
         coding = current.get("coding") or {}
         if coding.get("blocked"):
             return current
-        current = self._ensure_commit(current)
+        gated = self._require_test_gate(current)
+        if gated is not None:
+            return gated
+        current = self._ensure_commit(current, force=force)
         coding = current.get("coding") or {}
         if coding.get("blocked"):
             return current
+        gated = self._require_test_gate(current)
+        if gated is not None:
+            return gated
         current = self._ensure_push(current, force=force)
         coding = current.get("coding") or {}
         publication = coding.get("publication") or {}
         if coding.get("blocked") or not publication.get("branch_pushed"):
             return current
+        gated = self._require_test_gate(current)
+        if gated is not None:
+            return gated
         current = self._ensure_pr(current, force=force)
         return current
 
+    PUBLICATION_STAGES = (
+        "VALIDATING_DIFF",
+        "COMMIT_PREPARED",
+        "BRANCH_PUBLISHED",
+        "PR_CREATED",
+    )
+    TEST_EVIDENCE_STATUSES = {
+        "passed",
+        "failed",
+        "timed_out",
+        "interrupted",
+        "orphans",
+        "error",
+        "cancelled",
+    }
+
+    def _test_gate_problem(self, coding: Mapping[str, Any]) -> str | None:
+        """Return a reason unless tests are explicitly and verifiably passed."""
+
+        tests = coding.get("tests")
+        if not isinstance(tests, dict):
+            return "trusted test evidence is missing or malformed"
+        status = str(tests.get("status") or "")
+        if status != "passed":
+            return f"trusted tests did not pass (status={status or 'missing'})"
+        expected_profile = str((self.project.get("coding") or {}).get("test_profile") or "")
+        if expected_profile and str(tests.get("profile") or "") != expected_profile:
+            return "trusted test evidence belongs to a different configured test profile"
+        commands = tests.get("commands")
+        if not isinstance(commands, list) or not commands:
+            return "trusted test evidence contains no executed command"
+        for item in commands:
+            if not isinstance(item, dict):
+                return "trusted test evidence contains a malformed command result"
+            if str(item.get("status") or "") != "passed":
+                return "a trusted test command did not pass"
+            try:
+                exit_code = int(item.get("exit_code"))
+            except (TypeError, ValueError):
+                return "a trusted test command has no verified exit code"
+            if exit_code != 0:
+                return "a trusted test command exited non-zero"
+            if item.get("timed_out"):
+                return "a trusted test command timed out"
+            if item.get("orphans_detected"):
+                return "a trusted test command left an orphaned process group"
+        if tests.get("failed_command"):
+            return "trusted test evidence records a failed command"
+        return None
+
+    def _record_test_failure(
+        self,
+        current: dict[str, Any],
+        *,
+        reason: str,
+        stored: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist test evidence and the blocked state in one ledger write."""
+
+        def extra(coding: dict[str, Any]) -> None:
+            if stored is not None:
+                coding["tests"] = dict(stored)
+            coding.setdefault("milestones", {})["TESTS_PASSED"] = False
+
+        return self._block("TESTING", reason, extra=extra)
+
+    def _require_test_gate(self, current: dict[str, Any]) -> dict[str, Any] | None:
+        """Fail closed before validation, commit, push, or PR publication."""
+
+        coding = current.get("coding") or {}
+        if coding.get("blocked"):
+            return current
+        problem = self._test_gate_problem(coding)
+        if problem:
+            return self._record_test_failure(
+                current,
+                reason=f"{problem}; publication is refused",
+            )
+        return None
+
     def _ensure_tests(self, current: dict[str, Any]) -> dict[str, Any]:
         coding = current.get("coding") or {}
-        tests = coding.get("tests") or {}
-        if tests.get("status") in ("passed", "failed", "timed_out"):
+        tests = coding.get("tests")
+        if tests is not None and not isinstance(tests, dict):
+            return self._record_test_failure(
+                current, reason="trusted test evidence is malformed; publication is refused"
+            )
+        status = str((tests or {}).get("status") or "") if isinstance(tests, dict) else ""
+        if status == "passed":
+            problem = self._test_gate_problem(coding)
+            if problem:
+                return self._record_test_failure(
+                    current, reason=f"{problem}; publication is refused"
+                )
             return current
+        has_evidence = bool(
+            isinstance(tests, dict)
+            and (
+                status in self.TEST_EVIDENCE_STATUSES
+                or tests.get("commands")
+                or status not in ("", "not_run")
+            )
+        )
+        stage = str(coding.get("stage") or "")
+        if has_evidence:
+            return self._record_test_failure(
+                current,
+                reason=(
+                    f"persisted trusted test evidence is not a pass (status={status or 'missing'}); "
+                    "publication is refused and the agent/tests are not re-run"
+                ),
+            )
+        if stage in self.PUBLICATION_STAGES:
+            return self._record_test_failure(
+                current,
+                reason="trusted test evidence is missing at a publication stage; publication is refused",
+            )
         definition = (self.project.get("coding") or {}).get("test_definition") or {}
         workspace = str(coding.get("workspace") or "")
         limits = (self.project.get("coding") or {}).get("limits") or {}
@@ -394,7 +657,9 @@ class CodingOrchestrator:
                 spawn=self.spawn,
             )
         except (TestExecutionError, OSError) as exc:
-            return self._block("TESTING", f"trusted test execution could not start: {exc}")
+            return self._record_test_failure(
+                current, reason=f"trusted test execution could not start: {exc}"
+            )
         stored = {
             "status": evidence.get("status"),
             "profile": evidence.get("profile"),
@@ -418,16 +683,13 @@ class CodingOrchestrator:
             ],
         }
         if evidence.get("status") != "passed":
-            updated = self._stage(
-                "TESTING",
-                note="trusted tests failed; publication is refused",
-                top_status="EXECUTION_COMPLETED",
-                updates={"coding": {"tests": stored}},
-            )
-            return self._block(
-                "TESTING",
-                f"trusted tests did not pass (status={evidence.get('status')}); "
-                "no commit, push, or Draft PR was created",
+            return self._record_test_failure(
+                current,
+                reason=(
+                    f"trusted tests did not pass (status={evidence.get('status')}); "
+                    "no commit, push, or Draft PR was created"
+                ),
+                stored=stored,
             )
         updated = self._stage(
             "TESTING",
@@ -439,6 +701,9 @@ class CodingOrchestrator:
         return updated
 
     def _ensure_validation(self, current: dict[str, Any]) -> dict[str, Any]:
+        gated = self._require_test_gate(current)
+        if gated is not None:
+            return gated
         coding = current.get("coding") or {}
         if (coding.get("diff") or {}).get("status") in ("passed", "blocked"):
             return current
@@ -489,10 +754,19 @@ class CodingOrchestrator:
         self._emit("coding_validation", "diff validation passed")
         return updated
 
-    def _ensure_commit(self, current: dict[str, Any]) -> dict[str, Any]:
+    def _ensure_commit(self, current: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
+        gated = self._require_test_gate(current)
+        if gated is not None:
+            return gated
+        current = self.revalidate_workspace(current)
+        if (current.get("coding") or {}).get("blocked"):
+            return current
         coding = current.get("coding") or {}
         publication = coding.get("publication") or {}
         if publication.get("commit"):
+            return current
+        if not self._publication_due(current, force):
+            self._emit("coding_waiting", "publication commit retry is not due yet")
             return current
         project_coding = self.project.get("coding") or {}
         branch = str(
@@ -535,7 +809,12 @@ class CodingOrchestrator:
                 base_commit=str(coding.get("base_commit") or ""),
             )
         except (PublicationError, OSError) as exc:
-            return self._block("COMMIT_PREPARED", f"preparing the publication commit failed: {exc}")
+            return self._publication_retry(
+                current,
+                stage="COMMIT_PREPARED",
+                error=f"preparing the publication commit failed: {exc}",
+                force=force,
+            )
         updated = self._stage(
             "COMMIT_PREPARED",
             note=f"commit prepared: {committed['commit']}",
@@ -606,6 +885,9 @@ class CodingOrchestrator:
             return True
 
     def _ensure_push(self, current: dict[str, Any], *, force: bool) -> dict[str, Any]:
+        gated = self._require_test_gate(current)
+        if gated is not None:
+            return gated
         coding = current.get("coding") or {}
         publication = coding.get("publication") or {}
         if publication.get("branch_pushed"):
@@ -615,11 +897,16 @@ class CodingOrchestrator:
             return current
         publisher = self._adopt_publisher()
         staging = publication.get("staging")
-        if staging and os.path.isdir(staging):
-            publisher.adopt_staging(str(staging))
+        staging_ok = False
+        if staging and os.path.isdir(str(staging)):
+            try:
+                publisher.adopt_staging(str(staging))
+                staging_ok = True
+            except (PublicationError, OSError) as exc:
+                self.log(f"persisted publication staging is not reusable: {exc}")
         branch = str(publication.get("branch") or "")
         commit = str(publication.get("commit") or "")
-        if not staging or not os.path.isdir(str(staging)):
+        if not staging_ok:
             try:
                 remote_sha = publisher.remote_branch_sha(branch)
             except (PublicationError, OSError) as exc:
@@ -648,11 +935,37 @@ class CodingOrchestrator:
                 )
                 self._emit("coding_branch", "remote branch reconciled after publication staging loss")
                 return updated
-            reason = (
-                "the publication staging repository is missing and the remote branch does not contain "
-                f"the verified commit (remote={remote_sha or 'absent'})"
+            if remote_sha:
+                return self._block(
+                    "BRANCH_PUBLISHED",
+                    "the publication staging is unusable and the remote branch contains a different commit; "
+                    "refusing to overwrite the published branch",
+                )
+            self._emit(
+                "coding_commit",
+                "publication staging was lost before the branch was pushed; rebuilding the verified commit",
             )
-            return self._block("BRANCH_PUBLISHED", reason)
+
+            def clear_commit(item: dict[str, Any]) -> None:
+                item.setdefault("publication", {}).update(
+                    {"commit": None, "staging": None, "status": "PENDING"}
+                )
+
+            current = self._set_coding(
+                clear_commit, note="rebuilding lost publication staging before branch publication"
+            )
+            current = self._ensure_commit(current, force=True)
+            coding = current.get("coding") or {}
+            if coding.get("blocked"):
+                return current
+            publication = coding.get("publication") or {}
+            staging = publication.get("staging")
+            commit = str(publication.get("commit") or "")
+            if not publication.get("commit") or not staging:
+                return self._block(
+                    "BRANCH_PUBLISHED", "the publication commit could not be rebuilt after staging loss"
+                )
+            publisher.adopt_staging(str(staging))
         self._stage("BRANCH_PUBLISHED", note="pushing one task branch to the trusted repository")
         self._emit("coding_branch", "pushing the task branch to the trusted repository")
         try:
@@ -682,17 +995,40 @@ class CodingOrchestrator:
         return updated
 
     def _ensure_pr(self, current: dict[str, Any], *, force: bool) -> dict[str, Any]:
+        gated = self._require_test_gate(current)
+        if gated is not None:
+            return gated
         coding = current.get("coding") or {}
         publication = coding.get("publication") or {}
+        publisher = self._adopt_publisher()
         if publication.get("pr_url"):
+            if not (coding.get("milestones") or {}).get("PR_PUBLISHED"):
+                current = self._stage(
+                    "PR_CREATED",
+                    note="reconciled Draft Pull Request publication milestone from existing PR evidence",
+                    milestones=["PR_CREATED", "PR_PUBLISHED"],
+                )
+                coding = current.get("coding") or {}
+                publication = coding.get("publication") or {}
+            staging = publication.get("staging")
+            if staging and os.path.isdir(str(staging)):
+                try:
+                    publisher.adopt_staging(str(staging))
+                    publisher.cleanup(preserve=False)
+                except (PublicationError, OSError) as exc:
+                    self.log(f"publication staging cleanup is still pending: {exc}")
             return current
+        if not publication.get("branch_pushed"):
+            return self._block("PR_CREATED", "the publication branch was not verified as pushed")
         if not self._publication_due(current, force):
             self._emit("coding_waiting", "Draft PR creation retry is not due yet")
             return current
-        publisher = self._adopt_publisher()
         staging = publication.get("staging")
         if staging and os.path.isdir(staging):
-            publisher.adopt_staging(str(staging))
+            try:
+                publisher.adopt_staging(str(staging))
+            except (PublicationError, OSError) as exc:
+                self.log(f"persisted publication staging is not reusable for PR creation: {exc}")
         branch = str(publication.get("branch") or "")
         commit = str(publication.get("commit") or "")
         project_name = str((current.get("project") or {}).get("name") or "project")
@@ -741,12 +1077,7 @@ class CodingOrchestrator:
                     }
                 }
             },
-            milestone="PR_CREATED",
-        )
-        self._stage(
-            "PR_CREATED",
-            note="Draft Pull Request publication milestone",
-            milestone="PR_PUBLISHED",
+            milestones=["PR_CREATED", "PR_PUBLISHED"],
         )
         publisher.cleanup(preserve=False)
         self._emit("coding_pr", "Draft Pull Request is ready")
@@ -761,7 +1092,12 @@ class CodingOrchestrator:
         workspace = str(coding.get("workspace") or "")
         if not workspace:
             return False
-        ok = cleanup_workspace(self.workspace_root, workspace, identity=self.identity)
+        ok = cleanup_workspace(
+            self.workspace_root,
+            workspace,
+            identity=self.identity,
+            expected_name=self._expected_workspace_name(),
+        )
         if ok:
             self._set_coding(
                 lambda item: item.update({"workspace": None, "cleaned_up": True}),

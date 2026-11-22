@@ -165,6 +165,24 @@ def qualified_path(root: str, relative: str) -> str:
     return candidate
 
 
+def workspace_entry_path(root: str, relative: str) -> str:
+    """Join a changed path without following the final symlink.
+
+    Intermediate parents must stay inside the canonical workspace. The final
+    entry is inspected with ``lstat`` by the caller so symlinks are visible.
+    """
+
+    safe = safe_relative_path(relative)
+    root_real = os.path.realpath(root)
+    candidate = os.path.abspath(os.path.join(root_real, safe))
+    if not candidate.startswith(root_real.rstrip("/") + "/"):
+        raise ChangeValidationError(f"changed path escapes the task workspace: {relative[:120]!r}")
+    parent_real = os.path.realpath(os.path.dirname(candidate))
+    if parent_real != root_real and not parent_real.startswith(root_real.rstrip("/") + "/"):
+        raise ChangeValidationError(f"changed path parent escapes the task workspace: {relative[:120]!r}")
+    return candidate
+
+
 def parse_status(output: str) -> list[ChangeEntry]:
     fields = [item for item in output.split("\x00") if item]
     entries: list[ChangeEntry] = []
@@ -208,6 +226,17 @@ def _index_mode(git: SafeGit, workspace: str, path: str) -> str | None:
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _head_blob(git: SafeGit, workspace: str, path: str) -> bytes | None:
+    exists = git.run(["cat-file", "-e", f"HEAD:{path}"], cwd=workspace, check=False)
+    if exists.returncode != 0:
+        return None
+    result = git.run(["cat-file", "-p", f"HEAD:{path}"], cwd=workspace, text=False, check=False)
+    if result.returncode != 0:
+        return None
+    data = result.stdout if isinstance(result.stdout, bytes) else bytes(result.stdout or b"")
+    return data
 
 
 def normalized_publication_mode(raw_mode: int) -> str:
@@ -280,7 +309,7 @@ def validate_changes(
     and path rules are defense in depth; review remains mandatory.
     """
 
-    from .config import is_protected_path
+    from .config import is_protected_path, pattern_matches
 
     workspace = os.path.realpath(workspace)
     entries = collect_status(git, workspace)
@@ -300,15 +329,75 @@ def validate_changes(
     if len(entries) > max_files:
         blocked.append(f"changed file count {len(entries)} exceeds the limit {max_files}")
 
+    def inspect_regular(path: str, entry_status: str, mode: str | None) -> bool:
+        """Validate one actual resulting path and record it in the manifest."""
+
+        nonlocal total_content
+        if is_protected_path(path, protected_paths):
+            blocked.append(f"protected path was changed: {path}")
+        if allowed_paths and not pattern_matches(path, list(allowed_paths)):
+            blocked.append(f"changed path is outside the configured allowlist: {path}")
+        try:
+            absolute = workspace_entry_path(workspace, path)
+            info = os.lstat(absolute)
+        except (OSError, ChangeValidationError) as exc:
+            blocked.append(f"changed path is not accessible: {sanitize_error(str(exc), 300)}")
+            return False
+        if stat.S_ISLNK(info.st_mode):
+            symlinks.append(path)
+            blocked.append(f"symlink changes are not supported: {path}")
+            return False
+        if not stat.S_ISREG(info.st_mode):
+            blocked.append(f"changed path is not a regular file: {path}")
+            return False
+        try:
+            size, data, file_mode, digest = read_regular_file(absolute, max_file_bytes)
+        except (OSError, ChangeValidationError) as exc:
+            blocked.append(f"{path}: {sanitize_error(str(exc), 300)}")
+            return False
+        if b"\x00" in data[:8192]:
+            blocked.append(f"binary file changes are not supported: {path}")
+        findings = scan_bytes_for_secrets(data) if secret_scan else []
+        if findings:
+            secret_findings.extend(f"{path}:{name}" for name in findings)
+            blocked.append(f"possible secret material detected in {path}; values are redacted")
+        total_content += size
+        files.append(
+            {
+                "path": path,
+                "status": entry_status,
+                "size": size,
+                "mode": normalized_publication_mode(file_mode),
+                "raw_mode": f"{file_mode:04o}",
+                "sha256": digest,
+            }
+        )
+        return True
+
+    def append_deleted(path: str, entry_status: str, mode: str | None) -> None:
+        if is_protected_path(path, protected_paths):
+            blocked.append(f"protected path was changed: {path}")
+        if allowed_paths and not pattern_matches(path, list(allowed_paths)):
+            blocked.append(f"changed path is outside the configured allowlist: {path}")
+        files.append(
+            {"path": path, "status": entry_status, "size": 0, "mode": None, "raw_mode": None, "sha256": None, "git_mode": mode}
+        )
+
     for entry in entries:
         code = entry.status
         if "U" in code or code == "AA" or code == "DD":
             blocked.append("unmerged or conflicting workspace state is not publishable")
             continue
-        paths = [entry.path]
-        if entry.old_path:
-            paths.append(entry.old_path)
-        for raw_path in paths:
+        roles: list[tuple[str, str]] = []
+        if entry.old_path and "R" in code:
+            roles.append((entry.old_path, "rename-source"))
+            roles.append((entry.path, "new"))
+        elif entry.old_path and "C" in code:
+            roles.append((entry.old_path, "copy-source"))
+            roles.append((entry.path, "new"))
+        else:
+            roles.append((entry.path, "new"))
+        for raw_path, role in roles:
             try:
                 path = safe_relative_path(raw_path)
             except ChangeValidationError as exc:
@@ -317,73 +406,66 @@ def validate_changes(
             if path in seen:
                 continue
             seen.add(path)
-            exists = entry.path == raw_path and "D" not in code
-            if not exists and entry.old_path == raw_path:
-                exists = False
-            entry_status = "deleted" if not exists else ("added" if "A" in code or code == "??" else "modified")
-            if entry.old_path and entry.path == raw_path:
-                entry_status = "renamed"
             mode = _index_mode(git, workspace, path)
             if mode == "160000":
                 submodules.append(path)
                 blocked.append(f"submodule changes are not supported: {path}")
                 files.append(
-                    {"path": path, "status": entry_status, "size": 0, "mode": None, "raw_mode": None, "sha256": None, "git_mode": mode}
+                    {"path": path, "status": "modified", "size": 0, "mode": None, "raw_mode": None, "sha256": None, "git_mode": mode}
                 )
                 continue
             if mode == "120000":
                 symlinks.append(path)
                 blocked.append(f"symlink changes are not supported: {path}")
                 files.append(
-                    {"path": path, "status": entry_status, "size": 0, "mode": None, "raw_mode": None, "sha256": None, "git_mode": mode}
+                    {"path": path, "status": "modified", "size": 0, "mode": None, "raw_mode": None, "sha256": None, "git_mode": mode}
                 )
                 continue
             if mode and mode.startswith("100") and mode not in ("100644", "100755"):
                 blocked.append(f"unsupported Git file mode {mode} for {path}")
-            if is_protected_path(path, protected_paths):
-                blocked.append(f"protected path was changed: {path}")
-            if allowed_paths and not is_protected_path(path, allowed_paths):
-                blocked.append(f"changed path is outside the configured allowlist: {path}")
-            absolute = qualified_path(workspace, path)
-            if not exists:
-                files.append(
-                    {"path": path, "status": entry_status, "size": 0, "mode": None, "raw_mode": None, "sha256": None, "git_mode": mode}
-                )
-                continue
             try:
-                info = os.lstat(absolute)
-            except OSError:
-                blocked.append(f"changed path is not accessible: {path}")
-                continue
-            if stat.S_ISLNK(info.st_mode):
-                symlinks.append(path)
-                blocked.append(f"symlink changes are not supported: {path}")
-                continue
-            if not stat.S_ISREG(info.st_mode):
-                blocked.append(f"changed path is not a regular file: {path}")
-                continue
-            try:
-                size, data, file_mode, digest = read_regular_file(absolute, max_file_bytes)
+                absolute = workspace_entry_path(workspace, path)
+                exists = os.path.lexists(absolute)
             except (OSError, ChangeValidationError) as exc:
-                blocked.append(f"{path}: {sanitize_error(str(exc), 300)}")
+                blocked.append(f"changed path is not accessible: {sanitize_error(str(exc), 300)}")
                 continue
-            if b"\x00" in data[:8192]:
-                blocked.append(f"binary file changes are not supported: {path}")
-            findings = scan_bytes_for_secrets(data) if secret_scan else []
-            if findings:
-                secret_findings.extend(f"{path}:{name}" for name in findings)
-                blocked.append(f"possible secret material detected in {path}; values are redacted")
-            total_content += size
-            files.append(
-                {
-                    "path": path,
-                    "status": entry_status,
-                    "size": size,
-                    "mode": normalized_publication_mode(file_mode),
-                    "raw_mode": f"{file_mode:04o}",
-                    "sha256": digest,
-                }
-            )
+            if role == "rename-source":
+                if exists:
+                    blocked.append(f"rename source is still present after the reported rename: {path}")
+                else:
+                    append_deleted(path, "deleted", mode)
+                continue
+            if role == "copy-source":
+                # A copy never removes its source. The source must remain a
+                # regular file; it is only added to the manifest if its own
+                # content differs from HEAD. Protected sources are refused even
+                # when their content is unchanged.
+                if is_protected_path(path, protected_paths):
+                    blocked.append(f"protected path was copied from: {path}")
+                if not exists:
+                    blocked.append(f"copied source is missing: {path}")
+                    continue
+                head = _head_blob(git, workspace, path)
+                try:
+                    _size, data, _file_mode, _digest = read_regular_file(absolute, max_file_bytes)
+                except (OSError, ChangeValidationError) as exc:
+                    blocked.append(f"{path}: {sanitize_error(str(exc), 300)}")
+                    continue
+                if head is None or sha256_bytes(data) != sha256_bytes(head):
+                    inspect_regular(path, "modified", mode)
+                continue
+            if not exists:
+                append_deleted(path, "deleted", mode)
+                continue
+            if "R" in code:
+                entry_status = "renamed"
+            elif "C" in code:
+                entry_status = "copied"
+            elif "A" in code or code == "??" or "?" in code:
+                entry_status = "added"
+            else:
+                entry_status = "modified"
+            inspect_regular(path, entry_status, mode)
 
     diff_command = ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "HEAD", "--"]
     try:
@@ -393,7 +475,7 @@ def validate_changes(
         blocked.append(sanitize_error(str(exc), 300))
         diff_bytes = 0
     for item in files:
-        if item.get("status") == "added":
+        if item.get("status") in ("added", "copied"):
             diff_bytes += int(item.get("size") or 0)
     if diff_bytes > max_diff_bytes:
         blocked.append(f"diff size {diff_bytes} exceeds the limit {max_diff_bytes}")

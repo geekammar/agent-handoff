@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..config import all_projects, storage_path
-from ..dispatch.coding.milestones import PER_STAGE_ORDER
+from ..dispatch.coding.milestones import PER_STAGE_ORDER, milestone_state
 from ..dispatch.ledger import Ledger
 from ..util import sanitize_error, utcnow_iso
 from .config import NotificationConfigError, validate_notification_config
@@ -214,7 +214,6 @@ class NotificationService:
         execution = record.get("execution") or {}
         coding = record.get("coding") or {}
         coding_publication = coding.get("publication") or {}
-        coding_milestones = coding.get("milestones") or {}
         issue_number = record.get("issue_number")
         title = text_value(
             self._clean(record.get("issue_title") or f"Agent Handoff issue #{issue_number}", 240),
@@ -244,10 +243,10 @@ class NotificationService:
             "base_commit": coding.get("base_commit"),
             "tests_status": (coding.get("tests") or {}).get("status"),
             "milestones": {
-                "agent_completed": bool(coding_milestones.get("AGENT_COMPLETED")),
-                "tests_passed": bool(coding_milestones.get("TESTS_PASSED")),
-                "pr_published": bool(coding_milestones.get("PR_PUBLISHED")),
-                "report_delivered": bool(coding_milestones.get("REPORT_DELIVERED")),
+                "agent_completed": milestone_state(coding, "AGENT_COMPLETED") == "true",
+                "tests_passed": milestone_state(coding, "TESTS_PASSED") == "true",
+                "pr_published": milestone_state(coding, "PR_PUBLISHED") == "true",
+                "report_delivered": milestone_state(coding, "REPORT_DELIVERED") == "true",
             }
             if record.get("task_type") == "coding"
             else None,
@@ -550,7 +549,30 @@ class NotificationService:
                 result["queued"] += 1
         if result["queued"]:
             self._log_safe(f"recovered {result['queued']} durable notification intent(s) after a restart")
+        self._reconcile_sent_milestones()
         return result
+
+    def _reconcile_sent_milestones(self) -> None:
+        """Rebuild TELEGRAM_SENT from SENT notifications after a crash."""
+
+        if self.store is None or self.ledger is None:
+            return
+        try:
+            notifications = self.store.all()
+        except Exception:
+            return
+        for notification in notifications:
+            if str(notification.get("state") or "") != "SENT":
+                continue
+            if str(notification.get("kind") or "") != DELIVERY_COMPLETED:
+                continue
+            record, _error = self._ledger_record(notification)
+            if not record:
+                continue
+            coding = record.get("coding") or {}
+            if (coding.get("milestones") or {}).get("TELEGRAM_SENT"):
+                continue
+            self._record_telegram_sent(notification, notification)
 
     def drain(
         self,
