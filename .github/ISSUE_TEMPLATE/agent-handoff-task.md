@@ -12,6 +12,7 @@ project: ProjectA
 agent: opencode
 model: fast
 session: new
+# task: coding   # only for owner-enabled C2 projects; default is read_only
 <!-- /agent-handoff-request -->
 
 Describe the task here. Include only instructions for the selected project.
@@ -23,3 +24,4 @@ Constraints for this request:
 - `agent` must be `opencode`.
 - `model` is an alias from the dispatcher's configured models.
 - `session` must be `new`; SAME SESSION is not supported in v1.1.
+- `task` is optional; `read_only` is the default. `coding` is rejected unless the owner enabled C2 for the project, and it never lets Issue text set commands, tests, paths, identity, repository, base branch, or isolation.

@@ -94,6 +94,8 @@ session: new
 Task instructions go here.
 ```
 
+Coding tasks add `task: coding`. Coding is disabled by default and requires owner-configured C2 policy, isolation, a trusted test profile, a model allowlist, and a Draft-PR-only publisher. See `docs/SECURE-CODING.md`.
+
 Reject `session: same`; v1.1 does not support continuation. Never derive a path or shell command from issue text.
 
 ## Recovery
@@ -104,6 +106,7 @@ agent-handoff dispatch status --json
 agent-handoff dispatch inspect --task <task-id> --run <run-id> --json
 agent-handoff dispatch deliver --task <task-id> --run <run-id> \
   --issue <number> --repository owner/private-dispatch --json
+agent-handoff dispatch reconcile --issue <number> --json  # GET-only C2 remote revalidation
 agent-handoff dispatch notify --json              # notification outbox (no agent execution)
 agent-handoff dispatch notify --retry --json      # retry confirmed Telegram failures only
 agent-handoff dispatch notify --retry --notification <id> --acknowledge-duplicate --json
@@ -114,6 +117,7 @@ agent-handoff dispatch notify --retry --notification <id> --acknowledge-duplicat
 - GitHub publication failure: retry publication only.
 - Crash after claim/start: never rerun automatically. Recover persisted session output if present; otherwise mark `NEEDS_ATTENTION`.
 - Stale remote `COMPLETE.json`: run `dispatch deliver`; it re-uploads truthful verified metadata and a receipt without rerunning the agent.
+- Coding `remote_state=unverified_exhausted`: after GitHub recovers, run `dispatch reconcile --issue <number>`; it verifies the existing branch and Draft PR with GET operations only. Deterministic `remote_state=invalid` is not recoverable this way.
 
 ## Optional Telegram notifications
 

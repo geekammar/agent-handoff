@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import BASE_DIR, all_projects, project_by_name
+from .coding.config import parse_coding_config
 from .security import (
     DEFAULT_DENIED_PROJECTS,
     IdentityError,
@@ -592,6 +593,19 @@ def validate_dispatch_config(
     if (enabled or require_enabled) and not projects:
         _add(errors, "dispatch.projects must configure at least one project")
 
+    coding = parse_coding_config(
+        raw.get("coding"),
+        projects_raw if isinstance(projects_raw, dict) else {},
+        projects,
+        models,
+        isolation,
+        workspace_roots=list(isolation.get("workspace_roots") or []),
+        base_dir=str(BASE_DIR),
+        check_paths=check_paths,
+        errors=errors,
+        warnings=warnings,
+    )
+
     poll_interval = _int_value(raw.get("poll_interval_seconds"), 30, 5, 86400, "dispatch.poll_interval_seconds", errors)
 
     delivery_raw = raw.get("delivery") if isinstance(raw.get("delivery"), dict) else {}
@@ -621,6 +635,7 @@ def validate_dispatch_config(
         "projects": projects,
         "poll_interval_seconds": poll_interval,
         "execution": global_execution,
+        "coding": coding,
         "delivery": {"retry_seconds": retry_seconds, "max_attempts": max_attempts},
         "github": {"command": gh_command, "require_private": True},
     }

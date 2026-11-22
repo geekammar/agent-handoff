@@ -28,6 +28,8 @@ class ExecutionResult:
     error: str | None
     started_at: str
     finished_at: str
+    process_group_id: int | None = None
+    orphans_detected: bool = False
 
 
 class AgentAdapter(Protocol):

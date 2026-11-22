@@ -174,3 +174,88 @@ C1 focused coverage (`tests/test_c1_isolation.py`):
 - real mixed-project dispatcher run under `nobody`: Rabet/Yakfi execute legacy read-only as root while AgentHandoff executes isolated `workspace_write` with the dedicated UID/GID, empty supplementary groups, dedicated HOME, no parent GitHub token, and effective isolation persisted in the ledger. These OS-level proofs were **skipped** on non-root CI runners because dropping to another UID requires root.
 
 Live staging acceptance of an actual isolated OpenCode coding task was **not performed** in this change. It requires a separately approved Unix account, provider credential, and disposable workspace. Production Rabet/Yakfi remain `read_only`, production isolation remains disabled, and the production service was not restarted.
+
+## C2 focused security, artifact integrity, and recovery repair
+
+Date: 2026-11-21
+
+Commands:
+
+```bash
+python3 -m compileall -q lib setup tests
+sh -n setup/install.sh setup/upgrade.sh setup/rollback.sh setup/gdrive-auth.sh
+PYTHONPATH=lib python3 -m unittest discover -s tests -p "test_*.py" -v
+PYTHONPATH=lib python3 -m unittest tests.test_c2_coding -v
+git diff --check
+```
+
+Deterministic result: **188 tests passed, 0 failed**. The focused C2 module ran **49 tests, 0 failed**. New coverage includes artifact digest/size/mode changes after validation, symlink substitution, manifest/index/committed-tree verification, unexpected staged paths, hook/filter/fsmonitor non-execution, restricted file protocol, no force push, clean-workspace adoption, unpersisted-commit recreation, missing-staging remote-SHA recovery, PR body retry, orphan-process blocking, SIGTERM unwinding, bounded output/resource limits, and historical-ledger/status compatibility. These are deterministic local tests, not live C2 staging acceptance.
+
+## C2 isolated coding workflow deterministic acceptance
+
+Date: 2026-11-21
+
+Commands:
+
+```bash
+python3 -m compileall -q lib setup tests
+sh -n setup/install.sh setup/upgrade.sh setup/rollback.sh setup/gdrive-auth.sh
+PYTHONPATH=lib python3 -m unittest discover -s tests -p "test_*.py" -v
+PYTHONPATH=lib python3 -m unittest tests.test_c2_coding -v
+git diff --check
+```
+
+Deterministic result: **169 tests passed, 0 failed** at the initial C2 review point; the focused C2 module ran **30 tests, 0 failed**. The focused repair run above supersedes these counts with 188/49. The suite uses fake GitHub, fake OpenCode, synthetic credentials, a local trusted Git remote, and fake rclone. It does not prove a live dedicated Unix account, live provider credential, real private GitHub repository, or production enablement.
+
+C2 focused coverage (`tests/test_c2_coding.py`, mapped to T01-T40 in test names):
+
+- legacy read-only request contract and existing C1/dispatcher/notification tests remain unchanged;
+- coding is disabled by default and requires global + project opt-in and effective non-root isolation;
+- unauthorized authors are rejected without execution;
+- Issue metadata cannot add commands, profiles, tests, identity, paths, or unknown task types;
+- valid coding requests require a trusted model alias;
+- dedicated non-root test identity and no parent secrets in test/child environments;
+- unique clean workspaces at the verified base commit; dirty/existing and symlink workspaces are refused;
+- concurrent task workspaces are isolated;
+- realistic simulated code changes, trusted argv test execution, timeout/failure recording, and root-test refusal;
+- protected paths, allowlists, secret scanning with redaction, and empty-change refusal;
+- branch collision refusal, no default-branch push, commit SHA recording, one Draft PR, and no force-push;
+- lost push and PR responses recover without duplicates;
+- restart after publication and upload failure do not rerun OpenCode or duplicate the PR/comment;
+- report, receipt, Issue comment, and Telegram payload include the verified report URL and Draft PR when present;
+- JSON progress and existing notification behavior remain covered by the full suite;
+- config validation does not mutate files, unrelated historical queue items are not processed, and Rabet/Yakfi-style projects remain legacy read-only.
+
+Not performed: a live C2 staging coding Issue, real dedicated Unix UID/GID drop for the C2 test runner, real provider/model execution, real private-repository push, real Draft PR creation, and Telegram delivery. These require explicit owner provisioning and are listed in the C2 staging acceptance procedure. Production coding remains disabled and the production service was not restarted.
+
+## C2 consolidated final security and recovery closure
+
+Date: 2026-11-22
+
+Starting reviewed HEAD: `8c9353219e885b478cdbc7a73fdf3d661b8a4a8e`.
+
+Commands:
+
+```bash
+python3 -m compileall -q lib setup tests
+sh -n setup/install.sh setup/upgrade.sh setup/rollback.sh setup/gdrive-auth.sh
+PYTHONPATH=lib python3 -m unittest tests.test_c2_coding -v
+PYTHONPATH=lib python3 -m unittest discover -s tests -p "test_*.py" -v
+git diff --check
+```
+
+Deterministic result on the repair host (root-capable Linux): **265 tests passed, 0 failed** in the full suite; the focused C2 module ran **126 tests, 0 failed**. These counts supersede the earlier C2 counts above. The suite uses fake GitHub, fake OpenCode, synthetic credentials, a local trusted Git remote, and fake rclone. OS-level UID-drop tests are skipped automatically on non-root CI runners.
+
+New regression coverage in this repair:
+
+- a child-owned `child_path` containing a fake `python3` is rejected before spawn, and the fake executable never runs; a safe system PATH executes real Python under a real non-root UID;
+- relative, empty, non-canonical, world-writable, sticky, child-owned, and workspace/HOME/TMPDIR PATH entries are rejected;
+- a crash before Draft PR ledger persistence plus a human PR-body edit preserves the human body byte-for-byte across repeated polls, with no repeated PATCH or warning and no duplicate Issue comment or PR;
+- a transient remote-verification exhaustion is explicitly reconciled for one Issue with GET-only checks, clears only on success, and does not re-execute the agent or create artifacts;
+- deterministic remote invalidation preserves the monotonic stage and historical publication milestones while reporting `remote_state=invalid`;
+- verified upload/Issue delivery milestones reconcile even when the remote artifact is invalid, and a stale PR URL cannot restore invalidated PR milestones;
+- a crash after report capture retries disposable-workspace cleanup for the matching completed task only;
+- literal Git pathspec filenames (`*`, `:(glob)**`, brackets) are committed exactly as validated, with no unexpected matched files;
+- the coding report says workspace size includes `.git`.
+
+Live staging verification on the exact final HEAD is recorded separately in the release report. Production coding remains disabled and no production service or workspace was changed.

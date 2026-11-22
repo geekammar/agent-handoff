@@ -128,6 +128,13 @@ Fields:
 | `delivery.max_attempts` | `0` means retry indefinitely. A non-zero value stops automatic publication retries after that many failures; the verified upload is preserved and `dispatch deliver` can publish manually. |
 | `github.command` | `gh` executable name or absolute path. |
 | `github.require_private` | Must remain `true`. |
+| `coding.enabled` | Global C2 opt-in, `false` by default. Coding also requires a project-level `coding.enabled: true` and effective isolation. |
+| `coding.staging_root` | Parent-owned, non-child-accessible directory for validated publication commits. Required when any project enables coding. |
+| `coding.test_profiles` | Trusted named argv command profiles. Issue text cannot select or modify them. |
+| `coding.limits` | Bounded test timeout, file/diff/output/workspace sizes, publication attempts, and serialized coding concurrency. |
+| `coding.publication` | `draft: true` only, trusted branch prefix, retry bound, PR title prefix, and optional parent-only token environment name. |
+| `coding.protected_paths` / `coding.secret_scan` | Default-deny path patterns and defense-in-depth secret scan. |
+| `projects.<name>.coding` | Owner opt-in with `repository`, `base_branch`, `workspace_root`, `source_workspace`, `test_profile`, `allowed_model_aliases`, and optional allowlists/overrides. |
 | `notifications.telegram.enabled` | `false` by default. Must be explicitly true to send anything. |
 | `notifications.telegram.chat_id` | Numeric Telegram chat id (negative for groups/channels) or `@channelusername`. |
 | `notifications.telegram.token_env` | Environment variable **name** that holds the bot token. Defaults to `AGENT_HANDOFF_TELEGRAM_TOKEN`. The token itself never belongs in JSON. |
@@ -169,6 +176,8 @@ Mixed project isolation is supported without a second dispatcher and without cha
 
 Rabet and Yakfi inherit legacy `read_only` without isolation. AgentHandoff is the only isolated write-capable project. Issue text cannot select, enable, or disable isolation. The resolved effective isolation is written to the dispatch ledger; a missing identity, an invalid override, or a write policy without isolation is rejected rather than falling back to root.
 
+C2 coding configuration is additive and disabled by default. It never changes the read-only workflow, and production coding is not enabled by this repository. See [SECURE-CODING.md](SECURE-CODING.md) for the full coding contract and staging acceptance procedure.
+
 Discover exact OpenCode model IDs:
 
 ```bash
@@ -193,14 +202,16 @@ session: new
 Read the first heading of README.md and report it. Do not edit files.
 ```
 
-Rules:
+Coding tasks add `task: coding`; coding must be explicitly enabled globally and for the selected project. Rules:
 
 - `handoff-version` must be `1`.
 - `project` must match a configured dispatch project or its core Agent Handoff project name/key.
 - `agent` must be `opencode` and must match `dispatch.agent`.
 - `model` is an alias from `dispatch.models`; it may be omitted only if `default_model` is configured.
 - `session` must be `new`. `same` is rejected with an explicit unsupported message.
-- Unknown or duplicate metadata fields are rejected.
+- `task` is optional and defaults to `read_only`. Supported values are `read_only` and `coding`; any other value is rejected.
+- Coding additionally requires the selected model alias to be in the project's trusted `allowed_model_aliases`.
+- Unknown or duplicate metadata fields are rejected. Issue text cannot add commands, tests, UID/GID, workspace, repository, base branch, credentials, or isolation settings.
 - Instructions must be non-empty and within `execution.max_prompt_bytes`.
 - Bodies without the request marker are ignored; they are not treated as requests.
 - Issue titles and labels are not routing inputs.
@@ -209,7 +220,29 @@ A malformed request from an authorized user receives one rejection comment (mark
 
 ## State machine
 
-Execution, capture, upload, and publication are tracked separately.
+Execution, capture, upload, and publication are tracked separately. Coding records additionally persist a fine-grained `coding.stage` without changing the legacy read-only states.
+
+Coding stages:
+
+```text
+REQUEST_ACCEPTED -> WORKSPACE_PREPARED -> AGENT_RUNNING -> AGENT_COMPLETED
+  -> TESTING -> VALIDATING_DIFF -> COMMIT_PREPARED -> BRANCH_PUBLISHED
+  -> PR_CREATED -> REPORT_CAPTURED (legacy) -> UPLOAD_VERIFIED
+  -> ISSUE_UPDATED -> notification outbox state
+```
+
+The workflow distinguishes `AGENT_COMPLETED`, `TESTS_PASSED`, `PR_PUBLISHED`, `REPORT_VERIFIED`, `ISSUE_DELIVERED`, and `TELEGRAM_SENT`. An agent completion is not test success, and a verified report does not prove the code is correct or merged.
+
+Delivery milestones have distinct meanings:
+
+- `REPORT_VERIFIED` means the Drive upload passed the established MD5/read-back contract.
+- `ISSUE_DELIVERED` means GitHub acknowledged the Issue comment, or a later idempotent poll reconciled an already-present delivery marker. A comment is built before its own API acknowledgement, so it renders `ISSUE_DELIVERED=pending (this comment)` rather than claiming its own delivery.
+- `TELEGRAM_SENT` means the Telegram API acknowledged a send with a message id. A queued, pending, failed, or ambiguous notification is not marked sent. The Issue comment is published before the Telegram outbox is drained, so the comment renders `TELEGRAM_SENT=pending`; the durable ledger advances after the API acknowledgement.
+- `REPORT_DELIVERED` remains a legacy alias of `ISSUE_DELIVERED` for old ledger records and older reports. New reports use the three canonical delivery milestones above.
+
+Reports and delivery comments are snapshots. A milestone that had not been reached at snapshot time renders `pending` (or `not_run` when a blocked task skipped it); it is not rewritten retroactively after later upload, Issue, or Telegram steps. Milestone reporting is derived defensively: a stale flag cannot claim `TESTS_PASSED` unless the persisted test evidence is explicitly `passed`, and a blocked coding task reports every coding operation beyond `blocked_stage` as `not_run` without converting later report-delivery milestones to false. After a crash between a primary state update and a milestone update, the next poll reconciles the milestone from authoritative evidence (verified upload, acknowledged Issue comment, existing Draft PR, or a durable Telegram `SENT` record) without repeating the external operation.
+
+Legacy state machine:
 
 ```text
 NEW
@@ -266,7 +299,17 @@ Writes are atomic; ledger mutations use `flock`. Only one dispatcher runner lock
 | After execution, before report capture | Persisted events are used to create the missing report. |
 | After capture, before upload | Upload retries with the existing task/run identity. |
 | After verified upload, before publication | Publication retries without another upload or execution. |
-| After comment posted, before ledger update | The delivery marker is found and publication is recorded without a duplicate comment. |
+| After comment posted, before ledger update | The delivery marker is found and publication is recorded without a duplicate comment; a per-Issue lock serializes manual `dispatch deliver` and automatic publication. |
+| Coding: before workspace preparation | The claim is resumed; no agent has started. |
+| Coding: during OpenCode, session output recoverable | The session is parsed and tests/publication resume; OpenCode is not rerun. |
+| Coding: tests failed/timed out/blocked, or failure persisted before the blocked flag | The mandatory test gate fails closed on resume; no commit, branch, or Draft PR is created. Failure evidence is preserved and the agent/tests are not rerun. |
+| Coding: during tests or diff validation | The persisted disposable workspace is revalidated (lstat-first identity, base, origin, and manifest), then tests/diff validation rerun; the agent is not rerun. Missing test evidence at a publication stage blocks. |
+| Coding: after commit, before push | The parent-owned staging commit is reused. If staging is lost and the remote branch is absent, an unpublished commit is safely rebuilt; if the remote branch exists with a different SHA, publication is refused. |
+| Coding: already published branch/PR | Resume/reconciliation reverifies the live branch SHA and open Draft PR metadata (repository/branch/base/head SHA). Deleted, moved, closed, merged, Ready-for-review, or mismatched artifacts set `remote_state=invalid` and become `NEEDS_ATTENTION`; the durable stage stays monotonic, historical publication milestones are preserved as history, and the artifact is not recreated. Transient GitHub/Git failures retry with bounded backoff. Ordinary polling avoids repeated requests with a five-minute verification interval; forced reconciliation checks immediately. |
+| Coding: transient remote verification exhausted | Ordinary polling stops retrying after the bounded budget and marks the record `NEEDS_ATTENTION` with `remote_state=unverified_exhausted`. After GitHub recovers, `agent-handoff dispatch reconcile --issue <number>` performs one GET-only recheck of the existing branch and Draft PR. The block clears only on authoritative success; deterministic `invalid` is never recovered this way. No agent, branch, PR, Issue comment, or notification is repeated. |
+| Coding: push succeeds, response lost | Remote branch SHA is queried; the same commit is accepted idempotently. |
+| Coding: PR created, response lost | The PR is recovered by task branch and body marker; no duplicate is created. |
+| Coding: report upload fails after PR publication | Only upload/publication retries; the agent and PR are not repeated. |
 
 `dispatch deliver` reconciles an existing run manually and never invokes an agent. After publication it enqueues and attempts the completion notification, but a Telegram failure does not change the successful delivery result.
 
@@ -394,6 +437,9 @@ agent-handoff dispatch inspect --task <task-id> --run <run-id> --json
 agent-handoff dispatch deliver --task <task-id> --run <run-id> \
   --issue <number> --repository owner/private-dispatch --json
 
+# Reverify one exhausted transient remote publication; GET only, no agent or artifacts
+agent-handoff dispatch reconcile --issue <number> --json
+
 # Inspect the notification outbox without sending anything
 agent-handoff dispatch notify --json
 agent-handoff dispatch notify --all --json
@@ -482,7 +528,7 @@ The service runs as the user who owns `gh` and rclone credentials. It does not r
 - C1 isolation drops the OpenCode child to a dedicated non-root UID/GID with empty supplementary groups and an allowlisted environment. The parent dispatcher still runs as root with its credentials; this is UID/environment separation, not full OS sandboxing. CPU/memory/disk limits, network policy, prompt-injection resistance, and hostile test code are not fully solved by C1. See [SECURE-CODING.md](SECURE-CODING.md).
 - SIGINT and SIGTERM attempt to stop the OpenCode and rclone child process groups before the dispatcher exits. A forced `SIGKILL` cannot run cleanup, so an already-started OpenCode child may continue. The ledger prevents automatic re-execution and marks the request `NEEDS_ATTENTION`; read-only mode limits the effect, but `workspace_write` requires operator care.
 - `allowed_users` matches GitHub login names, not immutable account IDs. Login renames must be handled by the repository owner.
-- Isolated coding is opt-in and disabled by default. Production Rabet/Yakfi remain read-only. A clean Git tree, canonical path, and validated ownership do not prove that repository content or tests are safe; C2 must use disposable worktrees and review publication.
+- Isolated coding is opt-in and disabled by default. Production Rabet/Yakfi remain read-only. A clean Git tree, canonical path, and validated ownership do not prove that repository content or tests are safe. C2 uses disposable clones, trusted tests, digest-bound artifact publication, diff validation, and a Draft-PR-only publisher, but it is still not a kernel/network sandbox and has not been enabled in production.
 - Uploaded `REPORT.md` files currently include the local run directory path as audit evidence. They are stored in the user's private Drive; GitHub delivery comments contain only identifiers and verified URLs. Upload receipts omit local filesystem paths.
 - Telegram credentials are read from the configured environment variable only. The bot token is never written to config, reports, notification records, logs, or exception text. The outbox stores report/Issue URLs and sanitized text, not Issue instructions or local paths. The transport always targets the official `https://api.telegram.org` endpoint; alternate test endpoints require explicit injection by test code and cannot be selected from runtime configuration.
 - The dispatcher removes the default and configured notification token environment variables from the OpenCode child environment for both `read_only` and `workspace_write` profiles. This is defense in depth, not an OS sandbox: a child running under the same Unix account may still access credential files or unrelated parent secrets, and model-authentication variables remain available because OpenCode legitimately needs them.
@@ -498,6 +544,7 @@ agent-handoff dispatch status --json
 - `UPLOAD_PENDING`: Drive unavailable or verification failed. Retry upload only. `dispatch status` shows the next retry and the exact action.
 - `UPLOAD_VERIFIED`: publication pending/failed. Retry comment only. The verified upload is reused.
 - `NEEDS_ATTENTION`: an execution was uncertain and no recoverable output exists. Inspect the host and session evidence; do not blindly rerun. Submit a new issue if the work must be repeated.
+- Coding `remote_state=unverified_exhausted`: after GitHub recovers, run `agent-handoff dispatch reconcile --issue <number>`. It performs GET verification only. Coding `remote_state=invalid` is deterministic and not recoverable by that command; inspect the host and GitHub, preserve the historical evidence, and submit a new Issue if needed.
 - `REJECTED`: malformed or unauthorized request. A new, corrected issue is required; editing an old rejected issue does not automatically execute it.
 
 Notification-only states are reported separately from the task record:
@@ -546,6 +593,7 @@ Deterministic tests use fake GitHub, fake OpenCode, and fake rclone. They cover:
 - dedicated identity fail-closed behavior, privileged-group rejection, and env allowlist;
 - canonical/symlink/protected/dirty workspace refusal without resetting work;
 - timeout and orphan-process cleanup with progress unchanged.
+- C2 coding: disabled-by-default config, issue override rejection, isolated workspace base/cleanliness, symlink refusal, trusted test argv/timeout/failure, protected paths, secret scan, branch collision refusal, Draft PR idempotency, lost push/PR response recovery, restart without agent re-execution, and unrelated historical queue preservation.
 
 ```bash
 PYTHONPATH=lib python3 -m unittest discover -s tests -p "test_*.py" -v

@@ -24,6 +24,8 @@ from .config import (
 from .adapters import agy_hook, auto_complete, git_info, integration_log, normalize_outcome, normalize_status, spawn_upload
 from .dispatch.config import DispatchConfigError, validate_core_config, validate_dispatch_config
 from .dispatch.delivery import (
+    apply_issue_delivered,
+    apply_upload_verified,
     diagnose_historical_run,
     delivery_marker,
     merged_upload_attempts,
@@ -1308,6 +1310,68 @@ def cmd_dispatch_inspect(args: argparse.Namespace) -> int:
     return 0 if data.get("ok") else 1
 
 
+def cmd_dispatch_reconcile(args: argparse.Namespace) -> int:
+    """Explicitly reverify one exhausted remote publication without side effects."""
+
+    config = load_config()
+    try:
+        resolved, errors, _warnings = validate_dispatch_config(config)
+    except DispatchConfigError as exc:
+        raise ValueError(str(exc))
+    if errors:
+        raise ValueError("dispatcher configuration is invalid: " + "; ".join(errors))
+    repository = str(args.repository or resolved.get("repository") or "")
+    if not repository:
+        raise ValueError("--repository is required when dispatch.repository is not configured")
+    reporter = _dispatch_reporter(args)
+    runner = DispatchRunner(config, resolved, progress=reporter)
+    try:
+        result = runner.reconcile_remote(repository=repository, issue=int(args.issue))
+    except Exception as exc:
+        error = sanitize_error(str(exc), 800)
+        payload = {
+            "ok": False,
+            "repository": repository,
+            "issue": int(args.issue),
+            "remote_state": None,
+            "error": error,
+        }
+        if args.json:
+            emit(payload)
+        elif not args.quiet:
+            print(f"Remote reconciliation failed: {error}", file=sys.stderr)
+        return 1
+    record = result.get("record") or {}
+    coding = record.get("coding") or {}
+    publication = coding.get("publication") or {}
+    view = record_status_view(record, resolved) if record else {}
+    payload = {
+        "ok": bool(result.get("ok")),
+        "repository": repository,
+        "issue": int(args.issue),
+        "remote_state": publication.get("remote_state") or result.get("remote_state"),
+        "blocked": bool(coding.get("blocked")),
+        "error": result.get("error"),
+        "next_action": view.get("next_action"),
+    }
+    if args.json:
+        emit(payload)
+    elif not args.quiet:
+        if payload["ok"]:
+            print(
+                f"Remote reconciliation verified issue #{payload['issue']} "
+                f"state={payload['remote_state']} without executing the agent."
+            )
+            if payload.get("next_action"):
+                print(f"Next action: {payload['next_action']}")
+        else:
+            print(
+                f"Remote reconciliation did not clear the block: {payload.get('error') or 'verification failed'}",
+                file=sys.stderr,
+            )
+    return 0 if payload["ok"] else 1
+
+
 def cmd_dispatch_deliver(args: argparse.Namespace) -> int:
     with graceful_sigterm():
         return _cmd_dispatch_deliver(args)
@@ -1425,34 +1489,60 @@ def _cmd_dispatch_deliver(args: argparse.Namespace) -> int:
         item["session"] = {**(item.get("session") or {}), "mode": "new", "id": agent.get("session_id")}
         item["model"] = agent.get("model")
         item["status"] = "UPLOAD_VERIFIED"
+        apply_upload_verified(item)
     record = ledger.update(repository, issue_number, apply_reconcile, note="verified upload metadata reconciled")
     marker = delivery_marker(args.run)
-    reporter.emit("publishing", "checking for an existing idempotent delivery comment")
-    existing_comment = transport.find_comment(issue_number, marker)
-    comment_url = (existing_comment or {}).get("html_url")
-    if not existing_comment:
-        from .dispatch.delivery import build_issue_comment
-
-        response = transport.comment(issue_number, build_issue_comment(record))
-        comment_url = response.get("url")
-    published_at = (existing_comment or {}).get("created_at") or utcnow_iso()
     notifier = NotificationService(config, log=lambda message: reporter.emit("notifying", message))
-    final_record = ledger.set_status(
-        repository,
-        issue_number,
-        "ISSUE_UPDATED",
-        note="operator published verified delivery",
-        updates={
-            "publication": {
-                "status": "PUBLISHED",
-                "published_at": published_at,
-                "comment_url": comment_url,
-                "last_error": None,
-                "next_attempt_at": None,
-            },
-            "attention_reason": None,
-        },
-    )
+    with ledger.publication_lock(repository, issue_number):
+        record = ledger.get(repository, issue_number) or record
+        if record.get("status") == "ISSUE_UPDATED" and (record.get("publication") or {}).get("status") == "PUBLISHED":
+            existing_comment = transport.find_comment(issue_number, marker)
+            comment_url = (record.get("publication") or {}).get("comment_url") or (existing_comment or {}).get("html_url")
+            final_record = record
+            coding_record = record.get("coding") or {}
+            milestones = coding_record.get("milestones") or {}
+            if record.get("task_type") == "coding" and not (
+                milestones.get("ISSUE_DELIVERED") or milestones.get("REPORT_DELIVERED")
+            ):
+                final_record = ledger.update(
+                    repository,
+                    issue_number,
+                    apply_issue_delivered,
+                    note="coding Issue delivery milestone reconciled from published state",
+                )
+        else:
+            reporter.emit("publishing", "checking for an existing idempotent delivery comment")
+            existing_comment = transport.find_comment(issue_number, marker)
+            comment_url = (existing_comment or {}).get("html_url")
+            if not existing_comment:
+                from .dispatch.delivery import build_issue_comment
+
+                response = transport.comment(issue_number, build_issue_comment(record))
+                comment_url = response.get("url")
+            published_at = (existing_comment or {}).get("created_at") or utcnow_iso()
+            final_record = ledger.set_status(
+                repository,
+                issue_number,
+                "ISSUE_UPDATED",
+                note="operator published verified delivery",
+                updates={
+                    "publication": {
+                        "status": "PUBLISHED",
+                        "published_at": published_at,
+                        "comment_url": comment_url,
+                        "last_error": None,
+                        "next_attempt_at": None,
+                    },
+                    "attention_reason": None,
+                },
+            )
+            if final_record.get("task_type") == "coding":
+                final_record = ledger.update(
+                    repository,
+                    issue_number,
+                    apply_issue_delivered,
+                    note="coding Issue delivery milestone recorded",
+                )
     notification_data: dict[str, Any] = {
         "enabled": notifier.enabled,
         "configured_enabled": notifier.configured_enabled,
@@ -1686,6 +1776,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--project")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_dispatch_inspect)
+    p = dispatch_sub.add_parser(
+        "reconcile",
+        help="reverify one exhausted remote publication without executing an agent or creating artifacts",
+    )
+    p.add_argument("--issue", type=int, required=True)
+    p.add_argument("--repository", help="owner/name (defaults to dispatch.repository)")
+    p.add_argument("--progress", action="store_true", help="write human progress to stderr even when stderr is not a TTY")
+    p.add_argument("--quiet", action="store_true", help="suppress human output; JSON stdout is unchanged")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_dispatch_reconcile)
     p = dispatch_sub.add_parser("deliver", help="reconcile an existing verified run and publish its direct link; never runs an agent")
     p.add_argument("--task", required=True)
     p.add_argument("--run", required=True)

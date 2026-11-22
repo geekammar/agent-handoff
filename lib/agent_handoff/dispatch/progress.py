@@ -46,6 +46,9 @@ class ProgressReporter:
             text = text.replace(value, "<local>")
         return text
 
+    def redact(self, text: str) -> str:
+        return self._redact(str(text or ""))
+
     def emit(self, stage: str, message: str, *, issue: int | None = None) -> None:
         if not self.enabled:
             return

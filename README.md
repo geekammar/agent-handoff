@@ -203,6 +203,8 @@ session: new
 Read the first heading of README.md and report it. Do not edit files.
 ```
 
+Coding tasks add `task: coding` to the metadata block and require an explicit owner-configured coding policy. Coding is disabled by default; unknown task types fail closed. See [docs/SECURE-CODING.md](docs/SECURE-CODING.md).
+
 The metadata block is versioned and parsed only from the Issue body. Free-form prose without the marker is ignored. Issue titles are not used for routing. A controlled template is included at `.github/ISSUE_TEMPLATE/agent-handoff-task.md`.
 
 ### Delivery guarantees and recovery
@@ -226,11 +228,37 @@ agent-handoff dispatch status                     # health, links, next actions
 agent-handoff dispatch inspect --task <task-id> --run <run-id>
 agent-handoff dispatch deliver --task <task-id> --run <run-id> \
   --issue <number> --repository owner/private-dispatch
+agent-handoff dispatch reconcile --issue <number>  # GET-only remote revalidation
 ```
 
-Progress reports discovered, validated, executing, captured, uploading, verifying, receipt reconciliation, publishing, and completion stages with elapsed time, plus a periodic heartbeat during long OpenCode execution and slow uploads or verification without inventing an ETA. It never prints Issue instructions, prompt text, tokens, or local workspace paths. `--quiet` suppresses human progress without changing JSON stdout. `dispatch deliver` reconciles an existing run and publishes its verified URL. It never invokes an agent.
+Progress reports discovered, validated, executing, captured, uploading, verifying, receipt reconciliation, publishing, and completion stages with elapsed time, plus a periodic heartbeat during long OpenCode execution and slow uploads or verification without inventing an ETA. It never prints Issue instructions, prompt text, tokens, or local workspace paths. `--quiet` suppresses human progress without changing JSON stdout. `dispatch deliver` reconciles an existing run and publishes its verified URL. It never invokes an agent. `dispatch reconcile --issue <number>` is the explicit, one-Issue recovery path for an exhausted transient C2 remote-verification failure; it performs GET checks only and never runs an agent or creates a branch, PR, comment, or notification.
 
 See [docs/DISPATCH.md](docs/DISPATCH.md) for the state machine, trust model, exact commands, systemd user-service example, and recovery procedures.
+
+## Optional isolated coding workflow (C2)
+
+C2 is implemented in source but **disabled by default and not enabled in production**. It adds one explicit coding task type on top of the C1 isolation foundation:
+
+- the owner configures the repository, base branch, disposable workspace root, publication staging root, model allowlist, trusted test profile, path rules, and limits;
+- the dispatcher creates a fresh per-task clone at a verified base commit, owned by the dedicated non-root identity;
+- OpenCode runs with `workspace_write` only inside that disposable workspace;
+- trusted tests run with the same non-root identity, a validated trusted PATH, a bounded timeout, bounded output, and an allowlisted environment; a child-writable PATH component cannot shadow the configured test interpreter;
+- the dispatcher validates changed paths, protected files, diff size, binary/symlink/submodule changes, and obvious secret material, then binds the approved content to SHA-256/size/mode digests that are rechecked while copying and against the staged and committed Git trees;
+- one task branch is committed from validated files in a parent-owned staging repository and pushed without force;
+- exactly one Draft Pull Request is created or recovered by a stable marker; after the report upload is verified, the verified report link is added to the PR body without creating a second PR, and a human-edited PR body is preserved with a durable skip reason;
+- a crash after report capture retries disposable-workspace cleanup only for the matching completed task;
+- invalidating a deleted or moved remote artifact preserves historical milestones while reporting the artifact as not currently valid;
+- the existing verified report upload, GitHub Issue comment, and Telegram outbox follow.
+
+C2 never merges, never pushes to the default branch, never deploys, and never reuses a dirty developer checkout. If any trusted precondition is missing, it fails closed and preserves evidence. A coding repository may be public if the owner accepts that PR text, branch/commit metadata, Issue references, and the verified report URL may become public; the dispatcher inbox remains private. Tokens and report contents are never published. See [docs/SECURE-CODING.md](docs/SECURE-CODING.md) for the contract, state machine, security limitations, and staging acceptance plan.
+
+Coding task metadata adds only:
+
+```text
+task: coding
+```
+
+Issue text cannot set commands, tests, UID/GID, repository, base branch, credentials, protected paths, isolation, or a model outside the configured allowlist.
 
 ## Optional Telegram notifications
 
@@ -379,7 +407,7 @@ agent-handoff/
 ## Known limitations
 
 - SAME SESSION continuation is deferred and rejected explicitly.
-- C1 secure coding isolation is an opt-in foundation only. C2 (clean task worktrees, test execution, and Draft PR automation) is not implemented; coding tasks are not enabled in production.
+- C1 isolation and C2 coding are opt-in and disabled in production. C2 implements disposable workspaces, trusted tests, diff validation, and Draft PR publication, but it has not been independently accepted or enabled for production coding tasks. Unix UID/GID separation is not a kernel/network sandbox.
 - Only OpenCode execution is implemented. AGY remains capture-only. No other CLI adapters are shipped.
 - No automatic model selection or AI-based project inference.
 - Automatic reports cannot independently verify code changes, tests, or deployments.

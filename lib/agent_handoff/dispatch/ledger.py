@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..config import storage_path
+from .coding.milestones import milestone_state
 from ..util import FileLock, atomic_write_json, ensure_dir, read_json, utcnow_iso, utcnow_iso_precise
 
 SCHEMA = 1
@@ -34,6 +35,15 @@ class Ledger:
 
     def lock(self, blocking: bool = True, timeout: float = 60.0) -> FileLock:
         return FileLock(self.root / "ledger.lock", blocking=blocking, timeout=timeout)
+
+    def publication_lock(
+        self, repository: str, issue_number: int, *, timeout: float = 120.0
+    ) -> FileLock:
+        return FileLock(
+            self.root / f"publication-{record_id(repository, issue_number)}.lock",
+            blocking=True,
+            timeout=timeout,
+        )
 
     def path(self, repository: str, issue_number: int) -> Path:
         return self.records_dir / f"{record_id(repository, issue_number)}.json"
@@ -128,6 +138,59 @@ class Ledger:
         return self.sessions_dir / f"{record_id(repository, issue_number)}-{stamp}.jsonl"
 
 
+def new_coding_state(project: dict[str, Any]) -> dict[str, Any]:
+    coding = project.get("coding") or {}
+    publication = coding.get("publication") or {}
+    now = utcnow_iso()
+    return {
+        "enabled": bool(coding.get("enabled")),
+        "stage": "REQUEST_ACCEPTED",
+        "stage_history": [],
+        "repository": coding.get("repository"),
+        "base_branch": coding.get("base_branch"),
+        "base_commit": None,
+        "source_workspace": coding.get("source_workspace"),
+        "workspace_root": coding.get("workspace_root"),
+        "workspace": None,
+        "test_profile": coding.get("test_profile"),
+        "allowed_model_aliases": list(coding.get("allowed_model_aliases") or []),
+        "limits": dict(coding.get("limits") or {}),
+        "publication": {
+            "branch": None,
+            "commit": None,
+            "branch_pushed": False,
+            "pr_number": None,
+            "pr_url": None,
+            "attempts": 0,
+            "next_attempt_at": None,
+            "last_error": None,
+            "draft": bool(publication.get("draft", True)),
+        },
+        "tests": {"status": "not_run", "commands": []},
+        "diff": {"status": "not_run", "files": [], "changed_count": 0, "blocked": []},
+        "agent": {"status": "not_started", "outcome": None},
+        "blocked": False,
+        "blocked_stage": None,
+        "blocked_reason": None,
+        "recovery": {"attempts": 0, "last_error": None},
+        "artifacts_preserved": False,
+        "milestones": {
+            "AGENT_COMPLETED": False,
+            "TESTS_PASSED": False,
+            "DIFF_VALIDATED": False,
+            "COMMIT_CREATED": False,
+            "BRANCH_PUBLISHED": False,
+            "PR_CREATED": False,
+            "PR_PUBLISHED": False,
+            "REPORT_VERIFIED": False,
+            "ISSUE_DELIVERED": False,
+            "REPORT_DELIVERED": False,
+            "TELEGRAM_SENT": False,
+        },
+        "created_at": now,
+    }
+
+
 def new_dispatch_record(
     *,
     repository: str,
@@ -136,10 +199,13 @@ def new_dispatch_record(
     agent: str,
     model: str,
     request: dict[str, Any],
+    task_type: str = "read_only",
+    coding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     now = utcnow_iso()
-    return {
+    record = {
         "schema": SCHEMA,
+        "task_type": task_type,
         "dispatch_id": f"d-{record_id(repository, int(issue['number']))}",
         "repository": repository,
         "issue_number": int(issue["number"]),
@@ -200,6 +266,8 @@ def new_dispatch_record(
         "updated_at": now,
         "history": [{"at": now, "status": "NEW", "note": "request received"}],
     }
+    record["coding"] = coding if task_type == "coding" else None
+    return record
 
 
 def safe_record_summary(record: dict[str, Any]) -> dict[str, Any]:
@@ -208,12 +276,18 @@ def safe_record_summary(record: dict[str, Any]) -> dict[str, Any]:
     publication = record.get("publication") or {}
     execution = record.get("execution") or {}
     session = record.get("session") or {}
+    coding = record.get("coding") or {}
+    coding_publication = coding.get("publication") or {}
+    tests = coding.get("tests") or {}
+    diff = coding.get("diff") or {}
+    milestones = coding.get("milestones") or {}
     return {
         "dispatch_id": record.get("dispatch_id"),
         "repository": record.get("repository"),
         "issue_number": record.get("issue_number"),
         "issue_url": record.get("issue_url"),
         "status": record.get("status"),
+        "task_type": record.get("task_type") or "read_only",
         "project": (record.get("project") or {}).get("name"),
         "agent": record.get("agent"),
         "model": record.get("model"),
@@ -250,6 +324,62 @@ def safe_record_summary(record: dict[str, Any]) -> dict[str, Any]:
             "last_error": publication.get("last_error"),
             "next_attempt_at": publication.get("next_attempt_at"),
         },
+        "coding": {
+            "stage": coding.get("stage"),
+            "base_branch": coding.get("base_branch"),
+            "base_commit": coding.get("base_commit"),
+            "branch": coding_publication.get("branch"),
+            "commit": coding_publication.get("commit"),
+            "branch_pushed": coding_publication.get("branch_pushed"),
+            "pr_number": coding_publication.get("pr_number"),
+            "pr_url": coding_publication.get("pr_url"),
+            "tests": {
+                "status": tests.get("status"),
+                "failed_command": tests.get("failed_command"),
+            },
+            "diff": {
+                "status": diff.get("status"),
+                "changed_count": diff.get("changed_count"),
+                "blocked": list(diff.get("blocked") or []),
+            },
+            "blocked": bool(coding.get("blocked")),
+            "blocked_stage": coding.get("blocked_stage"),
+            "blocked_reason": coding.get("blocked_reason"),
+            "milestones": {
+                "agent_completed": milestone_state(coding, "AGENT_COMPLETED") == "true",
+                "tests_passed": milestone_state(coding, "TESTS_PASSED") == "true",
+                "diff_validated": milestone_state(coding, "DIFF_VALIDATED") == "true",
+                "commit_created": milestone_state(coding, "COMMIT_CREATED") == "true",
+                "branch_published": milestone_state(coding, "BRANCH_PUBLISHED") == "true",
+                "pr_created": milestone_state(coding, "PR_CREATED") == "true",
+                "pr_published": milestone_state(coding, "PR_PUBLISHED") == "true",
+                "report_verified": milestone_state(coding, "REPORT_VERIFIED") == "true",
+                "issue_delivered": milestone_state(coding, "ISSUE_DELIVERED") == "true",
+                "report_delivered": milestone_state(coding, "REPORT_DELIVERED") == "true",
+                "telegram_sent": milestone_state(coding, "TELEGRAM_SENT") == "true",
+            },
+            "publication_attempts": coding_publication.get("attempts", 0),
+            "publication_next_attempt_at": coding_publication.get("next_attempt_at"),
+            "report_link_updated": bool(coding_publication.get("report_link_updated")),
+            "report_link_last_error": coding_publication.get("report_link_last_error"),
+            "report_link_next_attempt_at": coding_publication.get("report_link_next_attempt_at"),
+            "report_link_skip_reason": (
+                coding_publication.get("report_link_skip_reason")
+                or coding_publication.get("report_link_skipped_reason")
+            ),
+            "report_link_skipped_at": coding_publication.get("report_link_skipped_at"),
+            "pr_body_provenance": coding_publication.get("pr_body_provenance"),
+            "pr_body_external_edit": bool(coding_publication.get("pr_body_external_edit")),
+            "remote_state": coding_publication.get("remote_state"),
+            "remote_invalid_reason": coding_publication.get("remote_invalid_reason"),
+            "remote_verified_at": coding_publication.get("remote_verified_at"),
+            "remote_invalidated_at": coding_publication.get("remote_invalidated_at"),
+            "historical_branch_published": bool(coding_publication.get("branch_pushed")),
+            "historical_pr_created": bool(coding_publication.get("pr_url")),
+            "artifact_preserved": coding.get("artifacts_preserved"),
+        }
+        if record.get("task_type") == "coding"
+        else None,
         "attention_reason": record.get("attention_reason"),
         "created_at": record.get("created_at"),
         "updated_at": record.get("updated_at"),

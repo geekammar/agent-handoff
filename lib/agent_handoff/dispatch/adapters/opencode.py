@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 from ...notify.config import DEFAULT_TOKEN_ENV
 from ...util import ensure_dir, sanitize_error, utc_from_timestamp, utcnow_iso
+from ..coding.process import process_group_alive, terminate_process_group
 from ..security import (
     build_isolated_environment,
     popen_isolation_kwargs,
@@ -253,6 +254,7 @@ class OpenCodeAdapter:
                 stream.close()
 
         stderr_lines: list[str] = []
+        orphans_detected = False
         timed_out = False
         exit_code: int | None = None
         process: subprocess.Popen | None = None
@@ -331,8 +333,19 @@ class OpenCodeAdapter:
                 if thread is not None and thread.is_alive():
                     thread.join(timeout=5)
             handle.close()
+        process_group_id = process.pid if process is not None else None
+        if process_group_id and process_group_alive(process_group_id):
+            orphans_detected = True
+            terminated = terminate_process_group(process_group_id)
+            if not terminated:
+                stderr_lines.append("orphaned child process group could not be terminated")
         finished_at = utcnow_iso()
         error_parts = []
+        if orphans_detected:
+            error_parts.append(
+                "orphaned OpenCode child process group was detected after execution; "
+                "the result is not publishable"
+            )
         if parser.error_text():
             error_parts.append(parser.error_text() or "")
         if timed_out:
@@ -349,12 +362,14 @@ class OpenCodeAdapter:
             termination_reason=parser.termination_reason,
             exit_code=exit_code,
             timed_out=timed_out,
-            outcome=_outcome(parser, exit_code, timed_out),
+            outcome=("blocked" if orphans_detected else _outcome(parser, exit_code, timed_out)),
             events_path=events_path,
             event_count=parser.event_count,
             error=error,
             started_at=started_at,
             finished_at=finished_at,
+            process_group_id=process_group_id,
+            orphans_detected=orphans_detected,
         )
 
     def recover(self, events_path: str) -> ExecutionResult | None:
@@ -385,4 +400,6 @@ class OpenCodeAdapter:
             error=parser.error_text(),
             started_at=datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
             finished_at=finished_at,
+            process_group_id=None,
+            orphans_detected=False,
         )

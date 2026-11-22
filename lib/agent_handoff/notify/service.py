@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..config import all_projects, storage_path
+from ..dispatch.coding.milestones import PER_STAGE_ORDER, milestone_state
 from ..dispatch.ledger import Ledger
 from ..util import sanitize_error, utcnow_iso
 from .config import NotificationConfigError, validate_notification_config
@@ -178,6 +179,14 @@ class NotificationService:
             for item in dispatch_projects.values():
                 if isinstance(item, dict) and item.get("workspace"):
                     values.add(str(item["workspace"]))
+                if isinstance(item, dict):
+                    coding = item.get("coding") or {}
+                    for key in ("workspace_root", "staging_root", "source_workspace"):
+                        if coding.get(key):
+                            values.add(str(coding[key]))
+        coding_global = (config.get("dispatch") or {}).get("coding") or {}
+        if isinstance(coding_global, dict) and coding_global.get("staging_root"):
+            values.add(str(coding_global["staging_root"]))
         return sorted((item for item in values if len(item) > 1), key=len, reverse=True)
 
     def _clean(self, value: Any, limit: int = 500) -> str:
@@ -203,6 +212,8 @@ class NotificationService:
         upload = record.get("upload") or {}
         publication = record.get("publication") or {}
         execution = record.get("execution") or {}
+        coding = record.get("coding") or {}
+        coding_publication = coding.get("publication") or {}
         issue_number = record.get("issue_number")
         title = text_value(
             self._clean(record.get("issue_title") or f"Agent Handoff issue #{issue_number}", 240),
@@ -222,6 +233,23 @@ class NotificationService:
             "report_url": report_url,
             "receipt_url": safe_url(upload.get("receipt_url")) if upload.get("verified") else None,
             "outcome": execution.get("outcome"),
+            "task_type": record.get("task_type") or "read_only",
+            "coding_outcome": (
+                "blocked" if coding.get("blocked") else ("draft_pr_published" if coding_publication.get("pr_url") else None)
+            )
+            if record.get("task_type") == "coding"
+            else None,
+            "pr_url": safe_url(coding_publication.get("pr_url")),
+            "base_commit": coding.get("base_commit"),
+            "tests_status": (coding.get("tests") or {}).get("status"),
+            "milestones": {
+                "agent_completed": milestone_state(coding, "AGENT_COMPLETED") == "true",
+                "tests_passed": milestone_state(coding, "TESTS_PASSED") == "true",
+                "pr_published": milestone_state(coding, "PR_PUBLISHED") == "true",
+                "report_delivered": milestone_state(coding, "REPORT_DELIVERED") == "true",
+            }
+            if record.get("task_type") == "coding"
+            else None,
             "status": record.get("status"),
             "publication_status": publication.get("status"),
             "reason": self._clean(reason, 500) if reason else None,
@@ -273,6 +301,47 @@ class NotificationService:
         result = dict(created)
         result["_new"] = is_new
         return result
+
+    def _record_telegram_sent(self, notification: dict[str, Any], stored: dict[str, Any]) -> None:
+        """Record an acknowledged Telegram API send without affecting delivery."""
+
+        if str(notification.get("kind") or "") != DELIVERY_COMPLETED:
+            return
+        if self.ledger is None:
+            return
+        repository = str(notification.get("repository") or "").strip()
+        issue_number = notification.get("issue_number")
+        if not repository or issue_number is None:
+            return
+        try:
+            number = int(issue_number)
+        except (TypeError, ValueError):
+            return
+        sent_at = str(stored.get("sent_at") or utcnow_iso())
+        message_id = stored.get("telegram_message_id")
+
+        def apply(item: dict[str, Any]) -> None:
+            coding = item.get("coding")
+            if not isinstance(coding, dict):
+                return
+            coding.setdefault("milestones", {})["TELEGRAM_SENT"] = True
+            coding["telegram_sent_at"] = sent_at
+            coding["telegram_message_id"] = message_id
+            current = str(coding.get("stage") or "")
+            if PER_STAGE_ORDER.get("NOTIFICATION_SENT", -1) >= PER_STAGE_ORDER.get(current, -1):
+                coding["stage"] = "NOTIFICATION_SENT"
+
+        try:
+            self.ledger.update(
+                repository,
+                number,
+                apply,
+                note="Telegram API send acknowledged",
+            )
+        except Exception as exc:
+            # The notification is already sent. A ledger update failure must
+            # never change notification state or trigger a duplicate send.
+            self._log_safe(f"Telegram milestone ledger write failed independently: {exc}")
 
     def enqueue_completed(self, record: dict[str, Any]) -> dict[str, Any] | None:
         upload = record.get("upload") or {}
@@ -480,7 +549,30 @@ class NotificationService:
                 result["queued"] += 1
         if result["queued"]:
             self._log_safe(f"recovered {result['queued']} durable notification intent(s) after a restart")
+        self._reconcile_sent_milestones()
         return result
+
+    def _reconcile_sent_milestones(self) -> None:
+        """Rebuild TELEGRAM_SENT from SENT notifications after a crash."""
+
+        if self.store is None or self.ledger is None:
+            return
+        try:
+            notifications = self.store.all()
+        except Exception:
+            return
+        for notification in notifications:
+            if str(notification.get("state") or "") != "SENT":
+                continue
+            if str(notification.get("kind") or "") != DELIVERY_COMPLETED:
+                continue
+            record, _error = self._ledger_record(notification)
+            if not record:
+                continue
+            coding = record.get("coding") or {}
+            if (coding.get("milestones") or {}).get("TELEGRAM_SENT"):
+                continue
+            self._record_telegram_sent(notification, notification)
 
     def drain(
         self,
@@ -563,7 +655,8 @@ class NotificationService:
                 }
             if sent.get("ok"):
                 try:
-                    self.store.mark_sent(notification, sent.get("message_id"))
+                    stored = self.store.mark_sent(notification, sent.get("message_id"))
+                    self._record_telegram_sent(claimed, stored)
                     result["sent"] += 1
                 except Exception as exc:
                     result["errors"].append(self._clean(f"notification result write failed: {exc}"))
