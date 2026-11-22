@@ -131,6 +131,11 @@ def handle_api(argv: list[str]) -> int:
         target = next((item for item in pulls if int(item.get("number", -1)) == number), None)
         if target is None:
             return fail(f"pull #{number} not found")
+        if "PATCH" not in argv:
+            outage = os.environ.get("FAKE_GH_FAIL_PULL_GET_FILE")
+            if outage and Path(outage).exists():
+                Path(outage).unlink()
+                return fail("simulated GitHub pull API outage")
         if "PATCH" in argv:
             marker = os.environ.get("FAKE_GH_FAIL_PATCH_FILE")
             if marker and Path(marker).exists():

@@ -11,6 +11,7 @@ from .changes import ChangeValidationError, SafeGit, validate_changes
 from .milestones import CODING_STAGES, PER_STAGE_ORDER
 from .publication import (
     PublicationError,
+    RemoteStateError,
     TrustedPublisher,
     build_branch,
     build_pr_body,
@@ -24,6 +25,8 @@ from .workspace import (
     validate_coding_root,
     verify_source_repository,
 )
+
+REMOTE_REVALIDATE_SECONDS = 300
 
 PUBLICATION_LIMITATIONS = (
     "Unix UID/GID isolation is not a kernel or network sandbox.",
@@ -211,6 +214,184 @@ class CodingOrchestrator:
                 ),
             )
         return self._publisher
+
+    def _remote_check_due(self, publication: Mapping[str, Any], force: bool) -> bool:
+        if not (publication.get("branch_pushed") or publication.get("pr_url")):
+            return False
+        if str(publication.get("remote_state") or "") in ("invalid", "unverified_exhausted"):
+            return False
+        if force:
+            return True
+        from datetime import datetime
+
+        from ...util import utcnow
+
+        next_at = publication.get("remote_check_next_at")
+        if next_at:
+            try:
+                if datetime.fromisoformat(str(next_at).replace("Z", "+00:00")) > utcnow():
+                    return False
+            except ValueError:
+                pass
+        checked = publication.get("remote_checked_at")
+        if not checked:
+            return True
+        try:
+            moment = datetime.fromisoformat(str(checked).replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        return (utcnow() - moment).total_seconds() >= REMOTE_REVALIDATE_SECONDS
+
+    def _remote_max_attempts(self) -> int:
+        limits = (self.project.get("coding") or {}).get("limits") or {}
+        try:
+            return max(1, int(limits.get("max_publication_attempts", 3) or 3))
+        except (TypeError, ValueError):
+            return 3
+
+    def _mark_remote_invalid(self, current: dict[str, Any], reason: str) -> dict[str, Any]:
+        coding = current.get("coding") or {}
+        publication = coding.get("publication") or {}
+        stage = "PR_CREATED" if publication.get("pr_url") else "BRANCH_PUBLISHED"
+        safe_reason = self._safe_text(reason, 1200)
+
+        def extra(item: dict[str, Any]) -> None:
+            pub = item.setdefault("publication", {})
+            pub.update(
+                {
+                    "remote_state": "invalid",
+                    "remote_invalidated_at": utcnow_iso(),
+                    "remote_invalid_reason": safe_reason,
+                    "remote_last_error": safe_reason,
+                }
+            )
+            milestones = item.setdefault("milestones", {})
+            milestones["PR_CREATED"] = False
+            milestones["PR_PUBLISHED"] = False
+
+        return self._block(
+            stage,
+            f"the published remote state is no longer valid: {safe_reason}",
+            extra=extra,
+        )
+
+    def _schedule_remote_check_retry(
+        self, current: dict[str, Any], error: str
+    ) -> dict[str, Any]:
+        coding = current.get("coding") or {}
+        publication = coding.get("publication") or {}
+        stage = "PR_CREATED" if publication.get("pr_url") else "BRANCH_PUBLISHED"
+        attempts = int(publication.get("remote_check_attempts", 0) or 0) + 1
+        maximum = self._remote_max_attempts()
+        safe_error = self._safe_text(error, 1200)
+        if attempts >= maximum:
+            def extra(item: dict[str, Any]) -> None:
+                pub = item.setdefault("publication", {})
+                pub.update(
+                    {
+                        "remote_state": "unverified_exhausted",
+                        "remote_check_attempts": attempts,
+                        "remote_last_error": safe_error,
+                        "remote_check_next_at": None,
+                    }
+                )
+
+            return self._block(
+                stage,
+                f"could not verify the published remote state after {attempts} attempt(s): {safe_error}",
+                extra=extra,
+            )
+        next_at = publication_backoff(attempts, 60)
+
+        def update(item: dict[str, Any]) -> None:
+            pub = item.setdefault("publication", {})
+            pub.update(
+                {
+                    "remote_state": "unverified",
+                    "remote_check_attempts": attempts,
+                    "remote_last_error": safe_error,
+                    "remote_check_next_at": next_at,
+                }
+            )
+
+        updated = self._set_coding(
+            update,
+            note=f"remote publication verification failed transiently; retry after {next_at}",
+        )
+        self._emit(
+            "coding_retryable",
+            "could not verify the published remote state; a bounded retry is scheduled without rerunning OpenCode",
+        )
+        return updated
+
+    def revalidate_remote_publication(
+        self, current: dict[str, Any], *, force: bool = False
+    ) -> dict[str, Any]:
+        """Verify a previously published branch/PR against live GitHub state."""
+
+        coding = current.get("coding") or {}
+        if coding.get("blocked"):
+            return current
+        publication = coding.get("publication") or {}
+        if not self._remote_check_due(publication, force):
+            return current
+        branch = str(publication.get("branch") or "")
+        commit = str(publication.get("commit") or "")
+        if not branch or not commit:
+            return self._mark_remote_invalid(
+                current, "the recorded publication branch or commit is missing"
+            )
+        pr_number = publication.get("pr_number")
+        try:
+            pr_number = int(pr_number) if pr_number is not None else None
+        except (TypeError, ValueError):
+            pr_number = None
+        if pr_number is None and publication.get("pr_url"):
+            pr_number = TrustedPublisher.pr_number_from_url(str(publication.get("pr_url")))
+            if pr_number is None:
+                return self._mark_remote_invalid(
+                    current, "the recorded Draft PR URL has no safe PR number"
+                )
+        publisher = self._adopt_publisher()
+        try:
+            verified = publisher.verify_published_state(
+                branch=branch,
+                commit=commit,
+                pr_number=pr_number,
+                pr_url=str(publication.get("pr_url") or "") or None,
+            )
+        except RemoteStateError as exc:
+            return self._mark_remote_invalid(current, str(exc))
+        except (PublicationError, OSError) as exc:
+            return self._schedule_remote_check_retry(current, str(exc))
+        now = utcnow_iso()
+
+        def update(item: dict[str, Any]) -> None:
+            pub = item.setdefault("publication", {})
+            pub.update(
+                {
+                    "remote_state": "valid",
+                    "remote_checked_at": now,
+                    "remote_verified_at": now,
+                    "remote_check_attempts": 0,
+                    "remote_check_next_at": None,
+                    "remote_last_error": None,
+                    "remote_branch_sha": verified.get("branch_sha"),
+                }
+            )
+            pr = verified.get("pr") or {}
+            if pr:
+                pub.update(
+                    {
+                        "remote_pr_state": str(pr.get("state") or ""),
+                        "remote_pr_draft": bool(pr.get("draft")),
+                        "remote_pr_head_sha": str((pr.get("head") or {}).get("sha") or ""),
+                    }
+                )
+
+        updated = self._set_coding(update, note="verified published remote branch and Draft PR state")
+        self._emit("coding_verified", "published remote branch and Draft PR state are still valid")
+        return updated
 
     def _expected_workspace_name(self) -> str:
         return f"issue-{int(self.record['issue_number'])}-{self.task_id}"
@@ -888,6 +1069,9 @@ class CodingOrchestrator:
         gated = self._require_test_gate(current)
         if gated is not None:
             return gated
+        current = self.revalidate_remote_publication(current, force=force)
+        if (current.get("coding") or {}).get("blocked"):
+            return current
         coding = current.get("coding") or {}
         publication = coding.get("publication") or {}
         if publication.get("branch_pushed"):
@@ -998,6 +1182,9 @@ class CodingOrchestrator:
         gated = self._require_test_gate(current)
         if gated is not None:
             return gated
+        current = self.revalidate_remote_publication(current, force=force)
+        if (current.get("coding") or {}).get("blocked"):
+            return current
         coding = current.get("coding") or {}
         publication = coding.get("publication") or {}
         publisher = self._adopt_publisher()
@@ -1061,6 +1248,17 @@ class CodingOrchestrator:
             )
         except (PublicationError, OSError) as exc:
             return self._publication_retry(current, stage="PR_CREATED", error=str(exc), force=force)
+        expected_body_sha = TrustedPublisher.body_sha256(body)
+        remote_body_sha = str(result.get("body_sha256") or expected_body_sha)
+        external_edit = bool(
+            not result.get("created")
+            and (not result.get("body_sha256") or remote_body_sha != expected_body_sha)
+        )
+        history = list(publication.get("pr_body_sha256_history") or [])
+        if external_edit:
+            history = []
+        elif expected_body_sha not in history:
+            history.append(expected_body_sha)
         updated = self._stage(
             "PR_CREATED",
             note=f"Draft Pull Request recorded: {result.get('pr_url')}",
@@ -1074,6 +1272,9 @@ class CodingOrchestrator:
                         "last_error": None,
                         "next_attempt_at": None,
                         "status": "PR_CREATED",
+                        "pr_body_sha256": remote_body_sha,
+                        "pr_body_sha256_history": history[-10:],
+                        "pr_body_external_edit": external_edit,
                     }
                 }
             },

@@ -334,6 +334,9 @@ class DispatchRunner:
         if record.get("task_type") != "coding":
             return record
         coding = record.get("coding") or {}
+        publication_state = str((coding.get("publication") or {}).get("remote_state") or "")
+        if coding.get("blocked") and publication_state in ("invalid", "unverified_exhausted"):
+            return record
         milestones = coding.get("milestones") or {}
         upload = record.get("upload") or {}
         publication = record.get("publication") or {}
@@ -398,12 +401,71 @@ class DispatchRunner:
         )
         return updated
 
+    def _revalidate_coding_remote(self, record: dict[str, Any], *, force: bool) -> dict[str, Any]:
+        """Verify a persisted published branch/PR without re-running the agent."""
+
+        coding = record.get("coding") or {}
+        publication = coding.get("publication") or {}
+        old_status = record.get("status")
+        if coding.get("blocked"):
+            if (
+                str(publication.get("remote_state") or "") in ("invalid", "unverified_exhausted")
+                and old_status == "ISSUE_UPDATED"
+            ):
+                return self.ledger.update(
+                    record["repository"],
+                    int(record["issue_number"]),
+                    lambda item: item.update(
+                        {
+                            "status": "NEEDS_ATTENTION",
+                            "attention_reason": item.get("coding", {}).get("blocked_reason")
+                            or "published remote state is no longer valid",
+                        }
+                    ),
+                    note="remote published artifact is no longer valid; manual review required",
+                )
+            return record
+        if not (publication.get("branch_pushed") or publication.get("pr_url")):
+            return record
+        project = self._dispatch_project_for(record)
+        project_coding = project.get("coding") or {}
+        execution = self._effective_coding_execution(project)
+        orchestrator = self._coding_orchestrator(record, project, execution, None)
+        if not project_coding.get("repository"):
+            return orchestrator._mark_remote_invalid(
+                record, "the coding publication repository is no longer configured"
+            )
+        updated = orchestrator.revalidate_remote_publication(record, force=force)
+        coding_now = updated.get("coding") or {}
+        publication_now = coding_now.get("publication") or {}
+        if (
+            coding_now.get("blocked")
+            and str(publication_now.get("remote_state") or "") in ("invalid", "unverified_exhausted")
+            and old_status == "ISSUE_UPDATED"
+        ):
+            updated = self.ledger.update(
+                record["repository"],
+                int(record["issue_number"]),
+                lambda item: item.update(
+                    {
+                        "status": "NEEDS_ATTENTION",
+                        "attention_reason": item.get("coding", {}).get("blocked_reason")
+                        or "published remote state is no longer valid",
+                    }
+                ),
+                note="remote published artifact is no longer valid; manual review required",
+            )
+        return updated
+
     def _advance_all(self, *, force: bool) -> None:
         for record in self.ledger.all():
             status = record.get("status")
             if record.get("task_type") == "coding":
                 record = self._reconcile_coding_milestones(record)
+                record = self._revalidate_coding_remote(record, force=force)
                 status = record.get("status")
+                if status == "NEEDS_ATTENTION":
+                    continue
             if record.get("task_type") == "coding" and status == "ISSUE_UPDATED":
                 self._publish(record, force=force)
                 continue
@@ -1504,6 +1566,8 @@ class DispatchRunner:
         pr_url = publication.get("pr_url")
         if not report_url or not pr_number or not pr_url or publication.get("report_link_updated"):
             return
+        if publication.get("report_link_skipped_reason"):
+            return
         next_at = publication.get("report_link_next_attempt_at")
         if next_at:
             from datetime import datetime
@@ -1543,12 +1607,49 @@ class DispatchRunner:
                 report_url=report_url,
                 limitations=PUBLICATION_LIMITATIONS,
             )
-            publisher.update_pr_body(
-                pr_number=int(pr_number),
-                body=body,
-                branch=str(publication.get("branch") or ""),
-                commit=str(publication.get("commit") or ""),
+            current_pr = publisher.get_pr(int(pr_number))
+            publisher._validate_pr(
+                current_pr,
+                str(publication.get("branch") or ""),
+                str(publication.get("commit") or ""),
             )
+            current_body = str(current_pr.get("body") or "")
+            current_body_sha = TrustedPublisher.body_sha256(current_body)
+            history = list(publication.get("pr_body_sha256_history") or [])
+            expected_body_sha = str(publication.get("pr_body_sha256") or "")
+            body_is_known = current_body_sha in history or (
+                not history and bool(expected_body_sha) and current_body_sha == expected_body_sha
+            )
+            if report_url in current_body:
+                new_body_sha = current_body_sha
+            elif not body_is_known:
+                skip_reason = (
+                    "the Draft PR body was modified outside Agent Handoff; refusing to overwrite human changes"
+                )
+                self.ledger.update(
+                    record["repository"],
+                    int(record["issue_number"]),
+                    lambda item: item.setdefault("coding", {}).setdefault("publication", {}).update(
+                        {
+                            "report_link_skipped_at": utcnow_iso_precise(),
+                            "report_link_skip_reason": skip_reason,
+                            "report_link_next_attempt_at": None,
+                        }
+                    ),
+                    note="Draft PR body was externally modified; report link was not written",
+                )
+                self.summary.setdefault("warnings", []).append(skip_reason)
+                self._log(skip_reason)
+                return
+            else:
+                publisher.update_pr_body(
+                    pr_number=int(pr_number),
+                    body=body,
+                    branch=str(publication.get("branch") or ""),
+                    commit=str(publication.get("commit") or ""),
+                    expected_body_sha256=current_body_sha,
+                )
+                new_body_sha = TrustedPublisher.body_sha256(body)
         except Exception as exc:
             message = sanitize_error(f"could not add the verified report link to the Draft PR: {exc}", 500)
             attempts = int(publication.get("report_link_attempts", 0) or 0) + 1
@@ -1570,18 +1671,28 @@ class DispatchRunner:
             )
             self._log(message)
             return
-        self.ledger.update(
-            record["repository"],
-            int(record["issue_number"]),
-            lambda item: item.setdefault("coding", {}).setdefault("publication", {}).update(
+        def record_success(item: dict[str, Any]) -> None:
+            pub = item.setdefault("coding", {}).setdefault("publication", {})
+            history = list(pub.get("pr_body_sha256_history") or [])
+            if new_body_sha not in history:
+                history.append(new_body_sha)
+            pub.update(
                 {
                     "report_link_updated": True,
                     "report_link_updated_at": utcnow_iso_precise(),
                     "report_link_attempts": int(publication.get("report_link_attempts", 0) or 0),
                     "report_link_last_error": None,
                     "report_link_next_attempt_at": None,
+                    "report_link_skip_reason": None,
+                    "pr_body_sha256": new_body_sha,
+                    "pr_body_sha256_history": history[-10:],
                 }
-            ),
+            )
+
+        self.ledger.update(
+            record["repository"],
+            int(record["issue_number"]),
+            record_success,
             note="verified report link added to the Draft PR body",
         )
 

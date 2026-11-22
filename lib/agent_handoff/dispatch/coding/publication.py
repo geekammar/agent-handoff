@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -40,6 +41,10 @@ ASKPASS_SCRIPT = (
 
 class PublicationError(RuntimeError):
     pass
+
+
+class RemoteStateError(PublicationError):
+    """A durable publication artifact is deterministically absent or invalid."""
 
 
 def _slug(value: str, limit: int = 32) -> str:
@@ -838,6 +843,90 @@ class TrustedPublisher:
             raise PublicationError("GitHub returned incomplete Pull Request metadata")
         return item
 
+    @staticmethod
+    def body_sha256(body: Any) -> str:
+        return hashlib.sha256(str(body or "").encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _is_not_found(error: BaseException) -> bool:
+        text = str(error).lower()
+        return "not found" in text or "http 404" in text or "404" in text or "gone" in text
+
+    @staticmethod
+    def pr_number_from_url(url: str | None) -> int | None:
+        match = re.search(r"/pull/([0-9]+)(?:$|[/?#])", str(url or ""))
+        return int(match.group(1)) if match else None
+
+    def verify_published_state(
+        self,
+        *,
+        branch: str,
+        commit: str,
+        pr_number: int | None = None,
+        pr_url: str | None = None,
+    ) -> dict[str, Any]:
+        """Verify the live remote branch and Draft PR against durable evidence.
+
+        Deterministic remote invalidation raises ``RemoteStateError``. Transient
+        GitHub/Git failures raise ``PublicationError`` so callers can retry
+        without misclassifying them as corruption.
+        """
+
+        if not prefix_valid(self.branch_prefix) or not branch.startswith(self.branch_prefix):
+            raise RemoteStateError("the recorded publication branch is outside the trusted namespace")
+        if branch.lower() in PROTECTED_BRANCHES:
+            raise RemoteStateError("the recorded publication branch is a protected branch")
+        token = self.token()
+        remote_sha = self._remote_branch_sha(branch, token)
+        if remote_sha is None:
+            raise RemoteStateError(
+                f"the published remote branch {branch!r} no longer exists"
+            )
+        if remote_sha != commit:
+            raise RemoteStateError(
+                f"the published remote branch {branch!r} moved from the verified commit "
+                f"{commit} to {remote_sha}"
+            )
+        if pr_number is None and pr_url:
+            pr_number = self.pr_number_from_url(pr_url)
+        if pr_number is None:
+            return {"branch_sha": remote_sha, "pr": None}
+        try:
+            item = self.get_pr(int(pr_number))
+        except PublicationError as exc:
+            if self._is_not_found(exc):
+                raise RemoteStateError(
+                    f"the recorded Draft Pull Request #{int(pr_number)} no longer exists"
+                ) from exc
+            raise
+        head = item.get("head") or {}
+        base = item.get("base") or {}
+        head_repo = str((head.get("repo") or {}).get("full_name") or "")
+        if head_repo.lower() != self.repository.lower():
+            raise RemoteStateError("the Pull Request head repository no longer matches the configured repository")
+        base_repo = str((base.get("repo") or {}).get("full_name") or "")
+        if base_repo and base_repo.lower() != self.repository.lower():
+            raise RemoteStateError("the Pull Request base repository no longer matches the configured repository")
+        if str(item.get("state") or "") != "open":
+            raise RemoteStateError(
+                f"the recorded Draft Pull Request #{int(pr_number)} is no longer open "
+                f"(state={item.get('state') or 'unknown'})"
+            )
+        if item.get("draft") is not True:
+            raise RemoteStateError("the recorded Draft Pull Request was converted to Ready for review")
+        if str(head.get("ref") or "") != branch:
+            raise RemoteStateError("the Pull Request head branch no longer matches the recorded branch")
+        if str(base.get("ref") or self.base_branch) != self.base_branch:
+            raise RemoteStateError("the Pull Request base branch no longer matches the configured base branch")
+        head_sha = str(head.get("sha") or "")
+        if re.fullmatch(r"[0-9a-f]{40,64}", head_sha) and head_sha.strip("0") and head_sha != commit:
+            raise RemoteStateError(
+                "the Pull Request head SHA no longer matches the verified publication commit"
+            )
+        if not item.get("html_url") or not isinstance(item.get("number"), int):
+            raise RemoteStateError("GitHub returned incomplete Pull Request metadata")
+        return {"branch_sha": remote_sha, "pr": item}
+
     def create_or_reuse_pr(
         self,
         *,
@@ -864,6 +953,7 @@ class TrustedPublisher:
                 "pr_url": item.get("html_url"),
                 "created": False,
                 "draft": True,
+                "body_sha256": hashlib.sha256(str(item.get("body") or "").encode("utf-8")).hexdigest(),
             }
         args = [
             "api",
@@ -892,6 +982,7 @@ class TrustedPublisher:
                 "pr_url": item.get("html_url"),
                 "created": True,
                 "draft": True,
+                "body_sha256": hashlib.sha256(str(item.get("body") or "").encode("utf-8")).hexdigest(),
             }
         except (PublicationError, ValueError) as exc:
             recovered = [
@@ -907,6 +998,7 @@ class TrustedPublisher:
                     "created": False,
                     "recovered": True,
                     "draft": True,
+                    "body_sha256": hashlib.sha256(str(item.get("body") or "").encode("utf-8")).hexdigest(),
                 }
             if len(recovered) > 1:
                 raise PublicationError("PR recovery found multiple matching Pull Requests") from exc
@@ -921,11 +1013,16 @@ class TrustedPublisher:
         body: str,
         branch: str | None = None,
         commit: str | None = None,
+        expected_body_sha256: str | None = None,
     ) -> dict[str, Any]:
         token = self.token()
         if branch:
             existing = self.get_pr(int(pr_number))
             self._validate_pr(existing, branch, commit)
+            if expected_body_sha256 and self.body_sha256(existing.get("body")) != expected_body_sha256:
+                raise PublicationError(
+                    "the Draft PR body changed before the update; refusing to overwrite external edits"
+                )
         result = self._gh(
             [
                 "api",

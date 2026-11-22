@@ -37,7 +37,7 @@ from agent_handoff.dispatch.coding.config import (  # noqa: E402
     prefix_valid,
     validate_branch_name,
 )
-from agent_handoff.dispatch.coding.pipeline import CodingOrchestrator  # noqa: E402
+from agent_handoff.dispatch.coding.pipeline import PUBLICATION_LIMITATIONS, CodingOrchestrator  # noqa: E402
 from agent_handoff.dispatch.coding.milestones import milestone_state  # noqa: E402
 from agent_handoff.dispatch.coding.publication import (  # noqa: E402
     PublicationError,
@@ -1933,6 +1933,8 @@ class CodingIntegrationTests(unittest.TestCase):
         env = self.h.env()
         with mock.patch.dict(os.environ, env, clear=False), mock.patch(
             "agent_handoff.upload.load_config", return_value=self.h.config
+        ), mock.patch.object(
+            DispatchRunner, "_coding_orchestrator", autospec=True, side_effect=self._fake_orchestrator
         ), mock.patch.object(DispatchRunner, "_coding_adapter", side_effect=AssertionError("agent must not run")):
             runner._advance_all(force=True)
         self.assertEqual(runner.summary["executed"], 0)
@@ -1958,6 +1960,8 @@ class CodingIntegrationTests(unittest.TestCase):
         env = self.h.env()
         with mock.patch.dict(os.environ, env, clear=False), mock.patch(
             "agent_handoff.upload.load_config", return_value=self.h.config
+        ), mock.patch.object(
+            DispatchRunner, "_coding_orchestrator", autospec=True, side_effect=self._fake_orchestrator
         ), mock.patch.object(DispatchRunner, "_coding_adapter", side_effect=AssertionError("agent must not run")):
             runner._advance_all(force=True)
         self.assertEqual(runner.summary["executed"], 0)
@@ -1992,6 +1996,8 @@ class CodingIntegrationTests(unittest.TestCase):
         env = self.h.env()
         with mock.patch.dict(os.environ, env, clear=False), mock.patch(
             "agent_handoff.upload.load_config", return_value=self.h.config
+        ), mock.patch.object(
+            DispatchRunner, "_coding_orchestrator", autospec=True, side_effect=self._fake_orchestrator
         ), mock.patch.object(DispatchRunner, "_coding_adapter", side_effect=AssertionError("agent must not run")):
             runner._advance_all(force=True)
         reconciled = self.ledger.get(GH_REPO, 21)
@@ -2138,7 +2144,19 @@ class CodingIntegrationTests(unittest.TestCase):
         commit = record["coding"]["publication"]["commit"]
         pulls_path = self.h.gh_dir / "pulls.json"
         pulls = json.loads(pulls_path.read_text(encoding="utf-8"))
-        pulls[0]["body"] = pulls[0]["body"].replace(report_url, "")
+        coding = record["coding"]
+        pulls[0]["body"] = build_pr_body(
+            task_id=str(record["capture"]["task_id"]),
+            run_id=str(record["capture"]["run_id"]),
+            title=str(record.get("issue_title") or ""),
+            issue_url=record.get("issue_url"),
+            base_commit=str(coding.get("base_commit") or ""),
+            branch=branch,
+            validation=coding.get("diff") or {},
+            tests=coding.get("tests") or {},
+            report_url=None,
+            limitations=PUBLICATION_LIMITATIONS,
+        )
         pulls_path.write_text(json.dumps(pulls, indent=2), encoding="utf-8")
 
         def clear_link(item: dict) -> None:
@@ -2162,7 +2180,9 @@ class CodingIntegrationTests(unittest.TestCase):
         marker = self.root / "fail-pr-patch-once"
         marker.write_text("1", encoding="utf-8")
         env = self.h.env({"FAKE_GH_FAIL_PATCH_FILE": str(marker)})
-        with mock.patch.dict(os.environ, env, clear=False):
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+            DispatchRunner, "_coding_orchestrator", autospec=True, side_effect=self._fake_orchestrator
+        ):
             runner._advance_all(force=True)
         failed = self.ledger.get(GH_REPO, 21)
         self.assertFalse(failed["coding"]["publication"]["report_link_updated"])
@@ -2176,7 +2196,9 @@ class CodingIntegrationTests(unittest.TestCase):
 
         self.ledger.update(GH_REPO, 21, make_due, note="make PR body retry due")
         env = self.h.env()
-        with mock.patch.dict(os.environ, env, clear=False):
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+            DispatchRunner, "_coding_orchestrator", autospec=True, side_effect=self._fake_orchestrator
+        ):
             runner._advance_all(force=True)
         recovered = self.ledger.get(GH_REPO, 21)
         self.assertTrue(recovered["coding"]["publication"]["report_link_updated"])
@@ -2248,6 +2270,215 @@ class CodingIntegrationTests(unittest.TestCase):
 
 
 
+    def _resume(self, *, extra_env: dict[str, str] | None = None):
+        runner = self.last_runner
+        runner.summary = {
+            "ok": True, "busy": False, "executed": 0, "rejected": 0, "needs_attention": 0,
+            "uploaded": 0, "published": 0, "errors": [], "warnings": [],
+        }
+        env = self.h.env(extra_env)
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch(
+            "agent_handoff.upload.load_config", return_value=self.h.config
+        ), mock.patch.object(
+            DispatchRunner, "_coding_orchestrator", autospec=True, side_effect=self._fake_orchestrator
+        ), mock.patch.object(
+            DispatchRunner, "_coding_adapter", side_effect=AssertionError("agent must not run")
+        ):
+            runner._advance_all(force=True)
+        return runner
+
+    def _publication_record(self):
+        record = self.ledger.get(GH_REPO, 21)
+        self.assertIsNotNone(record)
+        return record, record["coding"]["publication"]
+
+    def test_final_valid_branch_and_draft_pr_revalidates_without_mutation(self) -> None:
+        self._run()
+        self._resume()
+        record, publication = self._publication_record()
+        self.assertEqual(record["status"], "ISSUE_UPDATED")
+        self.assertEqual(publication["remote_state"], "valid")
+        self.assertTrue(publication["remote_verified_at"])
+        self.assertFalse(record["coding"]["blocked"])
+        self.assertEqual(len(self.h.comments(21)), 1)
+        self.assertEqual(len(json.loads((self.h.gh_dir / "pulls.json").read_text(encoding="utf-8"))), 1)
+
+    def test_final_deleted_remote_branch_surfaces_attention_without_recreate(self) -> None:
+        self._run()
+        record, publication = self._publication_record()
+        branch = publication["branch"]
+        git(["update-ref", "-d", f"refs/heads/{branch}"], self.repo["bare"])
+        self._resume()
+        record, publication = self._publication_record()
+        self.assertEqual(record["status"], "NEEDS_ATTENTION")
+        self.assertTrue(record["coding"]["blocked"])
+        self.assertEqual(publication["remote_state"], "invalid")
+        self.assertIn("no longer exists", publication["remote_invalid_reason"])
+        self.assertFalse(record["coding"]["milestones"]["PR_PUBLISHED"])
+        self.assertFalse(record["coding"]["milestones"]["PR_CREATED"])
+        self.assertEqual(milestone_state(record["coding"], "PR_PUBLISHED"), "false")
+        self.assertEqual(git(["ls-remote", "--heads", str(self.repo["bare"]), branch], self.root).stdout.strip(), "")
+        self.assertEqual(len(self.h.comments(21)), 1)
+        self.assertEqual(len(json.loads((self.h.gh_dir / "pulls.json").read_text(encoding="utf-8"))), 1)
+        self._resume()
+        record, publication = self._publication_record()
+        self.assertEqual(record["status"], "NEEDS_ATTENTION")
+        self.assertEqual(publication["remote_state"], "invalid")
+        self.assertFalse(record["coding"]["milestones"]["PR_CREATED"])
+        self.assertFalse(record["coding"]["milestones"]["PR_PUBLISHED"])
+
+    def test_final_moved_remote_branch_is_not_overwritten(self) -> None:
+        self._run()
+        record, publication = self._publication_record()
+        branch = publication["branch"]
+        git(["update-ref", f"refs/heads/{branch}", self.repo["base"]], self.repo["bare"])
+        self._resume()
+        record, publication = self._publication_record()
+        self.assertEqual(record["status"], "NEEDS_ATTENTION")
+        self.assertEqual(publication["remote_state"], "invalid")
+        self.assertIn("moved", publication["remote_invalid_reason"])
+        moved_sha = git(["rev-parse", f"refs/heads/{branch}"], self.repo["bare"]).stdout.strip()
+        self.assertEqual(moved_sha, self.repo["base"], "the changed remote branch must not be overwritten")
+
+    def _tamper_pr(self, **changes) -> None:
+        pulls_path = self.h.gh_dir / "pulls.json"
+        pulls = json.loads(pulls_path.read_text(encoding="utf-8"))
+        pulls[0].update(changes)
+        pulls_path.write_text(json.dumps(pulls, indent=2), encoding="utf-8")
+
+    def test_final_closed_pr_surfaces_attention(self) -> None:
+        self._run()
+        self._tamper_pr(state="closed")
+        self._resume()
+        record, publication = self._publication_record()
+        self.assertEqual(record["status"], "NEEDS_ATTENTION")
+        self.assertEqual(publication["remote_state"], "invalid")
+        self.assertIn("no longer open", publication["remote_invalid_reason"])
+
+    def test_final_ready_for_review_pr_surfaces_attention(self) -> None:
+        self._run()
+        self._tamper_pr(draft=False)
+        self._resume()
+        record, publication = self._publication_record()
+        self.assertEqual(record["status"], "NEEDS_ATTENTION")
+        self.assertIn("Ready for review", publication["remote_invalid_reason"])
+
+    def test_final_pr_head_sha_change_surfaces_attention(self) -> None:
+        self._run()
+        self._tamper_pr(head={"ref": self._publication_record()[1]["branch"], "sha": "d" * 40, "repo": {"full_name": PROJECT_REPO}})
+        self._resume()
+        record, publication = self._publication_record()
+        self.assertEqual(record["status"], "NEEDS_ATTENTION")
+        self.assertIn("head SHA", publication["remote_invalid_reason"])
+
+    def test_final_pr_base_branch_change_surfaces_attention(self) -> None:
+        self._run()
+        self._tamper_pr(base={"ref": "develop"})
+        self._resume()
+        record, publication = self._publication_record()
+        self.assertEqual(record["status"], "NEEDS_ATTENTION")
+        self.assertIn("base branch", publication["remote_invalid_reason"])
+
+    def test_final_transient_github_failure_is_retried_not_mislabelled(self) -> None:
+        self._run()
+        marker = self.root / "fail-pull-get-once"
+        marker.write_text("1", encoding="utf-8")
+        self._resume(extra_env={"FAKE_GH_FAIL_PULL_GET_FILE": str(marker)})
+        record, publication = self._publication_record()
+        self.assertEqual(record["status"], "ISSUE_UPDATED")
+        self.assertFalse(record["coding"]["blocked"])
+        self.assertEqual(publication["remote_state"], "unverified")
+        self.assertEqual(publication["remote_check_attempts"], 1)
+        self.assertTrue(publication["remote_check_next_at"])
+        self.assertNotIn("no longer", str(publication["remote_last_error"]))
+        self.assertNotIn("moved", str(publication["remote_last_error"]))
+
+        marker.write_text("1", encoding="utf-8")
+        self._resume(extra_env={"FAKE_GH_FAIL_PULL_GET_FILE": str(marker)})
+        record, publication = self._publication_record()
+        self.assertEqual(record["status"], "NEEDS_ATTENTION")
+        self.assertEqual(publication["remote_state"], "unverified_exhausted")
+        self.assertIn("could not verify", str(record["coding"].get("blocked_reason")))
+
+    def test_final_crash_after_pr_creation_reconciles_without_duplicate(self) -> None:
+        self._run()
+
+        def simulate_crash(item: dict) -> None:
+            item["status"] = "EXECUTION_COMPLETED"
+            item["coding"]["stage"] = "PR_CREATED"
+            item["coding"]["milestones"]["PR_CREATED"] = False
+            item["coding"]["milestones"]["PR_PUBLISHED"] = False
+
+        self.ledger.update(GH_REPO, 21, simulate_crash, note="simulated crash before PR milestone write")
+        self._resume()
+        record, publication = self._publication_record()
+        self.assertTrue(record["coding"]["milestones"]["PR_CREATED"])
+        self.assertTrue(record["coding"]["milestones"]["PR_PUBLISHED"])
+        self.assertEqual(publication["remote_state"], "valid")
+        self.assertEqual(len(json.loads((self.h.gh_dir / "pulls.json").read_text(encoding="utf-8"))), 1)
+        self.assertEqual(len(self.h.comments(21)), 1)
+
+    def test_final_concurrent_remote_recovery_is_idempotent(self) -> None:
+        self._run()
+        record, publication = self._publication_record()
+        runner = self.last_runner
+        project = runner._dispatch_project_for(record)
+        execution = runner._effective_coding_execution(project)
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+        results: list[dict] = []
+
+        def recover() -> None:
+            try:
+                orchestrator = self._fake_orchestrator(runner, record, project, execution, None)
+                barrier.wait(timeout=5)
+                results.append(orchestrator.revalidate_remote_publication(record, force=True))
+            except BaseException as exc:  # noqa: BLE001 - collected for the assertion
+                errors.append(exc)
+
+        threads = [threading.Thread(target=recover) for _ in range(2)]
+        with mock.patch.dict(os.environ, self.h.env(), clear=False):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        current, publication_now = self._publication_record()
+        self.assertTrue(publication_now.get("remote_verified_at"))
+        self.assertEqual(publication_now.get("remote_state"), "valid")
+        self.assertEqual(len(json.loads((self.h.gh_dir / "pulls.json").read_text(encoding="utf-8"))), 1)
+        self.assertEqual(len(self.h.comments(21)), 1)
+
+    def test_final_human_pr_body_edit_is_not_overwritten(self) -> None:
+        self._run()
+        record, publication = self._publication_record()
+        report_url = record["upload"]["report_url"]
+        pulls_path = self.h.gh_dir / "pulls.json"
+        pulls = json.loads(pulls_path.read_text(encoding="utf-8"))
+        pulls[0]["body"] = pulls[0]["body"].replace(report_url, "").rstrip() + "\n\nHuman edit.\n"
+        pulls_path.write_text(json.dumps(pulls, indent=2), encoding="utf-8")
+
+        def clear_link(item: dict) -> None:
+            item["coding"]["publication"].update(
+                {
+                    "report_link_updated": False,
+                    "report_link_next_attempt_at": None,
+                    "report_link_attempts": 0,
+                    "report_link_last_error": None,
+                    "report_link_skip_reason": None,
+                }
+            )
+
+        self.ledger.update(GH_REPO, 21, clear_link, note="simulate report-link retry")
+        self._resume()
+        pulls = json.loads(pulls_path.read_text(encoding="utf-8"))
+        self.assertIn("Human edit.", pulls[0]["body"])
+        self.assertNotIn(report_url, pulls[0]["body"])
+        record, publication = self._publication_record()
+        self.assertFalse(publication["report_link_updated"])
+        self.assertIn("refusing to overwrite", publication["report_link_skip_reason"])
+
     def test_s8_lost_staging_before_push_rebuilds_commit_safely(self) -> None:
         first = self._run()
         self.assertEqual(first["executed"], 1)
@@ -2317,6 +2548,8 @@ class CodingIntegrationTests(unittest.TestCase):
         env = self.h.env()
         with mock.patch.dict(os.environ, env, clear=False), mock.patch(
             "agent_handoff.upload.load_config", return_value=self.h.config
+        ), mock.patch.object(
+            DispatchRunner, "_coding_orchestrator", autospec=True, side_effect=self._fake_orchestrator
         ), mock.patch.object(DispatchRunner, "_coding_adapter", side_effect=AssertionError("agent must not run")):
             runner._advance_all(force=True)
         self.assertFalse(Path(staging).exists(), "retry must remove interrupted publication staging")
