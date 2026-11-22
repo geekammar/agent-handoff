@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 from ..config import all_projects, storage_path
 from ..dispatch.coding.milestones import PER_STAGE_ORDER, milestone_state
-from ..dispatch.ledger import Ledger
+from ..dispatch.ledger import Ledger, UNCHANGED
 from ..util import sanitize_error, utcnow_iso
 from .config import NotificationConfigError, validate_notification_config
 from .messages import (
@@ -37,6 +37,13 @@ RETRY_NEXT_ACTION = (
 def notification_id(project: str, task_id: str, run_id: str, kind: str) -> str:
     value = "|".join([str(project).strip().lower(), str(task_id), str(run_id), str(kind)])
     return "n-" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+
+
+def _coding_state(record: dict[str, Any]) -> dict[str, Any] | None:
+    if record.get("task_type") != "coding":
+        return None
+    coding = record.get("coding")
+    return coding if isinstance(coding, dict) else None
 
 
 def _next_action(record: dict[str, Any]) -> str:
@@ -307,6 +314,8 @@ class NotificationService:
 
         if str(notification.get("kind") or "") != DELIVERY_COMPLETED:
             return
+        if str(stored.get("state") or "") != "SENT":
+            return
         if self.ledger is None:
             return
         repository = str(notification.get("repository") or "").strip()
@@ -320,16 +329,25 @@ class NotificationService:
         sent_at = str(stored.get("sent_at") or utcnow_iso())
         message_id = stored.get("telegram_message_id")
 
-        def apply(item: dict[str, Any]) -> None:
-            coding = item.get("coding")
-            if not isinstance(coding, dict):
-                return
-            coding.setdefault("milestones", {})["TELEGRAM_SENT"] = True
+        def apply(item: dict[str, Any]) -> Any:
+            coding = _coding_state(item)
+            if coding is None:
+                return UNCHANGED
+            milestones = coding.get("milestones")
+            if milestones is None:
+                milestones = {}
+                coding["milestones"] = milestones
+            elif not isinstance(milestones, dict):
+                return UNCHANGED
+            if milestones.get("TELEGRAM_SENT"):
+                return UNCHANGED
+            milestones["TELEGRAM_SENT"] = True
             coding["telegram_sent_at"] = sent_at
             coding["telegram_message_id"] = message_id
             current = str(coding.get("stage") or "")
             if PER_STAGE_ORDER.get("NOTIFICATION_SENT", -1) >= PER_STAGE_ORDER.get(current, -1):
                 coding["stage"] = "NOTIFICATION_SENT"
+            return None
 
         try:
             self.ledger.update(
@@ -569,8 +587,13 @@ class NotificationService:
             record, _error = self._ledger_record(notification)
             if not record:
                 continue
-            coding = record.get("coding") or {}
-            if (coding.get("milestones") or {}).get("TELEGRAM_SENT"):
+            coding = _coding_state(record)
+            if coding is None:
+                continue
+            milestones = coding.get("milestones")
+            if isinstance(milestones, dict) and milestones.get("TELEGRAM_SENT"):
+                continue
+            if milestones is not None and not isinstance(milestones, dict):
                 continue
             self._record_telegram_sent(notification, notification)
 
