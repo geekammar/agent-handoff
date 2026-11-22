@@ -2515,17 +2515,20 @@ class TestCodingTestGate(unittest.TestCase):
         self.work.mkdir()
         os.chmod(self.work, 0o700)
         self.identity = {**fake_identity(), "uid": os.getuid(), "gid": os.getgid()}
-        self.workspace = prepare_workspace(
-            workspace_root=str(self.work),
-            repository=PROJECT_REPO,
-            base_branch="main",
-            base_commit=self.repo["base"],
-            source=str(self.repo["source"]),
-            issue_number=71,
-            task_id="t-gate",
-            identity=self.identity,
-            git=SafeGit(identity=None, allow_file_protocol=True),
-        )
+        with mock.patch("agent_handoff.dispatch.coding.workspace.os.geteuid", return_value=0), mock.patch(
+            "agent_handoff.dispatch.coding.workspace.os.chown"
+        ):
+            self.workspace = prepare_workspace(
+                workspace_root=str(self.work),
+                repository=PROJECT_REPO,
+                base_branch="main",
+                base_commit=self.repo["base"],
+                source=str(self.repo["source"]),
+                issue_number=71,
+                task_id="t-gate",
+                identity=self.identity,
+                git=SafeGit(identity=None, allow_file_protocol=True),
+            )
         self.h = DispatchHarness(self.root / "harness")
         self.ledger = Ledger(self.h.config)
         self.project = {
@@ -2721,17 +2724,20 @@ class TestWorkspaceAdoptionSafety(unittest.TestCase):
         self.repo = make_repository(self.root)
         self.identity = {**fake_identity(), "uid": os.getuid(), "gid": os.getgid()}
         self.git = SafeGit(identity=None, allow_file_protocol=True)
-        self.workspace = prepare_workspace(
-            workspace_root=str(self.work),
-            repository=PROJECT_REPO,
-            base_branch="main",
-            base_commit=self.repo["base"],
-            source=str(self.repo["source"]),
-            issue_number=81,
-            task_id="t-one",
-            identity=self.identity,
-            git=self.git,
-        )
+        with mock.patch("agent_handoff.dispatch.coding.workspace.os.geteuid", return_value=0), mock.patch(
+            "agent_handoff.dispatch.coding.workspace.os.chown"
+        ):
+            self.workspace = prepare_workspace(
+                workspace_root=str(self.work),
+                repository=PROJECT_REPO,
+                base_branch="main",
+                base_commit=self.repo["base"],
+                source=str(self.repo["source"]),
+                issue_number=81,
+                task_id="t-one",
+                identity=self.identity,
+                git=self.git,
+            )
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
