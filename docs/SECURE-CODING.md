@@ -150,7 +150,7 @@ Suggested staging layout:
 
 The runtime home (`$AGENT_HANDOFF_HOME`), `/root`, and protected system directories must not be used as child home or workspace. Ancestors ABOVE the dedicated leaf directories (for example `/srv/agent-handoff` and `/srv/agent-handoff/work`) must be root-owned and not group/world writable; only the leaf home/work directories are owned by the child identity.
 
-## OpenCode executable trust
+## Executable and child PATH trust
 
 The isolated child must not be able to replace the executable that the privileged dispatcher starts. Before launch, the resolved OpenCode binary must:
 
@@ -158,9 +158,19 @@ The isolated child must not be able to replace the executable that the privilege
 - be owned by root (or the dispatcher identity) and not group/world writable;
 - be executable by the dedicated identity;
 - not live under the child's HOME, workspace, cache, or TMPDIR;
-- have root/dispatcher-owned ancestors that are not group/world writable, except for sticky root-owned directories such as `/tmp`.
+- have root/dispatcher-owned ancestors that are not group/world writable.
 
-`shutil.which` is restricted to the reviewed `child_path`. An explicit `AGENT_HANDOFF_OPENCODE_BIN` is accepted only after the same checks. A user-home installation, a workspace-local shim, or a world-writable directory fails closed instead of being executed.
+Every `dispatch.execution.isolation.child_path` entry is validated as an executable search directory before configuration is accepted and again at execution time:
+
+- absolute, canonical, non-empty components only;
+- owned by root or the dispatcher identity, never by the child;
+- not group/other writable and not effectively writable through the child's primary or supplementary groups;
+- not the child's HOME, XDG, cache, TMPDIR, or coding workspace;
+- no untrusted writable ancestor. A sticky root-owned ancestor such as `/tmp` is allowed only when the PATH directory itself is root-owned and not writable by the child; `/tmp` itself as a PATH entry is refused;
+- no symlink escape. A root-owned system symlink such as `/bin -> /usr/bin` is accepted only when its target and ancestors are trusted;
+- sticky world-writable PATH entries such as `/tmp` are refused.
+
+Every bare trusted test executable is resolved in the parent against that validated PATH and checked with the same ownership, mode, setuid, and ancestor rules. The resolved absolute executable is passed to the child, so an earlier writable PATH component cannot shadow `python3` or any other trusted test command. A child-owned directory containing a fake `python3` is rejected before spawn. An explicit `AGENT_HANDOFF_OPENCODE_BIN` is accepted only after the same executable checks.
 
 ## Child model authentication
 
@@ -283,6 +293,18 @@ C2 is enabled only by an explicit double opt-in:
 
 The project must have effective isolation enabled with a validated non-root identity. A missing value, a disabled project, or any unavailable precondition fails closed; there is no root fallback.
 
+### Repository visibility policy
+
+C2 supports both private and public coding repositories. Public repositories are legitimate for open-source work, but the owner must understand the exposure before enabling a public project:
+
+- Draft PR titles/bodies, branch names, commit metadata, the originating Issue reference, and the verified report URL can become public;
+- the dispatcher inbox repository must remain private; the coding repository visibility is an independent owner choice;
+- the architecture does not automatically convert repository visibility;
+- the publisher never writes GitHub/Drive/Telegram tokens, report contents, transcripts, or local paths to a PR;
+- a public coding repository exposes references and links, not the private Drive report file itself.
+
+C2 does not require a coding repository to be private and does not silently change its visibility. Owners should choose a private coding repository when Issue metadata or report links are sensitive.
+
 ### Coding request contract
 
 The Issue metadata block gains one optional field:
@@ -385,7 +407,7 @@ For each coding task:
 4. Clone the source into that directory as the dedicated non-root identity, detach at the verified base SHA, reject any symlink, and require a clean tree.
 5. Run OpenCode only in this disposable workspace. The active developer checkout is only a source of committed Git objects.
 6. On success and after verified report capture, remove the workspace when `cleanup_on_success` is true. Failed or blocked tasks preserve the workspace and durable evidence for review.
-7. Cleanup refuses paths outside the managed root, symlinks, unexpected names, and directories not owned by the dedicated identity. A task cannot clean another task's directory: the expected `issue-<number>-<task_id>` basename is checked again at cleanup time.
+7. Cleanup refuses paths outside the managed root, symlinks, unexpected names, source/denied project paths, and directories not owned by the dedicated identity and primary group. A task cannot clean another task's directory: the expected `issue-<number>-<task_id>` basename is checked again at cleanup time. If the dispatcher crashes after report capture and before cleanup, the next poll retries cleanup for that completed task; blocked, failed, or policy-preserved workspaces are retained.
 
 Resume revalidates the persisted workspace before OpenCode or its artifacts are used:
 
@@ -404,6 +426,7 @@ Git authentication helpers are never placed inside the publication staging tree.
 Tests run in the same disposable workspace under the same dedicated non-root identity:
 
 - owner-configured argv commands only; no shell interpolation from Issue text;
+- every bare executable resolved against the validated `child_path`, with child-owned, world-writable, and untrusted-ancestor locations refused before spawn;
 - bounded overall timeout and bounded stdout/stderr capture;
 - process-group termination with `SIGTERM` then `SIGKILL`;
 - allowlisted environment with no parent Telegram, GitHub, rclone, or runtime secrets;
@@ -440,7 +463,7 @@ Before commit, C2 records changed paths and rejects:
 
 The publisher validates the repository, branch namespace, base commit ancestry, commit parent, and committed path set. It pushes without force, refuses protected/default branches, verifies the remote branch SHA, and creates or recovers exactly one Draft PR by a stable body marker. Before reuse or a body update it requires the PR to be open, Draft, on the expected branch/base, and at the verified head SHA; a moved, closed, merged, non-Draft, or mismatched PR fails closed. After the report upload is verified, the dispatcher updates that same Draft PR body with the verified report link; an update failure is recorded as a warning and does not block Issue/report delivery. Multiple matching PRs, or an existing branch with a different commit, fail closed. Transient commit/push/PR failures use bounded retry/backoff. A lost staging repository is recovered by remote SHA when the branch already exists, or by safely rebuilding an unpublished commit when the remote branch is absent; an altered remote branch is never overwritten. Interrupted staging cleanup is retried from durable evidence.
 
-Already-published artifacts are reverified on resume/reconciliation rather than trusted from the ledger alone. When `branch_pushed` or `pr_url` is present, the next resume (and at most every five minutes during ordinary polling; forced reconciliations bypass the interval) compares the live remote branch SHA and fetches the recorded PR from GitHub. The PR must still be open, Draft, in the expected repository, on the recorded branch, against the configured base, and at the verified head SHA. A deleted/moved branch, closed/merged/missing PR, Ready-for-review PR, or mismatched head/base clears `PR_PUBLISHED`, preserves the historical branch/commit/PR evidence, and surfaces a precise `NEEDS_ATTENTION` reason. It never recreates or overwrites the changed artifact. GitHub/Git API failures are treated as transient, retried with bounded backoff, and only become attention after the attempt budget is exhausted; they are never reported as artifact corruption. Remote verification performs GET operations only and never duplicates branches, PRs, comments, or notifications. PR body updates are refused when the current body digest is not one of the previously recorded generated bodies, so human edits to the Draft PR are never overwritten.
+Already-published artifacts are reverified on resume/reconciliation rather than trusted from the ledger alone. When `branch_pushed` or `pr_url` is present, the next resume (and at most every five minutes during ordinary polling; forced reconciliations bypass the interval) compares the live remote branch SHA and fetches the recorded PR from GitHub. The PR must still be open, Draft, in the expected repository, on the recorded branch, against the configured base, and at the verified head SHA. A deleted/moved branch, closed/merged/missing PR, Ready-for-review PR, or mismatched head/base sets the separate current `publication.remote_state=invalid` and surfaces a precise `NEEDS_ATTENTION` reason. The durable stage remains monotonic and historical `BRANCH_PUBLISHED`/`PR_CREATED`/`PR_PUBLISHED` milestones are preserved as history; status and the report show that the remote artifact is **not currently valid**. It never recreates or overwrites the changed artifact. GitHub/Git API failures are treated as transient, retried with bounded backoff, and only become attention after the attempt budget is exhausted; they are never reported as artifact corruption. A transient exhaustion can be explicitly reverified for one Issue with `agent-handoff dispatch reconcile --issue <number>` after GitHub recovers; deterministic invalidation is not recoverable this way. Remote verification performs GET operations only and never duplicates branches, PRs, comments, notifications, or agent executions. PR body updates are refused when body provenance is external or the current body digest is not a previously recorded generated body, so human edits to the Draft PR are never overwritten. A durable skip reason is recorded once and surfaced in status; the verified report URL remains available in the originating Issue comment.
 
 ### Durable stages and recovery
 
@@ -463,6 +486,8 @@ Recovery rules:
 - interrupted tests or diff validation rerun from the preserved workspace only if the mandatory test gate has explicit passing evidence; failing or missing evidence blocks instead of publishing;
 - a prepared commit is reused; a pushed branch is recognized by remote SHA even if the publication staging directory disappeared; a created PR is recovered by branch/marker and verified open/Draft/head-SHA;
 - previously published branch/PR state is reverified on resume/reconciliation (with a bounded five-minute ordinary-poll interval); a deleted/moved branch or invalid PR becomes `NEEDS_ATTENTION` without recreation, while transient API failures retry with backoff;
+- `unverified_exhausted` is not retried forever by ordinary polling. After GitHub recovers, an operator can run `agent-handoff dispatch reconcile --issue <number>` to perform one GET-only verification of the existing branch and Draft PR. The block clears only after authoritative verification succeeds; invalid state remains final;
+- delivery milestones (`REPORT_VERIFIED`, `ISSUE_DELIVERED`) are reconciled from verified upload and acknowledged comment evidence even when remote publication is invalid;
 - milestones are reconciled from authoritative evidence after a restart: verified upload implies `REPORT_VERIFIED`, a published acknowledged Issue comment implies `ISSUE_DELIVERED`, an existing verified PR implies `PR_CREATED`/`PR_PUBLISHED`, and a durable `SENT` Telegram notification implies `TELEGRAM_SENT` without sending it again;
 - a failed Draft PR body update after verified report upload is retried with bounded backoff against the same PR; it never creates another PR, and a body modified outside Agent Handoff is not overwritten;
 - upload, GitHub comment, and Telegram failures retry only their own stage;
@@ -487,7 +512,9 @@ C2 does not provide a full sandbox. Residual risks include:
 
 ### How to disable and recover
 
-Coding is disabled when either `dispatch.coding.enabled` or the project `coding.enabled` is false. Setting both false leaves legacy read-only dispatch unchanged. Do not run `git reset`/`git clean` in a source checkout to recover a coding task; inspect `dispatch status --json`, the preserved disposable workspace, and the durable ledger stage. Use the normal dispatcher poll to resume safe stages. Use `dispatch deliver` only for report/comment reconciliation; it never runs an agent.
+Coding is disabled when either `dispatch.coding.enabled` or the project `coding.enabled` is false. Setting both false leaves legacy read-only dispatch unchanged. Do not run `git reset`/`git clean` in a source checkout to recover a coding task; inspect `dispatch status --json`, the preserved disposable workspace, and the durable ledger stage. Use the normal dispatcher poll to resume safe stages. Use `dispatch reconcile --issue <number>` only to reverify an exhausted transient remote state for one Issue; it performs GET verification only and never runs an agent, pushes, creates a PR, or posts a comment. Use `dispatch deliver` only for report/comment reconciliation; it never runs an agent. A crash after report capture retries disposable-workspace cleanup on the next poll, but only for an eligible completed task with a verified Draft PR and matching workspace identity; failed, blocked, or preserved workspaces are retained.
+
+The report's workspace-size figure is inclusive of `.git`; it is a bounded resource check, not a source-only measurement.
 
 ### Staging acceptance procedure
 

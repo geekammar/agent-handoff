@@ -227,3 +227,35 @@ C2 focused coverage (`tests/test_c2_coding.py`, mapped to T01-T40 in test names)
 - config validation does not mutate files, unrelated historical queue items are not processed, and Rabet/Yakfi-style projects remain legacy read-only.
 
 Not performed: a live C2 staging coding Issue, real dedicated Unix UID/GID drop for the C2 test runner, real provider/model execution, real private-repository push, real Draft PR creation, and Telegram delivery. These require explicit owner provisioning and are listed in the C2 staging acceptance procedure. Production coding remains disabled and the production service was not restarted.
+
+## C2 consolidated final security and recovery closure
+
+Date: 2026-11-22
+
+Starting reviewed HEAD: `8c9353219e885b478cdbc7a73fdf3d661b8a4a8e`.
+
+Commands:
+
+```bash
+python3 -m compileall -q lib setup tests
+sh -n setup/install.sh setup/upgrade.sh setup/rollback.sh setup/gdrive-auth.sh
+PYTHONPATH=lib python3 -m unittest tests.test_c2_coding -v
+PYTHONPATH=lib python3 -m unittest discover -s tests -p "test_*.py" -v
+git diff --check
+```
+
+Deterministic result on the repair host (root-capable Linux): **265 tests passed, 0 failed** in the full suite; the focused C2 module ran **126 tests, 0 failed**. These counts supersede the earlier C2 counts above. The suite uses fake GitHub, fake OpenCode, synthetic credentials, a local trusted Git remote, and fake rclone. OS-level UID-drop tests are skipped automatically on non-root CI runners.
+
+New regression coverage in this repair:
+
+- a child-owned `child_path` containing a fake `python3` is rejected before spawn, and the fake executable never runs; a safe system PATH executes real Python under a real non-root UID;
+- relative, empty, non-canonical, world-writable, sticky, child-owned, and workspace/HOME/TMPDIR PATH entries are rejected;
+- a crash before Draft PR ledger persistence plus a human PR-body edit preserves the human body byte-for-byte across repeated polls, with no repeated PATCH or warning and no duplicate Issue comment or PR;
+- a transient remote-verification exhaustion is explicitly reconciled for one Issue with GET-only checks, clears only on success, and does not re-execute the agent or create artifacts;
+- deterministic remote invalidation preserves the monotonic stage and historical publication milestones while reporting `remote_state=invalid`;
+- verified upload/Issue delivery milestones reconcile even when the remote artifact is invalid, and a stale PR URL cannot restore invalidated PR milestones;
+- a crash after report capture retries disposable-workspace cleanup for the matching completed task only;
+- literal Git pathspec filenames (`*`, `:(glob)**`, brackets) are committed exactly as validated, with no unexpected matched files;
+- the coding report says workspace size includes `.git`.
+
+Live staging verification on the exact final HEAD is recorded separately in the release report. Production coding remains disabled and no production service or workspace was changed.

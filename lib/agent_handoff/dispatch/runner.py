@@ -335,14 +335,13 @@ class DispatchRunner:
             return record
         coding = record.get("coding") or {}
         publication_state = str((coding.get("publication") or {}).get("remote_state") or "")
-        if coding.get("blocked") and publication_state in ("invalid", "unverified_exhausted"):
-            return record
         milestones = coding.get("milestones") or {}
         upload = record.get("upload") or {}
         publication = record.get("publication") or {}
         coding_publication = coding.get("publication") or {}
         tests = coding.get("tests") or {}
         diff = coding.get("diff") or {}
+        remote_historically_invalid = publication_state in ("invalid", "unverified_exhausted")
         desired: list[str] = []
         if (coding.get("agent") or {}).get("outcome") == "succeeded":
             desired.append("AGENT_COMPLETED")
@@ -352,10 +351,14 @@ class DispatchRunner:
             desired.append("DIFF_VALIDATED")
         if coding_publication.get("commit"):
             desired.append("COMMIT_CREATED")
-        if coding_publication.get("branch_pushed"):
-            desired.append("BRANCH_PUBLISHED")
-        if coding_publication.get("pr_url"):
-            desired.extend(["BRANCH_PUBLISHED", "PR_CREATED", "PR_PUBLISHED"])
+        # Historical publication milestones are preserved when the live remote
+        # artifact is invalid. Never re-add them from a stale PR URL alone.
+        if not remote_historically_invalid:
+            if coding_publication.get("branch_pushed"):
+                desired.append("BRANCH_PUBLISHED")
+            if coding_publication.get("pr_url"):
+                desired.extend(["BRANCH_PUBLISHED", "PR_CREATED", "PR_PUBLISHED"])
+        # Delivery evidence is reconciled independently of remote publication.
         if upload.get("verified"):
             desired.append("REPORT_VERIFIED")
         if (
@@ -365,11 +368,28 @@ class DispatchRunner:
         ):
             desired.extend(["ISSUE_DELIVERED", "REPORT_DELIVERED"])
         missing = [name for name in desired if not milestones.get(name)]
-        stale = [
-            name
-            for name in ("TESTS_PASSED", "PR_CREATED", "PR_PUBLISHED", "BRANCH_PUBLISHED", "COMMIT_CREATED", "DIFF_VALIDATED")
-            if milestones.get(name) and name not in desired
-        ]
+        publication_milestones = {"PR_CREATED", "PR_PUBLISHED", "BRANCH_PUBLISHED"}
+        if remote_historically_invalid:
+            stale = [
+                name
+                for name in ("TESTS_PASSED", "COMMIT_CREATED", "DIFF_VALIDATED")
+                if milestones.get(name) and name not in desired
+            ]
+        else:
+            stale = [
+                name
+                for name in (
+                    "TESTS_PASSED",
+                    "PR_CREATED",
+                    "PR_PUBLISHED",
+                    "BRANCH_PUBLISHED",
+                    "COMMIT_CREATED",
+                    "DIFF_VALIDATED",
+                )
+                if milestones.get(name) and name not in desired
+            ]
+        if publication_milestones and remote_historically_invalid:
+            stale = [name for name in stale if name not in publication_milestones]
         if not missing and not stale:
             return record
 
@@ -457,12 +477,49 @@ class DispatchRunner:
             )
         return updated
 
+    def reconcile_remote(self, *, repository: str, issue: int) -> dict[str, Any]:
+        """Explicitly verify one exhausted remote publication without side effects."""
+
+        record = self.ledger.get(repository, int(issue))
+        if not record:
+            raise ValueError(f"no dispatch record exists for {repository}#{int(issue)}")
+        if record.get("task_type") != "coding":
+            raise ValueError("remote reconciliation is only supported for coding records")
+        try:
+            lock = self.ledger.publication_lock(repository, int(issue))
+            with lock:
+                current = self.ledger.get(repository, int(issue)) or record
+                project = self._dispatch_project_for(current)
+                project_coding = project.get("coding") or {}
+                if not project_coding.get("repository"):
+                    raise ValueError("the coding publication repository is no longer configured")
+                execution = self._effective_coding_execution(project)
+                orchestrator = self._coding_orchestrator(current, project, execution, None)
+                result = orchestrator.recover_blocked_remote()
+                state = str((result.get("record") or {}).get("coding", {}).get("publication", {}).get("remote_state") or "")
+                if result.get("ok"):
+                    self._log(
+                        f"issue #{int(issue)} explicit remote reconciliation verified {state} "
+                        "without executing an agent or creating artifacts"
+                    )
+                else:
+                    self._log(
+                        f"issue #{int(issue)} explicit remote reconciliation failed: "
+                        f"{sanitize_error(str(result.get('error') or 'unknown error'), 500)}"
+                    )
+                return result
+        except TimeoutError as exc:
+            raise ValueError(
+                f"publication lock timeout for issue #{int(issue)}: {exc}"
+            ) from exc
+
     def _advance_all(self, *, force: bool) -> None:
         for record in self.ledger.all():
             status = record.get("status")
             if record.get("task_type") == "coding":
                 record = self._reconcile_coding_milestones(record)
                 record = self._revalidate_coding_remote(record, force=force)
+                record = self._retry_coding_cleanup(record)
                 status = record.get("status")
                 if status == "NEEDS_ATTENTION":
                     continue
@@ -1239,6 +1296,26 @@ class DispatchRunner:
         current = orchestrator.continue_after_agent(force=force)
         self._finish_coding(current, result, force=force)
 
+    def _retry_coding_cleanup(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Retry cleanup only for a completed coding capture that had a PR."""
+
+        if record.get("task_type") != "coding":
+            return record
+        coding = record.get("coding") or {}
+        capture = record.get("capture") or {}
+        publication = coding.get("publication") or {}
+        if (
+            capture.get("status") != "CAPTURED"
+            or coding.get("blocked")
+            or coding.get("cleaned_up")
+            or not coding.get("workspace")
+            or not publication.get("pr_url")
+            or not capture.get("task_id")
+        ):
+            return record
+        self._cleanup_coding_after_capture(record)
+        return self.ledger.get(record["repository"], int(record["issue_number"])) or record
+
     def _cleanup_coding_after_capture(self, record: dict[str, Any]) -> None:
         project = self._dispatch_project_for(record)
         project_coding = project.get("coding") or {}
@@ -1250,25 +1327,50 @@ class DispatchRunner:
         coding = record.get("coding") or {}
         workspace = str(coding.get("workspace") or "")
         root = str(project_coding.get("workspace_root") or "")
-        if not identity or not workspace or not root:
-            return
         capture = record.get("capture") or {}
-        expected_name = None
-        if capture.get("task_id"):
-            expected_name = f"issue-{int(record['issue_number'])}-{capture.get('task_id')}"
+        if (
+            not identity
+            or not workspace
+            or not root
+            or coding.get("blocked")
+            or coding.get("cleaned_up")
+            or capture.get("status") != "CAPTURED"
+            or not capture.get("task_id")
+            or not (coding.get("publication") or {}).get("pr_url")
+        ):
+            return
+        expected_name = f"issue-{int(record['issue_number'])}-{capture.get('task_id')}"
         try:
             removed = cleanup_workspace(
-                root, workspace, identity=identity, expected_name=expected_name
+                root,
+                workspace,
+                identity=identity,
+                expected_name=expected_name,
+                source_workspace=str(project_coding.get("source_workspace") or "") or None,
             )
         except OSError as exc:
-            self.summary["warnings"].append(f"coding workspace cleanup failed: {sanitize_error(str(exc))}")
+            message = sanitize_error(f"coding workspace cleanup failed: {exc}", 500)
+            self.summary["warnings"].append(message)
+            self.ledger.update(
+                record["repository"],
+                int(record["issue_number"]),
+                lambda item: item.setdefault("coding", {}).update(
+                    {"cleanup_last_error": message}
+                ),
+                note="coding workspace cleanup failed; a later poll may retry it",
+            )
             return
         if removed:
             self.ledger.update(
                 record["repository"],
                 int(record["issue_number"]),
                 lambda item: item.setdefault("coding", {}).update(
-                    {"workspace": None, "cleaned_up": True, "artifacts_preserved": False}
+                    {
+                        "workspace": None,
+                        "cleaned_up": True,
+                        "cleanup_last_error": None,
+                        "artifacts_preserved": False,
+                    }
                 ),
                 note="disposable coding workspace removed after verified report capture",
             )
@@ -1552,6 +1654,7 @@ class DispatchRunner:
         )
         self._progress("captured", f"report captured as task={task_id} run={run_id}; upload is pending", current)
         if is_coding and (coding.get("publication") or {}).get("pr_url") and not coding.get("blocked"):
+            current = self.ledger.get(repository, number) or current
             self._cleanup_coding_after_capture(current)
         return True
 
@@ -1566,7 +1669,35 @@ class DispatchRunner:
         pr_url = publication.get("pr_url")
         if not report_url or not pr_number or not pr_url or publication.get("report_link_updated"):
             return
-        if publication.get("report_link_skipped_reason"):
+        existing_skip = str(
+            publication.get("report_link_skip_reason")
+            or publication.get("report_link_skipped_reason")
+            or ""
+        )
+        if existing_skip:
+            return
+        if publication.get("pr_body_external_edit") or str(
+            publication.get("pr_body_provenance") or ""
+        ) == "external":
+            skip_reason = (
+                "the Draft PR body was modified outside Agent Handoff; the verified report link "
+                "was not written, and the existing body was preserved"
+            )
+            self.ledger.update(
+                record["repository"],
+                int(record["issue_number"]),
+                lambda item: item.setdefault("coding", {}).setdefault("publication", {}).update(
+                    {
+                        "report_link_skipped_at": utcnow_iso_precise(),
+                        "report_link_skip_reason": skip_reason,
+                        "report_link_next_attempt_at": None,
+                        "report_link_last_error": None,
+                    }
+                ),
+                note="Draft PR body was externally modified; durable report-link skip recorded",
+            )
+            self.summary.setdefault("warnings", []).append(skip_reason)
+            self._log(skip_reason)
             return
         next_at = publication.get("report_link_next_attempt_at")
         if next_at:
@@ -1595,18 +1726,23 @@ class DispatchRunner:
                 max_file_bytes=int((project_coding.get("limits") or {}).get("max_file_bytes", 200_000)),
             )
             capture = record.get("capture") or {}
-            body = build_pr_body(
-                task_id=str(capture.get("task_id") or ""),
-                run_id=str(capture.get("run_id") or ""),
-                title=str(record.get("issue_title") or f"Agent Handoff issue #{record.get('issue_number')}"),
-                issue_url=record.get("issue_url"),
-                base_commit=str(coding.get("base_commit") or ""),
-                branch=str(publication.get("branch") or ""),
-                validation=coding.get("diff") or {},
-                tests=coding.get("tests") or {},
-                report_url=report_url,
-                limitations=PUBLICATION_LIMITATIONS,
-            )
+
+            def build_body(link: str | None) -> str:
+                return build_pr_body(
+                    task_id=str(capture.get("task_id") or ""),
+                    run_id=str(capture.get("run_id") or ""),
+                    title=str(record.get("issue_title") or f"Agent Handoff issue #{record.get('issue_number')}"),
+                    issue_url=record.get("issue_url"),
+                    base_commit=str(coding.get("base_commit") or ""),
+                    branch=str(publication.get("branch") or ""),
+                    validation=coding.get("diff") or {},
+                    tests=coding.get("tests") or {},
+                    report_url=link,
+                    limitations=PUBLICATION_LIMITATIONS,
+                )
+
+            body = build_body(report_url)
+            baseline_body = build_body(None)
             current_pr = publisher.get_pr(int(pr_number))
             publisher._validate_pr(
                 current_pr,
@@ -1617,9 +1753,26 @@ class DispatchRunner:
             current_body_sha = TrustedPublisher.body_sha256(current_body)
             history = list(publication.get("pr_body_sha256_history") or [])
             expected_body_sha = str(publication.get("pr_body_sha256") or "")
-            body_is_known = current_body_sha in history or (
-                not history and bool(expected_body_sha) and current_body_sha == expected_body_sha
-            )
+            provenance = str(publication.get("pr_body_provenance") or "")
+            generated_body_sha = str(publication.get("pr_body_generated_sha256") or "")
+            baseline_sha = TrustedPublisher.body_sha256(baseline_body)
+            body_is_known = current_body_sha in history
+            if not body_is_known and not publication.get("pr_body_external_edit"):
+                if provenance == "generated":
+                    body_is_known = bool(
+                        current_body_sha == generated_body_sha
+                        or current_body_sha == expected_body_sha
+                        or current_body_sha == baseline_sha
+                    )
+                elif not provenance:
+                    body_is_known = bool(
+                        current_body_sha == baseline_sha
+                        or (
+                            publication.get("pr_created") is True
+                            and bool(expected_body_sha)
+                            and current_body_sha == expected_body_sha
+                        )
+                    )
             if report_url in current_body:
                 new_body_sha = current_body_sha
             elif not body_is_known:
@@ -1684,8 +1837,12 @@ class DispatchRunner:
                     "report_link_last_error": None,
                     "report_link_next_attempt_at": None,
                     "report_link_skip_reason": None,
+                    "report_link_skipped_at": None,
                     "pr_body_sha256": new_body_sha,
+                    "pr_body_generated_sha256": new_body_sha,
                     "pr_body_sha256_history": history[-10:],
+                    "pr_body_external_edit": False,
+                    "pr_body_provenance": "generated",
                 }
             )
 
@@ -1720,6 +1877,9 @@ class DispatchRunner:
             return
         capture = current.get("capture") or {}
         if capture.get("status") != "CAPTURED":
+            return
+        current = self._retry_coding_cleanup(current)
+        if current.get("status") in ("NEEDS_ATTENTION", "REJECTED", "ISSUE_UPDATED"):
             return
         if not upload_due(current, force=force):
             next_at = (current.get("upload") or {}).get("next_attempt_at")

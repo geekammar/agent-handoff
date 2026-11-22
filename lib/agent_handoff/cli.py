@@ -1310,6 +1310,68 @@ def cmd_dispatch_inspect(args: argparse.Namespace) -> int:
     return 0 if data.get("ok") else 1
 
 
+def cmd_dispatch_reconcile(args: argparse.Namespace) -> int:
+    """Explicitly reverify one exhausted remote publication without side effects."""
+
+    config = load_config()
+    try:
+        resolved, errors, _warnings = validate_dispatch_config(config)
+    except DispatchConfigError as exc:
+        raise ValueError(str(exc))
+    if errors:
+        raise ValueError("dispatcher configuration is invalid: " + "; ".join(errors))
+    repository = str(args.repository or resolved.get("repository") or "")
+    if not repository:
+        raise ValueError("--repository is required when dispatch.repository is not configured")
+    reporter = _dispatch_reporter(args)
+    runner = DispatchRunner(config, resolved, progress=reporter)
+    try:
+        result = runner.reconcile_remote(repository=repository, issue=int(args.issue))
+    except Exception as exc:
+        error = sanitize_error(str(exc), 800)
+        payload = {
+            "ok": False,
+            "repository": repository,
+            "issue": int(args.issue),
+            "remote_state": None,
+            "error": error,
+        }
+        if args.json:
+            emit(payload)
+        elif not args.quiet:
+            print(f"Remote reconciliation failed: {error}", file=sys.stderr)
+        return 1
+    record = result.get("record") or {}
+    coding = record.get("coding") or {}
+    publication = coding.get("publication") or {}
+    view = record_status_view(record, resolved) if record else {}
+    payload = {
+        "ok": bool(result.get("ok")),
+        "repository": repository,
+        "issue": int(args.issue),
+        "remote_state": publication.get("remote_state") or result.get("remote_state"),
+        "blocked": bool(coding.get("blocked")),
+        "error": result.get("error"),
+        "next_action": view.get("next_action"),
+    }
+    if args.json:
+        emit(payload)
+    elif not args.quiet:
+        if payload["ok"]:
+            print(
+                f"Remote reconciliation verified issue #{payload['issue']} "
+                f"state={payload['remote_state']} without executing the agent."
+            )
+            if payload.get("next_action"):
+                print(f"Next action: {payload['next_action']}")
+        else:
+            print(
+                f"Remote reconciliation did not clear the block: {payload.get('error') or 'verification failed'}",
+                file=sys.stderr,
+            )
+    return 0 if payload["ok"] else 1
+
+
 def cmd_dispatch_deliver(args: argparse.Namespace) -> int:
     with graceful_sigterm():
         return _cmd_dispatch_deliver(args)
@@ -1714,6 +1776,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--project")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_dispatch_inspect)
+    p = dispatch_sub.add_parser(
+        "reconcile",
+        help="reverify one exhausted remote publication without executing an agent or creating artifacts",
+    )
+    p.add_argument("--issue", type=int, required=True)
+    p.add_argument("--repository", help="owner/name (defaults to dispatch.repository)")
+    p.add_argument("--progress", action="store_true", help="write human progress to stderr even when stderr is not a TTY")
+    p.add_argument("--quiet", action="store_true", help="suppress human output; JSON stdout is unchanged")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_dispatch_reconcile)
     p = dispatch_sub.add_parser("deliver", help="reconcile an existing verified run and publish its direct link; never runs an agent")
     p.add_argument("--task", required=True)
     p.add_argument("--run", required=True)

@@ -9,7 +9,15 @@ import time
 from typing import Any, Mapping
 
 from ...util import sanitize_error, utcnow_iso
-from ..security import DEFAULT_CHILD_PATH, popen_isolation_kwargs
+from ..security import (
+    DEFAULT_CHILD_PATH,
+    IdentityError,
+    IsolationError,
+    popen_isolation_kwargs,
+    resolve_trusted_path_executable,
+    validate_child_path,
+    validate_trusted_executable,
+)
 from .config import SECRET_ENV_MARKERS
 from .process import process_group_alive, terminate_process_group
 
@@ -59,6 +67,10 @@ def build_test_environment(
         if any(marker in upper for marker in SECRET_ENV_MARKERS):
             raise TestExecutionError(f"trusted test profile contains a credential-like variable: {name}")
         env[name] = str(value)
+    try:
+        validate_child_path(env["PATH"], identity, workspace=workspace)
+    except IdentityError as exc:
+        raise TestExecutionError(f"trusted test PATH is not safe: {exc}") from exc
     return env
 
 
@@ -137,6 +149,11 @@ def run_command_bounded(
     gid = int(identity.get("gid", -1))
     if uid <= 0 or gid <= 0:
         raise TestExecutionError("test execution requires a dedicated non-root Unix identity")
+    path_value = str(environment.get("PATH") or identity.get("child_path") or DEFAULT_CHILD_PATH)
+    try:
+        validate_child_path(path_value, identity, workspace=workspace)
+    except IdentityError as exc:
+        raise TestExecutionError(f"trusted test PATH is not safe: {exc}") from exc
     if os.geteuid() == 0 and spawn is None:
         kwargs = popen_isolation_kwargs(identity)
     elif spawn is None:
@@ -261,6 +278,38 @@ def run_command_bounded(
     }
 
 
+def resolve_trusted_test_command(
+    argv: list[str],
+    identity: Mapping[str, Any],
+    *,
+    workspace: str,
+) -> list[str]:
+    """Resolve a trusted argv executable and reject untrusted absolute binaries."""
+
+    if not argv:
+        raise TestExecutionError("test command must be a non-empty argument array")
+    resolved = list(argv)
+    executable = resolved[0]
+    try:
+        if "/" not in executable:
+            resolved[0] = resolve_trusted_path_executable(
+                executable,
+                identity,
+                workspace=workspace,
+                label="trusted test executable",
+            )
+        elif os.path.isabs(executable):
+            resolved[0] = validate_trusted_executable(
+                executable,
+                identity,
+                workspace=workspace,
+                label="trusted test executable",
+            )
+    except (IdentityError, IsolationError) as exc:
+        raise TestExecutionError(f"trusted test executable is not safe: {exc}") from exc
+    return resolved
+
+
 def run_test_profile(
     definition: Mapping[str, Any],
     *,
@@ -288,7 +337,9 @@ def run_test_profile(
     for command in commands:
         if not isinstance(command, list) or not command:
             raise TestExecutionError("trusted test profile contains an invalid command")
-        argv = [str(item) for item in command]
+        argv = resolve_trusted_test_command(
+            [str(item) for item in command], identity, workspace=workspace
+        )
         remaining = overall_timeout - (time.monotonic() - started)
         if remaining <= 0:
             results.append(

@@ -363,6 +363,19 @@ def safe_record_summary(record: dict[str, Any]) -> dict[str, Any]:
             "report_link_updated": bool(coding_publication.get("report_link_updated")),
             "report_link_last_error": coding_publication.get("report_link_last_error"),
             "report_link_next_attempt_at": coding_publication.get("report_link_next_attempt_at"),
+            "report_link_skip_reason": (
+                coding_publication.get("report_link_skip_reason")
+                or coding_publication.get("report_link_skipped_reason")
+            ),
+            "report_link_skipped_at": coding_publication.get("report_link_skipped_at"),
+            "pr_body_provenance": coding_publication.get("pr_body_provenance"),
+            "pr_body_external_edit": bool(coding_publication.get("pr_body_external_edit")),
+            "remote_state": coding_publication.get("remote_state"),
+            "remote_invalid_reason": coding_publication.get("remote_invalid_reason"),
+            "remote_verified_at": coding_publication.get("remote_verified_at"),
+            "remote_invalidated_at": coding_publication.get("remote_invalidated_at"),
+            "historical_branch_published": bool(coding_publication.get("branch_pushed")),
+            "historical_pr_created": bool(coding_publication.get("pr_url")),
             "artifact_preserved": coding.get("artifacts_preserved"),
         }
         if record.get("task_type") == "coding"

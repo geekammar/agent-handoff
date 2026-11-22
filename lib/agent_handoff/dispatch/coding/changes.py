@@ -78,6 +78,7 @@ class SafeGit:
     def command(self, args: Sequence[str]) -> list[str]:
         return [
             "git",
+            "--literal-pathspecs",
             "-c",
             "core.hooksPath=/dev/null",
             "-c",

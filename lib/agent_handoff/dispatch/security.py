@@ -16,6 +16,7 @@ from ..util import sanitize_error
 DEFAULT_DENIED_PROJECTS = ("Rabet", "Yakfi")
 DEFAULT_CHILD_PATH = "/usr/local/bin:/usr/bin:/bin"
 PRIVILEGED_GROUP_NAMES = frozenset({"root", "sudo", "wheel", "admin", "adm", "docker", "disk", "lxd"})
+CHILD_PATH_UNTRUSTED_WRITE_BITS = 0o022
 PROTECTED_PREFIXES = (
     "/bin",
     "/boot",
@@ -148,6 +149,270 @@ def _check_trusted_ancestors(path: str, identity: Mapping[str, Any], label: str)
             raise WorkspaceSecurityError(f"{label} ancestor is writable by untrusted users: {candidate}")
 
 
+def _identity_group_ids(identity: Mapping[str, Any]) -> set[int]:
+    """Return the child's primary and supplementary group ids, when resolvable."""
+
+    groups: set[int] = set()
+    try:
+        primary = int(identity.get("gid", -1))
+    except (TypeError, ValueError):
+        primary = -1
+    if primary > 0:
+        groups.add(primary)
+    for item in identity.get("group_ids") or []:
+        try:
+            value = int(item)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            groups.add(value)
+    for item in identity.get("groups") or []:
+        try:
+            value = int(item)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            groups.add(value)
+    user = str(identity.get("user") or "")
+    if user and primary > 0:
+        try:
+            groups.update(int(item) for item in os.getgrouplist(user, primary) if int(item) > 0)
+        except OSError:
+            pass
+    return groups
+
+
+def _has_child_write_capability(entry: os.stat_result, identity: Mapping[str, Any]) -> bool:
+    try:
+        uid = int(identity.get("uid", -1))
+    except (TypeError, ValueError):
+        uid = -1
+    if uid <= 0:
+        return True
+    if entry.st_uid == uid and entry.st_mode & stat.S_IWUSR:
+        return True
+    if entry.st_gid in _identity_group_ids(identity) and entry.st_mode & stat.S_IWGRP:
+        return True
+    return bool(entry.st_mode & stat.S_IWOTH)
+
+
+def _trusted_path_directory(entry: os.stat_result, identity: Mapping[str, Any]) -> bool:
+    """Return True when an untrusted child cannot replace this directory entry."""
+
+    try:
+        child_uid = int(identity.get("uid", -1))
+    except (TypeError, ValueError):
+        child_uid = -1
+    if entry.st_uid == child_uid:
+        return False
+    if entry.st_uid not in {0, os.geteuid()}:
+        return False
+    if entry.st_mode & CHILD_PATH_UNTRUSTED_WRITE_BITS:
+        return False
+    return not _has_child_write_capability(entry, identity)
+
+
+def _check_child_path_directory_chain(path: str, identity: Mapping[str, Any], label: str) -> None:
+    current = Path(path)
+    for candidate in reversed([current, *current.parents]):
+        try:
+            entry = os.lstat(candidate)
+        except OSError as exc:
+            raise IdentityError(f"{label} is not accessible: {candidate}") from exc
+        if stat.S_ISLNK(entry.st_mode):
+            raise IdentityError(f"{label} must not contain a symlink component: {candidate}")
+        if not stat.S_ISDIR(entry.st_mode):
+            raise IdentityError(f"{label} ancestor is not a directory: {candidate}")
+        is_entry = candidate == current
+        if not is_entry and entry.st_uid == 0 and entry.st_mode & stat.S_ISVTX:
+            # /tmp-style sticky root directory. The child cannot rename or
+            # replace a root-owned entry inside it, including this PATH entry.
+            continue
+        if not _trusted_path_directory(entry, identity):
+            raise IdentityError(
+                f"{label} is owned or writable by an untrusted identity: {candidate}"
+            )
+
+
+def _check_child_path_entry(path: str, identity: Mapping[str, Any], label: str) -> str:
+    """Validate one PATH entry and return its resolved real directory."""
+
+    try:
+        raw_entry = os.lstat(path)
+    except OSError as exc:
+        raise IdentityError(f"{label} does not exist: {path}") from exc
+    parent = os.path.dirname(path) or "/"
+    _check_child_path_directory_chain(parent, identity, label)
+    if stat.S_ISLNK(raw_entry.st_mode):
+        try:
+            link_entry = os.lstat(path)
+        except OSError as exc:
+            raise IdentityError(f"{label} is not accessible: {path}") from exc
+        try:
+            child_uid = int(identity.get("uid", -1))
+        except (TypeError, ValueError):
+            child_uid = -1
+        if link_entry.st_uid == child_uid or link_entry.st_uid not in {0, os.geteuid()}:
+            raise IdentityError(f"{label} symlink is owned by an untrusted identity: {path}")
+        resolved = os.path.realpath(path)
+        if resolved == path:
+            raise IdentityError(f"{label} is an unresolved symlink: {path}")
+        _check_child_path_directory_chain(resolved, identity, label)
+    else:
+        resolved = os.path.realpath(path)
+        if resolved != path:
+            raise IdentityError(f"{label} must not contain a symlink escape: {path}")
+        _check_child_path_directory_chain(resolved, identity, label)
+    if not os.path.isdir(resolved):
+        raise IdentityError(f"{label} is not a directory: {path}")
+    return resolved
+
+
+def validate_child_path(
+    value: Any,
+    identity: Mapping[str, Any],
+    *,
+    workspace: str | None = None,
+    check_paths: bool = True,
+) -> list[str]:
+    """Validate the isolated child PATH and reject untrusted executable directories.
+
+    Every component must be absolute, canonical, and owned by root (or the
+    dispatcher identity) with no group/other write permission and no effective
+    write capability for the dedicated child UID/GID. A sticky root-owned
+    ancestor such as /tmp is allowed when the PATH directory itself is trusted;
+    /tmp as a PATH entry and child-owned HOME/cache/TMPDIR/workspace entries
+    are unsafe because the child could create or replace an executable there.
+    """
+
+    text = value.strip() if isinstance(value, str) else ""
+    if not text:
+        raise IdentityError("dispatch.execution.isolation.child_path must not be empty")
+    if "\x00" in text or "\n" in text or "\r" in text:
+        raise IdentityError("dispatch.execution.isolation.child_path must be a single PATH value")
+    parts = text.split(":")
+    if any(not part for part in parts):
+        raise IdentityError(
+            "dispatch.execution.isolation.child_path must not contain empty or relative components"
+        )
+    validated: list[str] = []
+    for part in parts:
+        if not os.path.isabs(part):
+            raise IdentityError(
+                "dispatch.execution.isolation.child_path must contain absolute directories only"
+            )
+        normalized = os.path.normpath(part)
+        if normalized != part:
+            raise IdentityError(
+                "dispatch.execution.isolation.child_path entries must be canonical paths"
+            )
+        if not check_paths:
+            validated.append(part)
+            continue
+        resolved = _check_child_path_entry(part, identity, "dispatch.execution.isolation.child_path entry")
+        untrusted_roots = [
+            identity.get("home"),
+            identity.get("config_home"),
+            identity.get("data_home"),
+            identity.get("cache_home"),
+            identity.get("tmp_dir"),
+            workspace,
+        ]
+        for root in untrusted_roots:
+            if not isinstance(root, str) or not root:
+                continue
+            root_real = os.path.realpath(root)
+            if _is_within(resolved, root_real):
+                raise IdentityError(
+                    "dispatch.execution.isolation.child_path must not contain the child's "
+                    f"HOME, XDG, TMPDIR, or workspace path: {part}"
+                )
+        if part not in validated:
+            validated.append(part)
+    if not validated:
+        raise IdentityError("dispatch.execution.isolation.child_path must contain at least one directory")
+    return validated
+
+
+def validate_trusted_executable(
+    binary: str,
+    identity: Mapping[str, Any],
+    *,
+    workspace: str | None = None,
+    label: str = "trusted executable",
+) -> str:
+    """Validate a regular executable used by the privileged parent for the child."""
+
+    try:
+        uid = int(identity.get("uid", -1))
+        gid = int(identity.get("gid", -1))
+    except (TypeError, ValueError) as exc:
+        raise IsolationError("the dedicated execution identity is malformed") from exc
+    canonical = os.path.realpath(binary)
+    try:
+        entry = os.stat(canonical)
+    except OSError as exc:
+        raise IsolationError(f"{label} is not available: {binary}") from exc
+    if not stat.S_ISREG(entry.st_mode):
+        raise IsolationError(f"{label} must be a regular file")
+    if entry.st_uid == uid or entry.st_uid not in {0, os.geteuid()}:
+        raise IsolationError(
+            f"{label} must be owned by root (or the dispatcher identity) so the dedicated "
+            "coding identity cannot replace it"
+        )
+    if entry.st_mode & 0o022:
+        raise IsolationError(f"{label} must not be group/world writable")
+    if entry.st_mode & (stat.S_ISUID | stat.S_ISGID):
+        raise IsolationError(f"{label} must not be setuid or setgid")
+    if not _has_execute_bits(entry.st_mode, uid, gid, owner_uid=entry.st_uid, owner_gid=entry.st_gid):
+        raise IsolationError(f"{label} is not executable by the dedicated identity")
+    for root in (
+        identity.get("home"),
+        identity.get("config_home"),
+        identity.get("data_home"),
+        identity.get("cache_home"),
+        identity.get("tmp_dir"),
+        workspace,
+    ):
+        if not isinstance(root, str) or not root:
+            continue
+        root_real = os.path.realpath(root)
+        if _is_within(canonical, root_real):
+            raise IsolationError(
+                f"{label} must not live under the dedicated child's HOME, workspace, cache, or temporary directories"
+            )
+    try:
+        _check_trusted_ancestors(canonical, identity, label)
+    except WorkspaceSecurityError as exc:
+        raise IsolationError(str(exc)) from exc
+    return canonical
+
+
+def resolve_trusted_path_executable(
+    name: str,
+    identity: Mapping[str, Any],
+    *,
+    workspace: str | None = None,
+    label: str = "trusted executable",
+) -> str:
+    """Resolve one bare executable name against the validated trusted child PATH."""
+
+    if not isinstance(name, str) or not name or "\x00" in name or "\n" in name or "/" in name:
+        raise IsolationError(f"{label} name must be a bare executable name")
+    entries = validate_child_path(
+        identity.get("child_path") or DEFAULT_CHILD_PATH,
+        identity,
+        workspace=workspace,
+        check_paths=True,
+    )
+    resolved = shutil.which(name, path=":".join(entries))
+    if not resolved:
+        raise IsolationError(f"{label} {name!r} is not available on the validated trusted child PATH")
+    return validate_trusted_executable(
+        resolved, identity, workspace=workspace, label=f"{label} {name!r}"
+    )
+
+
 def resolve_child_identity(
     raw: Any,
     *,
@@ -252,11 +517,6 @@ def resolve_child_identity(
     tmp_dir = os.path.join(home, "tmp")
 
     path_value = _text(child_path) or DEFAULT_CHILD_PATH
-    if "\x00" in path_value or "\n" in path_value or "\r" in path_value:
-        raise IdentityError("dispatch.execution.isolation.child_path must be a single PATH value")
-    path_parts = [part for part in path_value.split(":") if part]
-    if not path_parts or any(not os.path.isabs(part) for part in path_parts):
-        raise IdentityError("dispatch.execution.isolation.child_path must contain absolute directories only")
 
     identity = {
         "user": user,
@@ -264,14 +524,19 @@ def resolve_child_identity(
         "group": group_name,
         "gid": gid,
         "groups": [],
+        "group_ids": [int(item) for item in group_ids],
         "home": home,
         "config_home": config_home,
         "data_home": data_home,
         "cache_home": cache_home,
         "tmp_dir": tmp_dir,
-        "child_path": ":".join(path_parts),
+        "child_path": path_value,
         "model_auth_path": os.path.join(data_home, "opencode", "auth.json"),
     }
+
+    validated_path = validate_child_path(path_value, identity, check_paths=check_paths)
+    identity["path_entries"] = validated_path
+    identity["child_path"] = ":".join(validated_path)
 
     if check_paths:
         for label, directory in (
@@ -295,18 +560,6 @@ def resolve_child_identity(
                     f"the dedicated execution identity {label} directory must not be group/world writable: {directory}"
                 )
             _check_ancestor_traversal(directory, identity, label)
-        for directory in path_parts:
-            if not os.path.isdir(directory):
-                raise IdentityError(
-                    f"dispatch.execution.isolation.child_path entry does not exist: {directory}"
-                )
-            if _protected_reason(os.path.realpath(directory), ()):
-                if not _is_within(os.path.realpath(directory), "/usr") and not _is_within(
-                    os.path.realpath(directory), "/bin"
-                ) and not _is_within(os.path.realpath(directory), "/usr/local"):
-                    raise IdentityError(
-                        f"dispatch.execution.isolation.child_path entry is not a safe executable directory: {directory}"
-                    )
 
     return identity
 
@@ -470,7 +723,15 @@ def check_clean_git_workspace(
     timeout: int = GIT_CLEAN_CHECK_TIMEOUT,
 ) -> None:
     path = canonical_path(workspace, "dispatch workspace")
-    git = shutil.which("git", path=(identity or {}).get("child_path") or DEFAULT_CHILD_PATH)
+    if identity:
+        try:
+            git = resolve_trusted_path_executable(
+                "git", identity, workspace=path, label="trusted git executable"
+            )
+        except IsolationError as exc:
+            raise WorkspaceSecurityError(str(exc)) from exc
+    else:
+        git = shutil.which("git", path=DEFAULT_CHILD_PATH)
     if not git:
         raise WorkspaceSecurityError("git is required to prove the isolated coding workspace is clean")
     env = {
@@ -564,60 +825,16 @@ def _validate_opencode_executable(
     *,
     workspace: str | None = None,
 ) -> str:
-    """Require a non-tamperable OpenCode executable.
+    """Require a non-tamperable OpenCode executable."""
 
-    The child identity is itself untrusted for executable selection: a binary in
-    the child's HOME, workspace, cache, or TMPDIR could be replaced by the task.
-    On the production host the parent runs as root, so the file and its parent
-    directories must be root-owned and must not be group/world writable (sticky
-    root-owned directories are allowed).
-    """
-
-    uid = int(identity["uid"])
-    gid = int(identity["gid"])
-    canonical = os.path.realpath(binary)
-    if not os.path.isfile(canonical):
-        raise IsolationError(
-            "the OpenCode executable is not available on the dedicated child PATH; "
-            "install it in a reviewed location or set an explicit absolute binary path"
-        )
-    entry = os.stat(canonical)
-    if not stat.S_ISREG(entry.st_mode):
-        raise IsolationError("the OpenCode executable must be a regular file")
-    if entry.st_uid not in {0, os.geteuid()}:
-        raise IsolationError(
-            "the OpenCode executable must be owned by root (or the dispatcher identity) so the "
-            "dedicated coding identity cannot replace it"
-        )
-    if entry.st_mode & 0o022:
-        raise IsolationError("the OpenCode executable must not be group/world writable")
-    if entry.st_mode & (stat.S_ISUID | stat.S_ISGID):
-        raise IsolationError("the OpenCode executable must not be setuid or setgid")
-    if not _has_execute_bits(entry.st_mode, uid, gid, owner_uid=entry.st_uid, owner_gid=entry.st_gid):
-        raise IsolationError("the OpenCode executable is not executable by the dedicated identity")
-
-    untrusted_roots = [
-        identity.get("home"),
-        identity.get("config_home"),
-        identity.get("data_home"),
-        identity.get("cache_home"),
-        identity.get("tmp_dir"),
-        workspace,
-    ]
-    for root in untrusted_roots:
-        if not isinstance(root, str) or not root:
-            continue
-        root_real = os.path.realpath(root)
-        if _is_within(canonical, root_real):
-            raise IsolationError(
-                "the OpenCode executable must not live under the dedicated child's "
-                "HOME, workspace, cache, or temporary directories"
-            )
     try:
-        _check_trusted_ancestors(canonical, identity, "the OpenCode executable")
-    except WorkspaceSecurityError as exc:
-        raise IsolationError(str(exc)) from exc
-    return canonical
+        return validate_trusted_executable(
+            binary, identity, workspace=workspace, label="the OpenCode executable"
+        )
+    except IsolationError:
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
+        raise IsolationError("the dedicated execution identity is malformed") from exc
 
 
 def resolve_opencode_binary(
@@ -627,13 +844,20 @@ def resolve_opencode_binary(
     workspace: str | None = None,
 ) -> str:
     parent = parent_env or {}
+    validate_child_path(
+        identity.get("child_path") or DEFAULT_CHILD_PATH,
+        identity,
+        workspace=workspace,
+    )
     explicit = _text(parent.get("AGENT_HANDOFF_OPENCODE_BIN"))
     if explicit:
         if not os.path.isabs(explicit) or "\x00" in explicit or "\n" in explicit:
             raise IsolationError("AGENT_HANDOFF_OPENCODE_BIN must be an absolute executable path")
         binary = os.path.realpath(explicit)
     else:
-        binary = shutil.which("opencode", path=str(identity["child_path"])) or ""
+        binary = shutil.which(
+            "opencode", path=str(identity.get("child_path") or DEFAULT_CHILD_PATH)
+        ) or ""
     if not binary:
         raise IsolationError(
             "the OpenCode executable is not available on the dedicated child PATH; "

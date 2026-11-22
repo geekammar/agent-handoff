@@ -37,7 +37,11 @@ from agent_handoff.dispatch.coding.config import (  # noqa: E402
     prefix_valid,
     validate_branch_name,
 )
-from agent_handoff.dispatch.coding.pipeline import PUBLICATION_LIMITATIONS, CodingOrchestrator  # noqa: E402
+from agent_handoff.dispatch.coding.pipeline import (  # noqa: E402
+    PUBLICATION_LIMITATIONS,
+    CodingOrchestrator,
+    CodingPipelineError,
+)
 from agent_handoff.dispatch.coding.milestones import milestone_state  # noqa: E402
 from agent_handoff.dispatch.coding.publication import (  # noqa: E402
     PublicationError,
@@ -71,9 +75,12 @@ from agent_handoff.dispatch.requests import (  # noqa: E402
 from agent_handoff.dispatch.runner import DispatchRunner  # noqa: E402
 from agent_handoff.dispatch.security import (  # noqa: E402
     DEFAULT_CHILD_PATH,
+    IdentityError,
     IsolationError,
     build_isolated_environment,
     popen_isolation_kwargs,
+    resolve_trusted_path_executable,
+    validate_child_path,
 )
 from agent_handoff.notify.messages import DELIVERY_COMPLETED, build_telegram_message  # noqa: E402
 from agent_handoff.notify.service import NotificationService  # noqa: E402
@@ -763,6 +770,7 @@ class TestWorkspaceAndDiff(unittest.TestCase):
         self.assertNotIn("protocol.file.allow=always", command)
         self.assertIn("core.hooksPath=/dev/null", command)
         self.assertIn("credential.helper=", command)
+        self.assertIn("--literal-pathspecs", command)
         allowed = SafeGit(identity=None, allow_file_protocol=True).command(["clone", "src", "dst"])
         self.assertIn("protocol.file.allow=always", allowed)
 
@@ -914,7 +922,9 @@ class TestTestRunnerSecurity(unittest.TestCase):
                 spawn=lambda argv, **kwargs: process,
             )
         self.assertEqual(result["status"], "passed")
-        self.assertEqual(result["commands"][0]["argv"], ["python3", "-c", "print('ok')"])
+        self.assertTrue(os.path.isabs(result["commands"][0]["argv"][0]))
+        self.assertTrue(os.path.basename(result["commands"][0]["argv"][0]).startswith("python3"))
+        self.assertEqual(result["commands"][0]["argv"][1:], ["-c", "print('ok')"])
 
     def test_t16_test_timeout_and_t17_failure(self) -> None:
         timeout_process = FakeProcess(exit_code=-15, always_timeout=True)
@@ -949,6 +959,143 @@ class TestTestRunnerSecurity(unittest.TestCase):
             )
         with self.assertRaises(IsolationError):
             popen_isolation_kwargs({"uid": 0, "gid": 0})
+
+
+class TestTrustedChildPath(unittest.TestCase):
+    """F1: a child-writable PATH component must never shadow a trusted test executable."""
+
+    def _real_identity(self, user: str, *, child_path: str) -> dict:
+        import grp
+        import pwd
+
+        account = pwd.getpwnam(user)
+        group = grp.getgrgid(account.pw_gid)
+        home = Path(tempfile.mkdtemp(prefix="child-home-"))
+        self.addCleanup(shutil.rmtree, home, True)
+        for relative in (".config", ".local/share", ".cache", "tmp", ".local/share/opencode"):
+            (home / relative).mkdir(parents=True, exist_ok=True)
+        subprocess.run(["chown", "-R", f"{account.pw_uid}:{account.pw_gid}", str(home)], check=True)
+        auth = home / ".local/share/opencode/auth.json"
+        auth.write_text("{}\n", encoding="utf-8")
+        os.chmod(auth, 0o600)
+        subprocess.run(["chown", f"{account.pw_uid}:{account.pw_gid}", str(auth)], check=True)
+        return {
+            "user": user,
+            "uid": int(account.pw_uid),
+            "group": group.gr_name,
+            "gid": int(account.pw_gid),
+            "groups": [],
+            "group_ids": [int(account.pw_gid)],
+            "home": str(home),
+            "config_home": str(home / ".config"),
+            "data_home": str(home / ".local/share"),
+            "cache_home": str(home / ".cache"),
+            "tmp_dir": str(home / "tmp"),
+            "child_path": child_path,
+            "model_auth_path": str(auth),
+        }
+
+    def test_safe_default_path_is_accepted_and_resolves(self) -> None:
+        entries = validate_child_path(DEFAULT_CHILD_PATH, fake_identity())
+        self.assertIn("/usr/bin", entries)
+        self.assertIn("/bin", entries)
+        resolved = resolve_trusted_path_executable("python3", fake_identity())
+        self.assertTrue(os.path.isabs(resolved))
+        self.assertTrue(os.access(resolved, os.X_OK))
+
+    def test_relative_empty_and_noncanonical_components_are_rejected(self) -> None:
+        for value in ("usr/bin", "/usr/bin::/bin", ":/usr/bin", "/usr/bin:", "/usr/../usr/bin"):
+            with self.assertRaises(IdentityError, msg=value):
+                validate_child_path(value, fake_identity())
+
+    def test_world_writable_and_sticky_directories_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            os.chmod(directory, 0o777)
+            with self.assertRaises(IdentityError):
+                validate_child_path(str(directory), fake_identity())
+        with self.assertRaises(IdentityError):
+            validate_child_path("/tmp", fake_identity())
+
+    @unittest.skipUnless(os.geteuid() == 0, "requires root to create a child-owned directory")
+    def test_child_owned_directory_is_rejected(self) -> None:
+        import pwd
+
+        account = pwd.getpwnam("nobody")
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            os.chown(directory, account.pw_uid, account.pw_gid)
+            os.chmod(directory, 0o700)
+            identity = self._real_identity("nobody", child_path=str(directory))
+            with self.assertRaises(IdentityError):
+                validate_child_path(str(directory), identity)
+            with self.assertRaises(IdentityError):
+                resolve_trusted_path_executable("python3", identity)
+
+    @unittest.skipUnless(os.geteuid() == 0, "requires root and a nobody account for a real UID drop")
+    def test_fake_python3_in_child_path_never_runs(self) -> None:
+        import pwd
+
+        account = pwd.getpwnam("nobody")
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            child_bin = root / "child-bin"
+            child_bin.mkdir()
+            marker = child_bin / "shadow-ran"
+            fake = child_bin / "python3"
+            fake.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n", encoding="utf-8")
+            os.chmod(fake, 0o755)
+            os.chown(child_bin, account.pw_uid, account.pw_gid)
+            os.chown(fake, account.pw_uid, account.pw_gid)
+            os.chmod(child_bin, 0o700)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            os.chmod(workspace, 0o755)
+            identity = self._real_identity(
+                "nobody", child_path=f"{child_bin}:/usr/bin:/bin"
+            )
+            with self.assertRaises(TestExecutionError):
+                run_test_profile(
+                    {
+                        "name": "safe",
+                        "commands": [["python3", "-B", "-c", "print('real')"]],
+                        "timeout_seconds": 10,
+                        "env": {},
+                    },
+                    workspace=str(workspace),
+                    identity=identity,
+                    limits={"test_timeout_seconds": 10, "max_output_bytes": 1000},
+                )
+            self.assertFalse(marker.exists(), "the child-planted python3 must never execute")
+            with self.assertRaises(IdentityError):
+                self.assertEqual(
+                    resolve_trusted_path_executable("python3", identity),
+                    str(fake),
+                )
+
+    @unittest.skipUnless(os.geteuid() == 0, "requires root and a nobody account for a real UID drop")
+    def test_safe_trusted_path_runs_real_python_under_child_uid(self) -> None:
+        import pwd
+
+        account = pwd.getpwnam("nobody")
+        with tempfile.TemporaryDirectory() as raw:
+            workspace = Path(raw) / "workspace"
+            workspace.mkdir()
+            os.chmod(workspace, 0o755)
+            identity = self._real_identity("nobody", child_path="/usr/bin:/bin")
+            result = run_test_profile(
+                {
+                    "name": "safe",
+                    "commands": [["python3", "-B", "-c", "import os; print(os.getuid())"]],
+                    "timeout_seconds": 10,
+                    "env": {},
+                },
+                workspace=str(workspace),
+                identity=identity,
+                limits={"test_timeout_seconds": 10, "max_output_bytes": 1000},
+            )
+        self.assertEqual(result["status"], "passed", result)
+        self.assertIn(str(account.pw_uid), result["commands"][0]["stdout"])
 
 
 class TestProcessSafety(unittest.TestCase):
@@ -1111,6 +1258,70 @@ class TestPublicationAndReporting(unittest.TestCase):
         self.assertEqual(pulls[0]["base"]["ref"], "main")
         self.assertIn("No auto-merge", pulls[0]["body"])
 
+    def test_f9_literal_pathspec_filenames_commit_exactly(self) -> None:
+        workspace = self.work / "weird-paths"
+        shutil.copytree(self.repo["source"], workspace)
+        weird = {
+            "*": "literal star\n",
+            ":(glob)**": "literal magic prefix\n",
+            "name[abc]": "literal brackets\n",
+        }
+        for name, content in weird.items():
+            (workspace / name).write_text(content, encoding="utf-8")
+        evidence = validate_changes(
+            str(workspace),
+            git=SafeGit(identity=None, allow_file_protocol=True),
+            limits={
+                "max_files_changed": 10,
+                "max_file_bytes": 50000,
+                "max_diff_bytes": 200000,
+                "max_workspace_bytes": 1000000,
+            },
+            protected_paths=[],
+        )
+        self.assertEqual(evidence["status"], "passed", evidence)
+        publisher = self._publisher()
+        with mock.patch.dict(os.environ, {"FAKE_GH_DIR": str(self.gh_dir)}, clear=False):
+            publisher.prepare(base_commit=self.repo["base"], task_id="t-weird", run_id="r-weird")
+        committed = publisher.stage_and_commit(
+            validation=evidence,
+            task_workspace=str(workspace),
+            project="Alpha",
+            title="Literal paths",
+            issue_number=12,
+            task_id="t-weird",
+            run_id="r-weird",
+            base_commit=self.repo["base"],
+        )
+        tree = subprocess.run(
+            [
+                "git",
+                "-C",
+                committed["staging"],
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "--no-renames",
+                "-r",
+                "-z",
+                "HEAD",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        committed_paths = {item for item in tree.split("\x00") if item}
+        self.assertEqual(committed_paths, set(weird))
+        self.assertNotIn("src/app.py", committed_paths)
+        for name, content in weird.items():
+            blob = subprocess.run(
+                ["git", "-C", committed["staging"], "show", f"HEAD:{name}"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            self.assertEqual(blob, content)
+
     def test_t28_lost_pr_response_is_recovered_without_duplicate(self) -> None:
         publisher = self._publisher()
         commit, evidence = self._commit_change(publisher)
@@ -1240,6 +1451,7 @@ class TestPublicationAndReporting(unittest.TestCase):
                 "diff": {
                     "status": "passed",
                     "changed_count": 1,
+                    "workspace_bytes": 123,
                     "files": [{"path": "src/app.py", "status": "modified", "size": 10}],
                     "blocked": [],
                 },
@@ -1254,6 +1466,8 @@ class TestPublicationAndReporting(unittest.TestCase):
         self.assertIn("Diff validation evidence", text)
         self.assertIn("Security restrictions and limits", text)
         self.assertIn("Unverified claims", text)
+        self.assertIn("Workspace bytes (including .git): `123`", text)
+        self.assertNotIn("excluding .git", text)
         self.assertEqual(coding_outcome(record), "draft_pr_published")
 
 
@@ -1400,7 +1614,7 @@ class TestDeliveryMilestoneReporting(unittest.TestCase):
         report = coding_report_sections(record)
         self.assertIn("Coding outcome: `blocked:TESTING`", report)
         self.assertIn("Trusted tests passed: `false`", report)
-        self.assertIn("Draft PR created: `not_run`", report)
+        self.assertIn("Draft PR created (historical): `not_run`", report)
         self.assertIn("Report verified: `pending`", report)
         self.assertIn("Issue delivered: `pending`", report)
         self.assertIn("Telegram sent: `pending`", report)
@@ -2270,20 +2484,26 @@ class CodingIntegrationTests(unittest.TestCase):
 
 
 
-    def _resume(self, *, extra_env: dict[str, str] | None = None):
+    def _resume(self, *, extra_env: dict[str, str] | None = None, allow_adapter: bool = False):
         runner = self.last_runner
         runner.summary = {
             "ok": True, "busy": False, "executed": 0, "rejected": 0, "needs_attention": 0,
             "uploaded": 0, "published": 0, "errors": [], "warnings": [],
         }
         env = self.h.env(extra_env)
+        if allow_adapter:
+            adapter_patch = mock.patch.object(
+                DispatchRunner, "_coding_adapter", autospec=True, return_value=SimpleNamespace()
+            )
+        else:
+            adapter_patch = mock.patch.object(
+                DispatchRunner, "_coding_adapter", side_effect=AssertionError("agent must not run")
+            )
         with mock.patch.dict(os.environ, env, clear=False), mock.patch(
             "agent_handoff.upload.load_config", return_value=self.h.config
         ), mock.patch.object(
             DispatchRunner, "_coding_orchestrator", autospec=True, side_effect=self._fake_orchestrator
-        ), mock.patch.object(
-            DispatchRunner, "_coding_adapter", side_effect=AssertionError("agent must not run")
-        ):
+        ), adapter_patch:
             runner._advance_all(force=True)
         return runner
 
@@ -2314,18 +2534,31 @@ class CodingIntegrationTests(unittest.TestCase):
         self.assertTrue(record["coding"]["blocked"])
         self.assertEqual(publication["remote_state"], "invalid")
         self.assertIn("no longer exists", publication["remote_invalid_reason"])
-        self.assertFalse(record["coding"]["milestones"]["PR_PUBLISHED"])
-        self.assertFalse(record["coding"]["milestones"]["PR_CREATED"])
-        self.assertEqual(milestone_state(record["coding"], "PR_PUBLISHED"), "false")
+        self.assertEqual(record["coding"]["stage"], "ISSUE_UPDATED")
+        self.assertTrue(record["coding"]["milestones"]["PR_PUBLISHED"])
+        self.assertTrue(record["coding"]["milestones"]["PR_CREATED"])
+        self.assertTrue(record["coding"]["milestones"]["BRANCH_PUBLISHED"])
+        self.assertTrue(record["coding"]["milestones"]["REPORT_VERIFIED"])
+        self.assertTrue(record["coding"]["milestones"]["ISSUE_DELIVERED"])
+        self.assertEqual(milestone_state(record["coding"], "PR_PUBLISHED"), "true")
         self.assertEqual(git(["ls-remote", "--heads", str(self.repo["bare"]), branch], self.root).stdout.strip(), "")
         self.assertEqual(len(self.h.comments(21)), 1)
         self.assertEqual(len(json.loads((self.h.gh_dir / "pulls.json").read_text(encoding="utf-8"))), 1)
+        view = record_status_view(record, self.dispatch_cfg)
+        self.assertEqual(view["health"], "attention")
+        self.assertIn("no longer valid", view["next_action"])
         self._resume()
         record, publication = self._publication_record()
         self.assertEqual(record["status"], "NEEDS_ATTENTION")
         self.assertEqual(publication["remote_state"], "invalid")
-        self.assertFalse(record["coding"]["milestones"]["PR_CREATED"])
-        self.assertFalse(record["coding"]["milestones"]["PR_PUBLISHED"])
+        self.assertEqual(record["coding"]["stage"], "ISSUE_UPDATED")
+        self.assertTrue(record["coding"]["milestones"]["PR_CREATED"])
+        self.assertTrue(record["coding"]["milestones"]["PR_PUBLISHED"])
+        with self.assertRaises(CodingPipelineError):
+            self.last_runner.reconcile_remote(repository=GH_REPO, issue=21)
+        after, publication_after = self._publication_record()
+        self.assertEqual(publication_after["remote_state"], "invalid")
+        self.assertTrue(after["coding"]["blocked"])
 
     def test_final_moved_remote_branch_is_not_overwritten(self) -> None:
         self._run()
@@ -2399,6 +2632,45 @@ class CodingIntegrationTests(unittest.TestCase):
         self.assertEqual(record["status"], "NEEDS_ATTENTION")
         self.assertEqual(publication["remote_state"], "unverified_exhausted")
         self.assertIn("could not verify", str(record["coding"].get("blocked_reason")))
+
+    def test_final_exhausted_transient_remote_is_explicitly_reconciled(self) -> None:
+        self._run()
+        marker = self.root / "fail-pull-get-once"
+        for _ in range(2):
+            marker.write_text("1", encoding="utf-8")
+            self._resume(extra_env={"FAKE_GH_FAIL_PULL_GET_FILE": str(marker)})
+        record, publication = self._publication_record()
+        self.assertEqual(record["status"], "NEEDS_ATTENTION")
+        self.assertEqual(publication["remote_state"], "unverified_exhausted")
+        self.assertTrue(record["coding"]["blocked"])
+        runner = self.last_runner
+        runner.summary = {
+            "ok": True, "busy": False, "executed": 0, "rejected": 0, "needs_attention": 0,
+            "uploaded": 0, "published": 0, "errors": [], "warnings": [],
+        }
+        agent_calls_before = len(self.h.opencode_calls())
+        env = self.h.env()
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+            DispatchRunner, "_coding_orchestrator", autospec=True, side_effect=self._fake_orchestrator
+        ), mock.patch.object(
+            DispatchRunner, "_coding_adapter", side_effect=AssertionError("agent must not run")
+        ):
+            result = runner.reconcile_remote(repository=GH_REPO, issue=21)
+            self.assertTrue(result["ok"], result)
+            record, publication = self._publication_record()
+            self.assertEqual(publication["remote_state"], "valid")
+            self.assertFalse(record["coding"]["blocked"])
+            self.assertEqual(record["status"], "ISSUE_UPDATED")
+            self.assertEqual(record["coding"]["stage"], "ISSUE_UPDATED")
+            self.assertTrue(publication.get("remote_verified_at"))
+            self.assertEqual(len(self.h.opencode_calls()), agent_calls_before)
+            self.assertEqual(len(json.loads((self.h.gh_dir / "pulls.json").read_text(encoding="utf-8"))), 1)
+            self.assertEqual(len(self.h.comments(21)), 1)
+            with self.assertRaises(CodingPipelineError):
+                runner.reconcile_remote(repository=GH_REPO, issue=21)
+        self.assertEqual(len(self.h.opencode_calls()), agent_calls_before)
+        self.assertEqual(len(json.loads((self.h.gh_dir / "pulls.json").read_text(encoding="utf-8"))), 1)
+        self.assertEqual(len(self.h.comments(21)), 1)
 
     def test_final_crash_after_pr_creation_reconciles_without_duplicate(self) -> None:
         self._run()
@@ -2479,6 +2751,102 @@ class CodingIntegrationTests(unittest.TestCase):
         self.assertFalse(publication["report_link_updated"])
         self.assertIn("refusing to overwrite", publication["report_link_skip_reason"])
 
+    def test_final_crash_before_pr_persistence_preserves_human_body(self) -> None:
+        self._run()
+        record = self.ledger.get(GH_REPO, 21)
+        self.assertIsNotNone(record)
+        report_url = record["upload"]["report_url"]
+        pulls_path = self.h.gh_dir / "pulls.json"
+        pulls = json.loads(pulls_path.read_text(encoding="utf-8"))
+        pulls[0]["body"] = pulls[0]["body"].replace(report_url, "").rstrip()
+        human_body = pulls[0]["body"] + "\n\nHuman review note: preserve this byte-for-byte.\n"
+        pulls[0]["body"] = human_body
+        pulls_path.write_text(json.dumps(pulls, indent=2), encoding="utf-8")
+
+        def simulate_crash_before_pr_persistence(item: dict) -> None:
+            item["status"] = "EXECUTION_COMPLETED"
+            item["capture"]["status"] = "PENDING"
+            item["upload"].update(
+                {
+                    "status": "PENDING",
+                    "verified": False,
+                    "verified_at": None,
+                    "report_url": None,
+                    "receipt_url": None,
+                    "attempts": 0,
+                    "next_attempt_at": None,
+                }
+            )
+            item["publication"].update(
+                {"status": "PENDING", "comment_url": None, "published_at": None, "attempts": 0, "next_attempt_at": None}
+            )
+            item["coding"]["stage"] = "BRANCH_PUBLISHED"
+            item["coding"]["milestones"].update(
+                {
+                    "PR_CREATED": False,
+                    "PR_PUBLISHED": False,
+                    "REPORT_VERIFIED": False,
+                    "ISSUE_DELIVERED": False,
+                    "REPORT_DELIVERED": False,
+                }
+            )
+            pub = item["coding"]["publication"]
+            for key in (
+                "pr_number",
+                "pr_url",
+                "pr_created",
+                "pr_body_sha256",
+                "pr_body_generated_sha256",
+                "pr_body_sha256_history",
+                "pr_body_external_edit",
+                "pr_body_provenance",
+                "report_link_updated",
+                "report_link_updated_at",
+                "report_link_skip_reason",
+                "report_link_skipped_at",
+                "report_link_next_attempt_at",
+                "report_link_last_error",
+            ):
+                pub.pop(key, None)
+            pub["status"] = "BRANCH_PUBLISHED"
+            pub["report_link_updated"] = False
+
+        self.ledger.update(
+            GH_REPO, 21, simulate_crash_before_pr_persistence, note="simulated crash before PR ledger persistence"
+        )
+        first = self._resume(allow_adapter=True)
+        record = self.ledger.get(GH_REPO, 21)
+        publication = record["coding"]["publication"]
+        self.assertTrue(publication["pr_body_external_edit"])
+        self.assertEqual(publication["pr_body_provenance"], "external")
+        self.assertIn("preserved", publication["report_link_skip_reason"])
+        self.assertFalse(publication["report_link_updated"])
+        self.assertEqual(record["status"], "ISSUE_UPDATED")
+        pulls = json.loads(pulls_path.read_text(encoding="utf-8"))
+        self.assertEqual(pulls[0]["body"], human_body)
+        self.assertEqual(len(pulls), 1)
+        self.assertEqual(len(self.h.comments(21)), 1)
+        self.assertFalse(
+            any("modified outside" in warning for warning in first.summary.get("warnings") or []),
+            first.summary,
+        )
+
+        calls_before = sum(1 for call in self.h.gh_calls() if "PATCH" in call)
+        for _ in range(3):
+            runner = self._resume(allow_adapter=True)
+            self.assertFalse(
+                any("modified outside" in warning for warning in runner.summary.get("warnings") or []),
+                runner.summary,
+            )
+        calls_after = sum(1 for call in self.h.gh_calls() if "PATCH" in call)
+        self.assertEqual(calls_after, calls_before, "a durable skip must prevent repeated PATCH attempts")
+        pulls = json.loads(pulls_path.read_text(encoding="utf-8"))
+        self.assertEqual(pulls[0]["body"], human_body, "human PR text must remain byte-identical")
+        self.assertEqual(len(self.h.comments(21)), 1)
+        self.assertEqual(len(pulls), 1)
+        record = self.ledger.get(GH_REPO, 21)
+        self.assertEqual(record["status"], "ISSUE_UPDATED")
+
     def test_s8_lost_staging_before_push_rebuilds_commit_safely(self) -> None:
         first = self._run()
         self.assertEqual(first["executed"], 1)
@@ -2530,6 +2898,60 @@ class CodingIntegrationTests(unittest.TestCase):
         self.assertEqual(remote_sha, recovered["coding"]["publication"]["commit"])
         self.assertEqual(len(json.loads((self.h.gh_dir / "pulls.json").read_text(encoding="utf-8"))), 1)
         self.assertEqual(len(self.h.comments(21)), 1)
+
+    def test_s8_crash_after_capture_retries_disposable_workspace_cleanup(self) -> None:
+        self._run()
+        record = self.ledger.get(GH_REPO, 21)
+        workspace = Path(record["coding"]["workspace"])
+        self.assertTrue(workspace.is_dir())
+        if os.geteuid() == 0:
+            import pwd
+
+            account = pwd.getpwnam("nobody")
+            cleanup_identity = {
+                **fake_identity(),
+                "uid": int(account.pw_uid),
+                "gid": int(account.pw_gid),
+                "user": "nobody",
+            }
+        else:
+            cleanup_identity = {
+                **fake_identity(),
+                "uid": os.getuid(),
+                "gid": os.getgid(),
+            }
+        if os.geteuid() == 0:
+            os.chown(workspace, cleanup_identity["uid"], cleanup_identity["gid"])
+        self.dispatch_cfg["execution"]["isolation"]["identity"] = cleanup_identity
+        self.dispatch_cfg["projects"]["Alpha"]["coding"]["cleanup_on_success"] = True
+
+        def crash_after_capture(item: dict) -> None:
+            item["status"] = "REPORT_CAPTURED"
+            item["upload"].update({"status": "PENDING", "verified": False, "report_url": None})
+            item["coding"]["workspace"] = str(workspace)
+            item["coding"]["cleaned_up"] = False
+
+        self.ledger.update(GH_REPO, 21, crash_after_capture, note="simulated crash after capture")
+        runner = self.last_runner
+        runner.summary = {
+            "ok": True, "busy": False, "executed": 0, "rejected": 0, "needs_attention": 0,
+            "uploaded": 0, "published": 0, "errors": [], "warnings": [],
+        }
+        agent_calls_before = len(self.h.opencode_calls())
+        env = self.h.env()
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch(
+            "agent_handoff.upload.load_config", return_value=self.h.config
+        ), mock.patch.object(
+            DispatchRunner, "_coding_orchestrator", autospec=True, side_effect=self._fake_orchestrator
+        ), mock.patch.object(
+            DispatchRunner, "_coding_adapter", autospec=True, return_value=SimpleNamespace()
+        ), mock.patch.object(DispatchRunner, "_upload_and_publish", autospec=True):
+            runner._advance_all(force=True)
+        self.assertFalse(workspace.exists(), "the completed task workspace must be removed on recovery")
+        current = self.ledger.get(GH_REPO, 21)
+        self.assertTrue(current["coding"].get("cleaned_up"))
+        self.assertIsNone(current["coding"].get("workspace"))
+        self.assertEqual(len(self.h.opencode_calls()), agent_calls_before)
 
     def test_s8_interrupted_publication_cleanup_is_retried_without_new_comment(self) -> None:
         with mock.patch.object(TrustedPublisher, "cleanup", return_value=True), mock.patch.object(
@@ -3396,6 +3818,75 @@ class TestDurableMilestoneReconciliation(unittest.TestCase):
         self.assertTrue(updated["coding"]["milestones"]["PR_CREATED"])
         self.assertTrue(updated["coding"]["milestones"]["PR_PUBLISHED"])
         self.assertEqual(updated["coding"]["publication"]["pr_url"], "https://github.test/dev/coding-repo/pull/8")
+
+    def test_s7_delivery_milestones_reconcile_when_remote_is_invalid(self) -> None:
+        def apply(item: dict) -> None:
+            item["status"] = "NEEDS_ATTENTION"
+            item["upload"].update(
+                {
+                    "status": "VERIFIED",
+                    "verified": True,
+                    "verified_at": "2026-01-01T00:00:00Z",
+                    "report_url": "https://drive.google.com/file/d/rec/view",
+                }
+            )
+            item["publication"].update(
+                {"status": "PUBLISHED", "published_at": "2026-01-01T00:00:10Z"}
+            )
+            pub = item["coding"]["publication"]
+            pub.update(
+                {
+                    "remote_state": "invalid",
+                    "remote_invalid_reason": "the published remote branch no longer exists",
+                }
+            )
+            item["coding"]["blocked"] = True
+            item["coding"]["blocked_stage"] = "PR_CREATED"
+            item["coding"]["blocked_reason"] = "remote branch deleted"
+            item["coding"]["stage"] = "ISSUE_UPDATED"
+            item["coding"]["milestones"].update(
+                {
+                    "BRANCH_PUBLISHED": True,
+                    "PR_CREATED": True,
+                    "PR_PUBLISHED": True,
+                    "REPORT_VERIFIED": False,
+                    "ISSUE_DELIVERED": False,
+                    "REPORT_DELIVERED": False,
+                }
+            )
+
+        self._update(apply)
+        updated = self.runner._reconcile_coding_milestones(self.ledger.get(GH_REPO, 101))
+        milestones = updated["coding"]["milestones"]
+        self.assertTrue(milestones["REPORT_VERIFIED"])
+        self.assertTrue(milestones["ISSUE_DELIVERED"])
+        self.assertTrue(milestones["REPORT_DELIVERED"])
+        self.assertTrue(milestones["PR_CREATED"])
+        self.assertTrue(milestones["PR_PUBLISHED"])
+        self.assertEqual(updated["coding"]["stage"], "ISSUE_UPDATED")
+        self.assertEqual(updated["coding"]["publication"]["remote_state"], "invalid")
+
+    def test_s7_stale_pr_url_does_not_restore_invalidated_pr_milestones(self) -> None:
+        def apply(item: dict) -> None:
+            item["coding"]["publication"].update(
+                {
+                    "remote_state": "invalid",
+                    "remote_invalid_reason": "the recorded Draft PR no longer exists",
+                }
+            )
+            item["coding"]["blocked"] = True
+            item["coding"]["blocked_stage"] = "PR_CREATED"
+            item["coding"]["stage"] = "PR_CREATED"
+            item["coding"]["milestones"].update(
+                {"BRANCH_PUBLISHED": False, "PR_CREATED": False, "PR_PUBLISHED": False}
+            )
+
+        self._update(apply)
+        updated = self.runner._reconcile_coding_milestones(self.ledger.get(GH_REPO, 101))
+        milestones = updated["coding"]["milestones"]
+        self.assertFalse(milestones["BRANCH_PUBLISHED"])
+        self.assertFalse(milestones["PR_CREATED"])
+        self.assertFalse(milestones["PR_PUBLISHED"])
 
     def test_s7_failed_tests_never_gain_tests_passed_milestone(self) -> None:
         self._update(

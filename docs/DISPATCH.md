@@ -305,7 +305,8 @@ Writes are atomic; ledger mutations use `flock`. Only one dispatcher runner lock
 | Coding: tests failed/timed out/blocked, or failure persisted before the blocked flag | The mandatory test gate fails closed on resume; no commit, branch, or Draft PR is created. Failure evidence is preserved and the agent/tests are not rerun. |
 | Coding: during tests or diff validation | The persisted disposable workspace is revalidated (lstat-first identity, base, origin, and manifest), then tests/diff validation rerun; the agent is not rerun. Missing test evidence at a publication stage blocks. |
 | Coding: after commit, before push | The parent-owned staging commit is reused. If staging is lost and the remote branch is absent, an unpublished commit is safely rebuilt; if the remote branch exists with a different SHA, publication is refused. |
-| Coding: already published branch/PR | Resume/reconciliation reverifies the live branch SHA and open Draft PR metadata (repository/branch/base/head SHA). Deleted, moved, closed, merged, Ready-for-review, or mismatched artifacts become `NEEDS_ATTENTION` with the historical evidence preserved and no recreation. Transient GitHub/Git failures retry with bounded backoff. Ordinary polling avoids repeated requests with a five-minute verification interval; forced reconciliation checks immediately. |
+| Coding: already published branch/PR | Resume/reconciliation reverifies the live branch SHA and open Draft PR metadata (repository/branch/base/head SHA). Deleted, moved, closed, merged, Ready-for-review, or mismatched artifacts set `remote_state=invalid` and become `NEEDS_ATTENTION`; the durable stage stays monotonic, historical publication milestones are preserved as history, and the artifact is not recreated. Transient GitHub/Git failures retry with bounded backoff. Ordinary polling avoids repeated requests with a five-minute verification interval; forced reconciliation checks immediately. |
+| Coding: transient remote verification exhausted | Ordinary polling stops retrying after the bounded budget and marks the record `NEEDS_ATTENTION` with `remote_state=unverified_exhausted`. After GitHub recovers, `agent-handoff dispatch reconcile --issue <number>` performs one GET-only recheck of the existing branch and Draft PR. The block clears only on authoritative success; deterministic `invalid` is never recovered this way. No agent, branch, PR, Issue comment, or notification is repeated. |
 | Coding: push succeeds, response lost | Remote branch SHA is queried; the same commit is accepted idempotently. |
 | Coding: PR created, response lost | The PR is recovered by task branch and body marker; no duplicate is created. |
 | Coding: report upload fails after PR publication | Only upload/publication retries; the agent and PR are not repeated. |
@@ -436,6 +437,9 @@ agent-handoff dispatch inspect --task <task-id> --run <run-id> --json
 agent-handoff dispatch deliver --task <task-id> --run <run-id> \
   --issue <number> --repository owner/private-dispatch --json
 
+# Reverify one exhausted transient remote publication; GET only, no agent or artifacts
+agent-handoff dispatch reconcile --issue <number> --json
+
 # Inspect the notification outbox without sending anything
 agent-handoff dispatch notify --json
 agent-handoff dispatch notify --all --json
@@ -540,6 +544,7 @@ agent-handoff dispatch status --json
 - `UPLOAD_PENDING`: Drive unavailable or verification failed. Retry upload only. `dispatch status` shows the next retry and the exact action.
 - `UPLOAD_VERIFIED`: publication pending/failed. Retry comment only. The verified upload is reused.
 - `NEEDS_ATTENTION`: an execution was uncertain and no recoverable output exists. Inspect the host and session evidence; do not blindly rerun. Submit a new issue if the work must be repeated.
+- Coding `remote_state=unverified_exhausted`: after GitHub recovers, run `agent-handoff dispatch reconcile --issue <number>`. It performs GET verification only. Coding `remote_state=invalid` is deterministic and not recoverable by that command; inspect the host and GitHub, preserve the historical evidence, and submit a new Issue if needed.
 - `REJECTED`: malformed or unauthorized request. A new, corrected issue is required; editing an old rejected issue does not automatically execute it.
 
 Notification-only states are reported separately from the task record:

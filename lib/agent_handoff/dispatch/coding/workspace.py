@@ -18,6 +18,7 @@ from .changes import ChangeValidationError, SafeGit
 
 WORKSPACE_NAME_RE = re.compile(r"^issue-[0-9]{1,20}-[A-Za-z0-9_-]{1,64}$")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+CLEANUP_DENIED_COMPONENTS = ("rabet", "yakfi", "nokmel")
 
 
 class WorkspacePreparationError(RuntimeError):
@@ -343,6 +344,7 @@ def cleanup_workspace(
     *,
     identity: Mapping[str, Any] | None = None,
     expected_name: str | None = None,
+    source_workspace: str | None = None,
 ) -> bool:
     try:
         original = os.lstat(workspace)
@@ -361,14 +363,36 @@ def cleanup_workspace(
         return False
     if expected_name is not None and name != expected_name:
         return False
+    if source_workspace:
+        source = os.path.realpath(source_workspace)
+        if (
+            target == source
+            or target.startswith(source.rstrip("/") + "/")
+            or source.startswith(target.rstrip("/") + "/")
+        ):
+            return False
+    components = {part.lower() for part in Path(target).parts if part and part != "/"}
+    if components & set(CLEANUP_DENIED_COMPONENTS):
+        return False
     if not os.path.isdir(target):
         return True
-    if identity and os.geteuid() == 0:
+    try:
+        entry = os.lstat(target)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(entry.st_mode):
+        return False
+    if entry.st_mode & 0o077:
+        return False
+    if identity:
         try:
-            entry = os.lstat(target)
-            if entry.st_uid != int(identity.get("uid", -1)):
-                return False
-        except OSError:
+            uid = int(identity.get("uid", -1))
+            gid = int(identity.get("gid", -1))
+        except (TypeError, ValueError):
+            return False
+        if uid <= 0 or gid <= 0:
+            return False
+        if entry.st_uid != uid or entry.st_gid != gid:
             return False
     shutil.rmtree(target)
     return not os.path.lexists(target)

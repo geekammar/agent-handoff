@@ -249,30 +249,70 @@ class CodingOrchestrator:
         except (TypeError, ValueError):
             return 3
 
+    def _remote_health_block(
+        self,
+        current: dict[str, Any],
+        *,
+        health_stage: str,
+        reason: str,
+        state: str,
+        publication_updates: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Record a current remote-health problem without rewriting history.
+
+        The durable stage remains monotonic. Historical publication milestones
+        stay recorded; ``remote_state`` is the separate current-health view.
+        """
+
+        safe_reason = self._safe_text(reason, 1200)
+
+        def mutate(coding: dict[str, Any]) -> None:
+            pub = coding.setdefault("publication", {})
+            pub.update(dict(publication_updates))
+            coding["blocked"] = True
+            coding["blocked_stage"] = health_stage
+            coding["blocked_reason"] = safe_reason
+            coding["artifacts_preserved"] = True
+            coding["current_health"] = state
+            coding["current_health_stage"] = health_stage
+            history = coding.setdefault("stage_history", [])
+            history.append(
+                {
+                    "at": utcnow_iso(),
+                    "stage": str(coding.get("stage") or health_stage),
+                    "note": f"remote health {state}: {safe_reason[:300]}",
+                }
+            )
+            if len(history) > 120:
+                coding["stage_history"] = history[-120:]
+
+        updated = self._set_coding(
+            mutate,
+            note=f"coding remote health changed to {state}: {safe_reason}",
+            top_status="EXECUTION_COMPLETED",
+            updates={"attention_reason": safe_reason},
+        )
+        self._emit("coding_blocked", f"coding remote state is {state}; evidence and history are preserved")
+        self.log(f"coding remote state {state}: {safe_reason}")
+        return updated
+
     def _mark_remote_invalid(self, current: dict[str, Any], reason: str) -> dict[str, Any]:
         coding = current.get("coding") or {}
         publication = coding.get("publication") or {}
         stage = "PR_CREATED" if publication.get("pr_url") else "BRANCH_PUBLISHED"
         safe_reason = self._safe_text(reason, 1200)
-
-        def extra(item: dict[str, Any]) -> None:
-            pub = item.setdefault("publication", {})
-            pub.update(
-                {
-                    "remote_state": "invalid",
-                    "remote_invalidated_at": utcnow_iso(),
-                    "remote_invalid_reason": safe_reason,
-                    "remote_last_error": safe_reason,
-                }
-            )
-            milestones = item.setdefault("milestones", {})
-            milestones["PR_CREATED"] = False
-            milestones["PR_PUBLISHED"] = False
-
-        return self._block(
-            stage,
-            f"the published remote state is no longer valid: {safe_reason}",
-            extra=extra,
+        return self._remote_health_block(
+            current,
+            health_stage=stage,
+            reason=f"the published remote state is no longer valid: {safe_reason}",
+            state="invalid",
+            publication_updates={
+                "remote_state": "invalid",
+                "remote_invalidated_at": utcnow_iso(),
+                "remote_invalid_reason": safe_reason,
+                "remote_last_error": safe_reason,
+                "remote_check_next_at": None,
+            },
         )
 
     def _schedule_remote_check_retry(
@@ -285,21 +325,20 @@ class CodingOrchestrator:
         maximum = self._remote_max_attempts()
         safe_error = self._safe_text(error, 1200)
         if attempts >= maximum:
-            def extra(item: dict[str, Any]) -> None:
-                pub = item.setdefault("publication", {})
-                pub.update(
-                    {
-                        "remote_state": "unverified_exhausted",
-                        "remote_check_attempts": attempts,
-                        "remote_last_error": safe_error,
-                        "remote_check_next_at": None,
-                    }
-                )
-
-            return self._block(
-                stage,
-                f"could not verify the published remote state after {attempts} attempt(s): {safe_error}",
-                extra=extra,
+            return self._remote_health_block(
+                current,
+                health_stage=stage,
+                reason=(
+                    f"could not verify the published remote state after {attempts} attempt(s): "
+                    f"{safe_error}; use `agent-handoff dispatch reconcile --issue <number>` after GitHub recovers"
+                ),
+                state="unverified_exhausted",
+                publication_updates={
+                    "remote_state": "unverified_exhausted",
+                    "remote_check_attempts": attempts,
+                    "remote_last_error": safe_error,
+                    "remote_check_next_at": None,
+                },
             )
         next_at = publication_backoff(attempts, 60)
 
@@ -354,6 +393,7 @@ class CodingOrchestrator:
                 )
         publisher = self._adopt_publisher()
         try:
+            publisher.verify_repository()
             verified = publisher.verify_published_state(
                 branch=branch,
                 commit=commit,
@@ -392,6 +432,153 @@ class CodingOrchestrator:
         updated = self._set_coding(update, note="verified published remote branch and Draft PR state")
         self._emit("coding_verified", "published remote branch and Draft PR state are still valid")
         return updated
+
+    def recover_blocked_remote(self) -> dict[str, Any]:
+        """Explicitly verify a transiently exhausted remote publication.
+
+        Deterministic ``invalid`` state is never recoverable here. This method
+        performs GET verification only: it never executes OpenCode, pushes a
+        branch, creates a PR, posts a comment, or sends a notification.
+        """
+
+        current = self._fresh()
+        coding = current.get("coding") or {}
+        publication = coding.get("publication") or {}
+        state = str(publication.get("remote_state") or "")
+        if not (coding.get("blocked") and state == "unverified_exhausted"):
+            if state == "invalid":
+                raise CodingPipelineError(
+                    "the recorded remote publication state is deterministically invalid; "
+                    "it is not recoverable by reconciliation"
+                )
+            raise CodingPipelineError(
+                "the coding record is not blocked by an exhausted transient remote-verification failure"
+            )
+        branch = str(publication.get("branch") or "")
+        commit = str(publication.get("commit") or "")
+        if not branch or not commit:
+            updated = self._mark_remote_invalid(
+                current, "the recorded publication branch or commit is missing"
+            )
+            return {
+                "ok": False,
+                "remote_state": "invalid",
+                "record": updated,
+                "error": "the recorded publication branch or commit is missing",
+            }
+        pr_number = publication.get("pr_number")
+        try:
+            pr_number = int(pr_number) if pr_number is not None else None
+        except (TypeError, ValueError):
+            pr_number = None
+        if pr_number is None and publication.get("pr_url"):
+            pr_number = TrustedPublisher.pr_number_from_url(str(publication.get("pr_url")))
+        publisher = self._adopt_publisher()
+        try:
+            publisher.verify_repository()
+            verified = publisher.verify_published_state(
+                branch=branch,
+                commit=commit,
+                pr_number=pr_number,
+                pr_url=str(publication.get("pr_url") or "") or None,
+            )
+        except RemoteStateError as exc:
+            updated = self._mark_remote_invalid(current, str(exc))
+            return {
+                "ok": False,
+                "remote_state": "invalid",
+                "record": updated,
+                "error": self._safe_text(str(exc), 800),
+            }
+        except (PublicationError, OSError) as exc:
+            error = self._safe_text(str(exc), 800)
+            attempts = int(publication.get("remote_check_attempts", 0) or 0)
+
+            def update(item: dict[str, Any]) -> None:
+                item.setdefault("publication", {}).update(
+                    {
+                        "remote_check_attempts": attempts,
+                        "remote_last_error": error,
+                        "remote_check_next_at": None,
+                    }
+                )
+
+            updated = self._set_coding(
+                update,
+                note="explicit remote reconciliation failed transiently; the record remains blocked",
+            )
+            return {
+                "ok": False,
+                "remote_state": "unverified_exhausted",
+                "record": updated,
+                "error": error,
+            }
+        now = utcnow_iso()
+        milestones = coding.get("milestones") or {}
+        delivered = bool(
+            milestones.get("ISSUE_DELIVERED") or milestones.get("REPORT_DELIVERED")
+        )
+        upload_verified = bool((current.get("upload") or {}).get("verified"))
+        if delivered:
+            top_status = "ISSUE_UPDATED"
+        elif upload_verified:
+            top_status = "UPLOAD_VERIFIED"
+        elif milestones.get("AGENT_COMPLETED") or publication.get("pr_url"):
+            top_status = "EXECUTION_COMPLETED"
+        else:
+            top_status = "CLAIMED"
+
+        def update(item: dict[str, Any]) -> None:
+            pub = item.setdefault("publication", {})
+            pub.update(
+                {
+                    "remote_state": "valid",
+                    "remote_checked_at": now,
+                    "remote_verified_at": now,
+                    "remote_check_attempts": 0,
+                    "remote_check_next_at": None,
+                    "remote_last_error": None,
+                    "remote_invalid_reason": None,
+                    "remote_recovered_at": now,
+                    "remote_branch_sha": verified.get("branch_sha"),
+                }
+            )
+            pr = verified.get("pr") or {}
+            if pr:
+                pub.update(
+                    {
+                        "remote_pr_state": str(pr.get("state") or ""),
+                        "remote_pr_draft": bool(pr.get("draft")),
+                        "remote_pr_head_sha": str((pr.get("head") or {}).get("sha") or ""),
+                    }
+                )
+            item["blocked"] = False
+            item["blocked_stage"] = None
+            item["blocked_reason"] = None
+            item["current_health"] = None
+            item["current_health_stage"] = None
+            history = item.setdefault("stage_history", [])
+            history.append(
+                {
+                    "at": now,
+                    "stage": str(item.get("stage") or ""),
+                    "note": "remote publication verified by explicit operator reconciliation",
+                }
+            )
+            if len(history) > 120:
+                item["stage_history"] = history[-120:]
+
+        updated = self._set_coding(
+            update,
+            note="explicit remote reconciliation verified the existing branch and Draft PR",
+            top_status=top_status,
+            updates={"attention_reason": None},
+        )
+        self._emit(
+            "coding_verified",
+            "existing remote branch and Draft PR verified by explicit reconciliation; no artifact was created",
+        )
+        return {"ok": True, "remote_state": "valid", "record": updated, "error": None}
 
     def _expected_workspace_name(self) -> str:
         return f"issue-{int(self.record['issue_number'])}-{self.task_id}"
@@ -1248,17 +1435,30 @@ class CodingOrchestrator:
             )
         except (PublicationError, OSError) as exc:
             return self._publication_retry(current, stage="PR_CREATED", error=str(exc), force=force)
-        expected_body_sha = TrustedPublisher.body_sha256(body)
-        remote_body_sha = str(result.get("body_sha256") or expected_body_sha)
+        generated_body_sha = TrustedPublisher.body_sha256(body)
+        remote_body_sha = str(result.get("body_sha256") or generated_body_sha)
+        created = bool(result.get("created"))
         external_edit = bool(
-            not result.get("created")
-            and (not result.get("body_sha256") or remote_body_sha != expected_body_sha)
+            not created
+            and (not result.get("body_sha256") or remote_body_sha != generated_body_sha)
         )
         history = list(publication.get("pr_body_sha256_history") or [])
         if external_edit:
             history = []
-        elif expected_body_sha not in history:
-            history.append(expected_body_sha)
+        else:
+            generated_sha = generated_body_sha
+            if generated_sha not in history:
+                history.append(generated_sha)
+        generated_sha = generated_body_sha if not external_edit else None
+        provenance = "external" if external_edit else "generated"
+        skip_reason = None
+        skipped_at = None
+        if external_edit:
+            skip_reason = (
+                "the Draft PR body was modified outside Agent Handoff; the verified report link "
+                "was not written, and the existing body was preserved"
+            )
+            skipped_at = utcnow_iso()
         updated = self._stage(
             "PR_CREATED",
             note=f"Draft Pull Request recorded: {result.get('pr_url')}",
@@ -1267,14 +1467,20 @@ class CodingOrchestrator:
                     "publication": {
                         "pr_number": result.get("pr_number"),
                         "pr_url": result.get("pr_url"),
-                        "pr_created": bool(result.get("created")),
+                        "pr_created": created,
                         "draft": bool(result.get("draft", True)),
                         "last_error": None,
                         "next_attempt_at": None,
                         "status": "PR_CREATED",
                         "pr_body_sha256": remote_body_sha,
+                        "pr_body_generated_sha256": generated_sha,
                         "pr_body_sha256_history": history[-10:],
                         "pr_body_external_edit": external_edit,
+                        "pr_body_provenance": provenance,
+                        "report_link_skip_reason": skip_reason,
+                        "report_link_skipped_at": skipped_at,
+                        "report_link_last_error": None if external_edit else publication.get("report_link_last_error"),
+                        "report_link_next_attempt_at": None if external_edit else publication.get("report_link_next_attempt_at"),
                     }
                 }
             },

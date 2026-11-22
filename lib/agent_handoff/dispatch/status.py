@@ -198,7 +198,27 @@ def record_status_view(
             view["telegram_state"] = "PENDING"
         else:
             view["telegram_state"] = "NOT_QUEUED"
-        if status == "EXECUTION_COMPLETED":
+        if status == "NEEDS_ATTENTION" and coding.get("remote_state") in ("invalid", "unverified_exhausted"):
+            health = ATTENTION
+            phase = (
+                "coding_remote_invalid"
+                if coding.get("remote_state") == "invalid"
+                else "coding_remote_unverified"
+            )
+            detail = coding.get("remote_invalid_reason") or coding.get("blocked_reason") or "review required"
+            if coding.get("remote_state") == "unverified_exhausted":
+                next_action = (
+                    f"Published remote state could not be verified: {detail}. After GitHub recovers, run "
+                    "agent-handoff dispatch reconcile --issue <number> to verify the existing branch and Draft PR. "
+                    "The agent, branch push, PR creation, comment, and notification are not repeated."
+                )
+            else:
+                next_action = (
+                    f"Previously published remote state is no longer valid: {detail}. The historical branch/PR "
+                    "evidence and delivered report milestones are preserved, but the Draft PR must not be treated "
+                    "as currently valid. Inspect the host and GitHub before submitting a new Issue."
+                )
+        elif status == "EXECUTION_COMPLETED":
             if coding.get("blocked"):
                 health = ATTENTION
                 phase = "coding_blocked"
@@ -236,7 +256,14 @@ def record_status_view(
                 )
             else:
                 coding_pub = (view.get("coding") or {})
-                if not coding_pub.get("report_link_updated") and coding_pub.get("report_link_next_attempt_at"):
+                skip_reason = coding_pub.get("report_link_skip_reason")
+                if skip_reason:
+                    next_action = (
+                        "Report and Issue are delivered. The existing Draft PR body was modified outside "
+                        f"Agent Handoff and was preserved: {skip_reason} Use the Issue comment for the verified "
+                        "report URL. Do not create a second PR."
+                    )
+                elif not coding_pub.get("report_link_updated") and coding_pub.get("report_link_next_attempt_at"):
                     next_action = (
                         "Report and Issue are delivered. A retry is scheduled to add the verified report link "
                         f"to the existing Draft PR body after {coding_pub.get('report_link_next_attempt_at')}. "
@@ -325,15 +352,25 @@ def format_status_view(view: dict[str, Any]) -> list[str]:
     if view.get("coding_stage"):
         milestones = view.get("milestones") or {}
         tests_status = view.get("tests_status") or "not_run"
+        remote_state = str((view.get("coding") or {}).get("remote_state") or "unknown")
         lines.append(
             f"      coding stage: {view['coding_stage']} · tests={tests_status} "
             f"· agent={bool(milestones.get('agent_completed'))} "
             f"· diff={bool(milestones.get('diff_validated'))} "
             f"· commit={bool(milestones.get('commit_created'))} "
             f"· pr={bool(milestones.get('pr_published'))} "
+            f"· remote={remote_state} "
             f"· report={bool(milestones.get('report_delivered'))} "
             f"· telegram={view.get('telegram_state') or 'unknown'}"
         )
+        if remote_state in ("invalid", "unverified_exhausted"):
+            lines.append(
+                f"      remote publication: historically published={bool((view.get('coding') or {}).get('historical_branch_published'))}; "
+                f"currently valid=false; state={remote_state}"
+            )
+        skip_reason = (view.get("coding") or {}).get("report_link_skip_reason")
+        if skip_reason:
+            lines.append(f"      Draft PR body: preserved; report link not written ({skip_reason})")
     if (view.get("publication") or {}).get("comment_url"):
         lines.append(f"      delivery comment: {view['publication']['comment_url']}")
     if view.get("next_attempt_at"):
