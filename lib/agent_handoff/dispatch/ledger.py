@@ -344,8 +344,12 @@ def safe_record_summary(record: dict[str, Any]) -> dict[str, Any]:
                 "pr_created": bool(milestones.get("PR_CREATED") or milestones.get("PR_PUBLISHED")),
                 "pr_published": bool(milestones.get("PR_PUBLISHED")),
                 "report_verified": bool(milestones.get("REPORT_VERIFIED")),
-                "issue_delivered": bool(milestones.get("ISSUE_DELIVERED")),
-                "report_delivered": bool(milestones.get("REPORT_DELIVERED")),
+                "issue_delivered": bool(
+                    milestones.get("ISSUE_DELIVERED") or milestones.get("REPORT_DELIVERED")
+                ),
+                "report_delivered": bool(
+                    milestones.get("REPORT_DELIVERED") or milestones.get("ISSUE_DELIVERED")
+                ),
                 "telegram_sent": bool(milestones.get("TELEGRAM_SENT")),
             },
             "publication_attempts": coding_publication.get("attempts", 0),

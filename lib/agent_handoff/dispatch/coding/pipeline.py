@@ -8,11 +8,13 @@ from ...util import sanitize_error, utcnow_iso
 from ..delivery import publication_backoff
 from ..security import validate_model_auth
 from .changes import ChangeValidationError, SafeGit, validate_changes
+from .milestones import CODING_STAGES, PER_STAGE_ORDER
 from .publication import (
     PublicationError,
     TrustedPublisher,
     build_branch,
     build_pr_body,
+    build_pr_title,
 )
 from .testrunner import TestExecutionError, run_test_profile
 from .workspace import (
@@ -23,22 +25,6 @@ from .workspace import (
     verify_source_repository,
 )
 
-CODING_STAGES = (
-    "REQUEST_ACCEPTED",
-    "WORKSPACE_PREPARED",
-    "AGENT_RUNNING",
-    "AGENT_COMPLETED",
-    "TESTING",
-    "VALIDATING_DIFF",
-    "COMMIT_PREPARED",
-    "BRANCH_PUBLISHED",
-    "PR_CREATED",
-    "REPORT_CAPTURED",
-    "UPLOAD_VERIFIED",
-    "ISSUE_UPDATED",
-    "NOTIFICATION_SENT",
-)
-PER_STAGE_ORDER = {name: index for index, name in enumerate(CODING_STAGES)}
 PUBLICATION_LIMITATIONS = (
     "Unix UID/GID isolation is not a kernel or network sandbox.",
     "The dispatcher parent still owns GitHub, Drive, and Telegram credentials.",
@@ -710,8 +696,10 @@ class CodingOrchestrator:
         branch = str(publication.get("branch") or "")
         commit = str(publication.get("commit") or "")
         project_name = str((current.get("project") or {}).get("name") or "project")
-        title_prefix = str(self.publication.get("pr_title_prefix") or "Agent Handoff: ")
-        title = title_prefix + str(current.get("issue_title") or f"issue #{self.record['issue_number']}")
+        title = build_pr_title(
+            self.publication.get("pr_title_prefix"),
+            str(current.get("issue_title") or f"issue #{self.record['issue_number']}"),
+        )
         body = build_pr_body(
             task_id=self.task_id,
             run_id=self.run_id,

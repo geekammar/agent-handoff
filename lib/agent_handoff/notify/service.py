@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..config import all_projects, storage_path
+from ..dispatch.coding.milestones import PER_STAGE_ORDER
 from ..dispatch.ledger import Ledger
 from ..util import sanitize_error, utcnow_iso
 from .config import NotificationConfigError, validate_notification_config
@@ -302,6 +303,47 @@ class NotificationService:
         result["_new"] = is_new
         return result
 
+    def _record_telegram_sent(self, notification: dict[str, Any], stored: dict[str, Any]) -> None:
+        """Record an acknowledged Telegram API send without affecting delivery."""
+
+        if str(notification.get("kind") or "") != DELIVERY_COMPLETED:
+            return
+        if self.ledger is None:
+            return
+        repository = str(notification.get("repository") or "").strip()
+        issue_number = notification.get("issue_number")
+        if not repository or issue_number is None:
+            return
+        try:
+            number = int(issue_number)
+        except (TypeError, ValueError):
+            return
+        sent_at = str(stored.get("sent_at") or utcnow_iso())
+        message_id = stored.get("telegram_message_id")
+
+        def apply(item: dict[str, Any]) -> None:
+            coding = item.get("coding")
+            if not isinstance(coding, dict):
+                return
+            coding.setdefault("milestones", {})["TELEGRAM_SENT"] = True
+            coding["telegram_sent_at"] = sent_at
+            coding["telegram_message_id"] = message_id
+            current = str(coding.get("stage") or "")
+            if PER_STAGE_ORDER.get("NOTIFICATION_SENT", -1) >= PER_STAGE_ORDER.get(current, -1):
+                coding["stage"] = "NOTIFICATION_SENT"
+
+        try:
+            self.ledger.update(
+                repository,
+                number,
+                apply,
+                note="Telegram API send acknowledged",
+            )
+        except Exception as exc:
+            # The notification is already sent. A ledger update failure must
+            # never change notification state or trigger a duplicate send.
+            self._log_safe(f"Telegram milestone ledger write failed independently: {exc}")
+
     def enqueue_completed(self, record: dict[str, Any]) -> dict[str, Any] | None:
         upload = record.get("upload") or {}
         publication = record.get("publication") or {}
@@ -591,7 +633,8 @@ class NotificationService:
                 }
             if sent.get("ok"):
                 try:
-                    self.store.mark_sent(notification, sent.get("message_id"))
+                    stored = self.store.mark_sent(notification, sent.get("message_id"))
+                    self._record_telegram_sent(claimed, stored)
                     result["sent"] += 1
                 except Exception as exc:
                     result["errors"].append(self._clean(f"notification result write failed: {exc}"))

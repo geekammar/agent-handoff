@@ -33,11 +33,13 @@ from agent_handoff.dispatch.coding.config import (  # noqa: E402
     validate_branch_name,
 )
 from agent_handoff.dispatch.coding.pipeline import CodingOrchestrator  # noqa: E402
+from agent_handoff.dispatch.coding.milestones import milestone_state  # noqa: E402
 from agent_handoff.dispatch.coding.publication import (  # noqa: E402
     PublicationError,
     TrustedPublisher,
     build_branch,
     build_pr_body,
+    build_pr_title,
     pr_marker,
 )
 from agent_handoff.dispatch.coding.report import coding_outcome, coding_report_sections  # noqa: E402
@@ -52,7 +54,7 @@ from agent_handoff.dispatch.coding.workspace import (  # noqa: E402
     prepare_workspace,
 )
 from agent_handoff.dispatch.config import validate_dispatch_config  # noqa: E402
-from agent_handoff.dispatch.ledger import Ledger, new_coding_state, new_dispatch_record  # noqa: E402
+from agent_handoff.dispatch.ledger import Ledger, new_coding_state, new_dispatch_record, safe_record_summary  # noqa: E402
 from agent_handoff.dispatch.status import format_status_view, record_status_view  # noqa: E402
 from agent_handoff.dispatch.requests import (  # noqa: E402
     RequestError,
@@ -61,7 +63,8 @@ from agent_handoff.dispatch.requests import (  # noqa: E402
 )
 from agent_handoff.dispatch.runner import DispatchRunner  # noqa: E402
 from agent_handoff.dispatch.security import DEFAULT_CHILD_PATH, IsolationError, popen_isolation_kwargs  # noqa: E402
-from agent_handoff.notify.messages import build_telegram_message  # noqa: E402
+from agent_handoff.notify.messages import DELIVERY_COMPLETED, build_telegram_message  # noqa: E402
+from agent_handoff.notify.service import NotificationService  # noqa: E402
 from agent_handoff.util import utcnow_iso  # noqa: E402
 
 UID = 4242
@@ -1221,6 +1224,353 @@ class TestPublicationAndReporting(unittest.TestCase):
         self.assertEqual(coding_outcome(record), "draft_pr_published")
 
 
+class TestDeliveryMilestoneReporting(unittest.TestCase):
+    def _record(self, **coding_overrides) -> dict:
+        coding = {
+            "stage": "PR_CREATED",
+            "base_commit": "a" * 40,
+            "blocked": False,
+            "tests": {"status": "passed"},
+            "publication": {
+                "branch": "agent-handoff/alpha/issue-5-t-test",
+                "commit": "b" * 40,
+                "pr_url": "https://github.test/dev/coding-repo/pull/7",
+            },
+            "milestones": {
+                "AGENT_COMPLETED": True,
+                "TESTS_PASSED": True,
+                "DIFF_VALIDATED": True,
+                "COMMIT_CREATED": True,
+                "BRANCH_PUBLISHED": True,
+                "PR_CREATED": True,
+                "PR_PUBLISHED": True,
+                "REPORT_VERIFIED": False,
+                "ISSUE_DELIVERED": False,
+                "REPORT_DELIVERED": False,
+                "TELEGRAM_SENT": False,
+            },
+        }
+        coding.update(coding_overrides)
+        return {
+            "task_type": "coding",
+            "repository": GH_REPO,
+            "issue_number": 5,
+            "issue_url": "https://github.test/issues/5",
+            "project": {"name": "Alpha"},
+            "agent": "opencode",
+            "model": "provider/model-fast",
+            "session": {"id": "ses_test"},
+            "execution": {"outcome": "succeeded"},
+            "capture": {"task_id": "t-test", "run_id": "r-test"},
+            "upload": {
+                "verified": True,
+                "verified_at": "2026-01-01T00:00:00Z",
+                "report_url": "https://drive.google.com/file/d/report123/view",
+                "receipt_url": "https://drive.google.com/file/d/receipt123/view",
+            },
+            "publication": {"status": "PENDING"},
+            "coding": coding,
+        }
+
+    def test_t10_t11_pr_title_has_one_canonical_space_and_old_prefixes_work(self) -> None:
+        from agent_handoff.dispatch.coding.config import _parse_publication
+
+        errors: list[str] = []
+        parsed = _parse_publication(
+            {"pr_title_prefix": "Agent Handoff:"},
+            {"pr_title_prefix": "Agent Handoff:"},
+            "publication",
+            errors,
+        )
+        self.assertEqual(parsed["pr_title_prefix"], "Agent Handoff:")
+        self.assertEqual(build_pr_title(parsed["pr_title_prefix"], "C2 live acceptance"), "Agent Handoff: C2 live acceptance")
+        self.assertEqual(build_pr_title("Agent Handoff: ", "C2 live acceptance"), "Agent Handoff: C2 live acceptance")
+        self.assertEqual(build_pr_title("Agent Handoff:", "  C2 live acceptance  "), "Agent Handoff: C2 live acceptance")
+        self.assertEqual(build_pr_title("[Bot]  ", "Task"), "[Bot] Task")
+        self.assertEqual(build_pr_title(None, "Task"), "Agent Handoff: Task")
+        self.assertEqual(build_pr_title("Agent Handoff:", ""), "Agent Handoff:")
+
+    def test_t01_t02_t13_comment_shows_verified_pending_and_never_claims_own_ack(self) -> None:
+        from agent_handoff.dispatch.delivery import build_issue_comment
+
+        record = self._record()
+        comment = build_issue_comment(record)
+        self.assertIn("REPORT_VERIFIED=`true`", comment)
+        self.assertIn("ISSUE_DELIVERED=`pending` (this comment)", comment)
+        self.assertIn("TELEGRAM_SENT=`pending` (attempted after this comment)", comment)
+        self.assertNotIn("REPORT_DELIVERED=", comment)
+        self.assertNotIn("verified report delivered", comment)
+        self.assertIn("attempted after this Issue comment", comment)
+        self.assertIn("exactly-once Telegram delivery is not claimed", comment)
+
+        record["coding"]["milestones"]["ISSUE_DELIVERED"] = True
+        record["coding"]["milestones"]["REPORT_DELIVERED"] = True
+        record["coding"]["milestones"]["TELEGRAM_SENT"] = True
+        record["coding"]["stage"] = "NOTIFICATION_SENT"
+        delivered = build_issue_comment(record)
+        self.assertIn("ISSUE_DELIVERED=`true`", delivered)
+        self.assertIn("TELEGRAM_SENT=`true`", delivered)
+
+    def test_t09_historical_records_are_read_without_rewriting(self) -> None:
+        record = self._record()
+        record["coding"]["stage"] = "ISSUE_UPDATED"
+        record["coding"]["milestones"] = {"REPORT_DELIVERED": True}
+        before = json.loads(json.dumps(record))
+        from agent_handoff.dispatch.delivery import build_issue_comment
+
+        self.assertEqual(milestone_state(record["coding"], "ISSUE_DELIVERED"), "true")
+        self.assertEqual(milestone_state(record["coding"], "REPORT_DELIVERED"), "true")
+        self.assertEqual(milestone_state(record["coding"], "TELEGRAM_SENT"), "pending")
+        summary = safe_record_summary(record)
+        self.assertTrue(summary["coding"]["milestones"]["issue_delivered"])
+        self.assertTrue(summary["coding"]["milestones"]["report_delivered"])
+        self.assertFalse(summary["coding"]["milestones"]["telegram_sent"])
+        comment = build_issue_comment(record)
+        self.assertIn("ISSUE_DELIVERED=`true`", comment)
+        self.assertEqual(record, before)
+
+    def test_t12_blocked_coding_report_is_truthful(self) -> None:
+        record = self._record()
+        record["coding"].update(
+            {
+                "stage": "TESTING",
+                "blocked": True,
+                "blocked_stage": "TESTING",
+                "blocked_reason": "trusted tests failed",
+                "tests": {"status": "failed"},
+                "publication": {"branch": None, "commit": None, "pr_url": None},
+                "milestones": {
+                    "AGENT_COMPLETED": True,
+                    "TESTS_PASSED": False,
+                    "DIFF_VALIDATED": False,
+                    "COMMIT_CREATED": False,
+                    "BRANCH_PUBLISHED": False,
+                    "PR_CREATED": False,
+                    "PR_PUBLISHED": False,
+                    "REPORT_VERIFIED": False,
+                    "ISSUE_DELIVERED": False,
+                    "REPORT_DELIVERED": False,
+                    "TELEGRAM_SENT": False,
+                },
+            }
+        )
+        from agent_handoff.dispatch.delivery import build_issue_comment
+
+        comment = build_issue_comment(record)
+        self.assertIn("Coding outcome: `blocked`", comment)
+        self.assertIn("TESTS_PASSED=`false`", comment)
+        self.assertIn("PR_PUBLISHED=`not_run`", comment)
+        self.assertIn("REPORT_VERIFIED=`true`", comment)
+        self.assertIn("ISSUE_DELIVERED=`pending` (this comment)", comment)
+        self.assertIn("TELEGRAM_SENT=`pending` (attempted after this comment)", comment)
+        self.assertNotIn("draft_pr_published", comment)
+        report = coding_report_sections(record)
+        self.assertIn("Coding outcome: `blocked:TESTING`", report)
+        self.assertIn("Trusted tests passed: `false`", report)
+        self.assertIn("Draft PR created: `not_run`", report)
+        self.assertIn("Report verified: `pending`", report)
+        self.assertIn("Issue delivered: `pending`", report)
+        self.assertIn("Telegram sent: `pending`", report)
+        self.assertIn("Blocked: `True`", report)
+
+    def test_t14_read_only_delivery_comment_is_unchanged(self) -> None:
+        from agent_handoff.dispatch.delivery import build_issue_comment
+
+        record = {
+            "task_type": "read_only",
+            "repository": GH_REPO,
+            "issue_number": 6,
+            "project": {"name": "Alpha"},
+            "agent": "opencode",
+            "model": "provider/model-fast",
+            "session": {"id": "ses_read"},
+            "execution": {"outcome": "succeeded"},
+            "capture": {"task_id": "t-read", "run_id": "r-read"},
+            "upload": {
+                "verified": True,
+                "verified_at": "2026-01-01T00:00:00Z",
+                "report_url": "https://drive.google.com/file/d/read123/view",
+            },
+        }
+        comment = build_issue_comment(record)
+        self.assertIn("verified report available", comment)
+        self.assertIn("read123", comment)
+        self.assertNotIn("Coding milestones", comment)
+        self.assertNotIn("ISSUE_DELIVERED", comment)
+
+    def test_t13_manual_delivery_helpers_advance_stage_and_milestones(self) -> None:
+        from agent_handoff.dispatch.delivery import apply_issue_delivered, apply_upload_verified
+
+        record = self._record()
+        record["coding"]["stage"] = "PR_CREATED"
+        apply_upload_verified(record)
+        self.assertEqual(record["coding"]["stage"], "UPLOAD_VERIFIED")
+        self.assertTrue(record["coding"]["milestones"]["REPORT_VERIFIED"])
+        apply_issue_delivered(record)
+        self.assertEqual(record["coding"]["stage"], "ISSUE_UPDATED")
+        self.assertTrue(record["coding"]["milestones"]["ISSUE_DELIVERED"])
+        self.assertTrue(record["coding"]["milestones"]["REPORT_DELIVERED"])
+
+    def test_t15_milestone_json_outputs_remain_valid(self) -> None:
+        record = self._record()
+        record["coding"]["stage"] = "UPLOAD_VERIFIED"
+        record["status"] = "UPLOAD_VERIFIED"
+        summary = safe_record_summary(record)
+        view = record_status_view(record)
+        for value in (summary, view):
+            text = json.dumps(value)
+            self.assertIn("milestones", text)
+            self.assertIsInstance(value["coding"]["milestones"], dict)
+
+
+class TestTelegramMilestones(unittest.TestCase):
+    TOKEN = "123456789:AAFakeCodingMilestoneToken_1234567890"
+
+    class FakeTransport:
+        def __init__(self) -> None:
+            self.result: dict = {"ok": True, "message_id": 6}
+            self.calls: list[dict] = []
+
+        def send_message(self, chat_id: str, **message) -> dict:
+            self.calls.append({"chat_id": chat_id, **message})
+            return dict(self.result)
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.h = DispatchHarness(self.root)
+        self.h.config["notifications"] = {
+            "telegram": {
+                "enabled": True,
+                "chat_id": "-1001234567890",
+                "token_env": "AGENT_HANDOFF_TELEGRAM_TOKEN",
+                "timeout_seconds": 2,
+                "retry_seconds": 5,
+                "max_attempts": 3,
+                "delayed_after_attempts": 3,
+            }
+        }
+        self.h.write_config()
+        self.env_patch = mock.patch.dict(
+            os.environ,
+            {"AGENT_HANDOFF_TELEGRAM_TOKEN": self.TOKEN, "AGENT_HANDOFF_HOME": str(self.h.home)},
+            clear=False,
+        )
+        self.env_patch.start()
+        self.ledger = Ledger(self.h.config)
+        project = {"name": "Alpha", "core_name": "Alpha", "core_key": "alpha", "coding": {"enabled": True}}
+        record = new_dispatch_record(
+            repository=GH_REPO,
+            issue={"number": 7, "html_url": "https://github.test/issues/7", "title": "Coding telegram"},
+            project=project,
+            agent="opencode",
+            model="provider/model-fast",
+            request={"instructions": "test"},
+            task_type="coding",
+            coding=new_coding_state(project),
+        )
+        record["status"] = "ISSUE_UPDATED"
+        record["capture"].update({"status": "CAPTURED", "task_id": "t-test", "run_id": "r-test"})
+        record["upload"] = {
+            "status": "VERIFIED",
+            "verified": True,
+            "verified_at": "2026-01-01T00:00:00Z",
+            "report_url": "https://drive.google.com/file/d/report123/view",
+            "receipt_url": "https://drive.google.com/file/d/receipt123/view",
+        }
+        record["publication"] = {
+            "status": "PUBLISHED",
+            "published_at": "2026-01-01T00:00:10Z",
+            "comment_url": "https://github.test/issues/7#issuecomment-1",
+            "attempts": 1,
+            "last_error": None,
+            "next_attempt_at": None,
+        }
+        coding = record["coding"]
+        coding["stage"] = "ISSUE_UPDATED"
+        coding["milestones"].update(
+            {
+                "REPORT_VERIFIED": True,
+                "ISSUE_DELIVERED": True,
+                "REPORT_DELIVERED": True,
+            }
+        )
+        self.ledger.create(record)
+        self.service = NotificationService(self.h.config)
+        self.transport = self.FakeTransport()
+        self.service.transport = self.transport
+
+    def tearDown(self) -> None:
+        self.env_patch.stop()
+        self.tmp.cleanup()
+
+    def _current(self) -> dict:
+        return self.ledger.get(GH_REPO, 7) or {}
+
+    def _notification(self) -> dict:
+        items = [item for item in self.service.store.all() if item.get("kind") == DELIVERY_COMPLETED]
+        self.assertTrue(items)
+        return items[0]
+
+    def test_t05_t06_telegram_queued_is_not_sent_until_api_acknowledges(self) -> None:
+        queued = self.service.enqueue_completed(self._current())
+        self.assertIsNotNone(queued)
+        self.assertFalse(self._current()["coding"]["milestones"]["TELEGRAM_SENT"])
+        self.transport.result = {"ok": False, "error": "Telegram unavailable", "retry_after": None}
+        failed = self.service.drain(force=True)
+        self.assertEqual(failed["failed"], 1)
+        self.assertEqual(self._notification()["state"], "RETRY_WAIT")
+        self.assertFalse(self._current()["coding"]["milestones"]["TELEGRAM_SENT"])
+
+        self.transport.result = {"ok": True, "message_id": 6}
+        retried = self.service.retry(task_id="t-test", run_id="r-test")
+        self.assertEqual(retried["sent"], 1, retried)
+        current = self._current()
+        self.assertTrue(current["coding"]["milestones"]["TELEGRAM_SENT"])
+        self.assertEqual(current["coding"]["telegram_message_id"], 6)
+        self.assertEqual(current["coding"]["stage"], "NOTIFICATION_SENT")
+        self.assertEqual(self._notification()["state"], "SENT")
+        self.assertEqual(len(self.transport.calls), 2)
+
+    def test_t07_t08_ambiguous_send_requires_acknowledgement_before_true_milestone(self) -> None:
+        self.service.enqueue_completed(self._current())
+        claimed = self.service.store.claim_next(force=True)
+        self.assertIsNotNone(claimed)
+        notification_id = str(claimed["notification_id"])
+        self.service.store.update(
+            notification_id,
+            lambda item: item.update({"sending_at": "2020-01-01T00:00:00Z"}),
+        )
+        recovered = self.service.store.recover_stale_sending(stale_after_seconds=30)
+        self.assertEqual(len(recovered), 1)
+        self.assertTrue(recovered[0]["ambiguous"])
+        self.assertEqual(self._notification()["state"], "NEEDS_ATTENTION")
+        self.assertFalse(self._current()["coding"]["milestones"]["TELEGRAM_SENT"])
+
+        generic = self.service.retry()
+        self.assertEqual(generic["skipped_ambiguous"], 1)
+        self.assertEqual(self.transport.calls, [])
+        self.assertFalse(self._current()["coding"]["milestones"]["TELEGRAM_SENT"])
+
+        self.transport.result = {"ok": True, "message_id": 6}
+        accepted = self.service.retry(notification_id=notification_id, acknowledge_duplicate=True)
+        self.assertEqual(accepted["sent"], 1, accepted)
+        self.assertTrue(self._current()["coding"]["milestones"]["TELEGRAM_SENT"])
+        self.assertEqual(self._current()["coding"]["telegram_message_id"], 6)
+        self.assertEqual(len(self.transport.calls), 1)
+
+    def test_t09_old_records_without_telegram_key_accept_new_acknowledgement(self) -> None:
+        record = self._current()
+        record["coding"]["milestones"] = {"REPORT_DELIVERED": True, "ISSUE_DELIVERED": True}
+        self.ledger.update(GH_REPO, 7, lambda item: item["coding"].update({"milestones": record["coding"]["milestones"]}))
+        self.service.enqueue_completed(self._current())
+        self.transport.result = {"ok": True, "message_id": 9}
+        self.service.drain(force=True)
+        current = self._current()
+        self.assertTrue(current["coding"]["milestones"]["TELEGRAM_SENT"])
+        self.assertEqual(current["coding"]["telegram_message_id"], 9)
+
+
 class CodingIntegrationTests(unittest.TestCase):
     """In-process C2 pipeline with synthetic credentials and a local trusted remote."""
 
@@ -1531,6 +1881,44 @@ class CodingIntegrationTests(unittest.TestCase):
         self.assertEqual(runner.summary["published"], 1)
         self.assertEqual(len(json.loads((self.h.gh_dir / "pulls.json").read_text(encoding="utf-8"))), 1)
         self.assertEqual(len(self.h.comments(21)), 1)
+
+    def test_t01_t03_t04_lost_comment_ack_is_reconciled_without_duplicate(self) -> None:
+        marker = self.root / "lost-comment-ack"
+        marker.write_text("1", encoding="utf-8")
+        first = self._run({"FAKE_GH_LOST_COMMENT_RESPONSE_FILE": str(marker)})
+        self.assertEqual(first["executed"], 1)
+        self.assertEqual(first["uploaded"], 1)
+        self.assertEqual(first["published"], 0)
+        self.assertFalse(first["ok"])
+        record = self.ledger.get(GH_REPO, 21)
+        self.assertEqual(record["status"], "UPLOAD_VERIFIED")
+        self.assertTrue(record["upload"]["verified"])
+        self.assertTrue(record["upload"]["report_url"])
+        self.assertEqual(record["publication"]["status"], "FAILED")
+        self.assertTrue(record["coding"]["milestones"]["REPORT_VERIFIED"])
+        self.assertFalse(record["coding"]["milestones"]["ISSUE_DELIVERED"])
+        comments = self.h.comments(21)
+        self.assertEqual(len(comments), 1, "the simulated API created the comment before the response was lost")
+
+        runner = self.last_runner
+        runner.summary = {
+            "ok": True, "busy": False, "executed": 0, "rejected": 0, "needs_attention": 0,
+            "uploaded": 0, "published": 0, "errors": [], "warnings": [],
+        }
+        env = self.h.env()
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch(
+            "agent_handoff.upload.load_config", return_value=self.h.config
+        ), mock.patch.object(DispatchRunner, "_coding_adapter", side_effect=AssertionError("agent must not run")):
+            runner._advance_all(force=True)
+        reconciled = self.ledger.get(GH_REPO, 21)
+        self.assertEqual(reconciled["status"], "ISSUE_UPDATED")
+        self.assertEqual(reconciled["publication"]["status"], "PUBLISHED")
+        self.assertTrue(reconciled["publication"]["comment_url"])
+        self.assertTrue(reconciled["coding"]["milestones"]["REPORT_VERIFIED"])
+        self.assertTrue(reconciled["coding"]["milestones"]["ISSUE_DELIVERED"])
+        self.assertTrue(reconciled["coding"]["milestones"]["REPORT_DELIVERED"])
+        self.assertEqual(len(self.h.comments(21)), 1, "reconciliation must not post a duplicate comment")
+        self.assertEqual(runner.summary["executed"], 0)
 
     def test_t05_t13_t24_t25_t31_t33_end_to_end_coding_pipeline(self) -> None:
         unrelated = self.h.home / "queue" / "q-historical-legacy.json"

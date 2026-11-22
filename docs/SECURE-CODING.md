@@ -438,7 +438,7 @@ REQUEST_ACCEPTED -> WORKSPACE_PREPARED -> AGENT_RUNNING -> AGENT_COMPLETED
   -> PR_CREATED -> REPORT_CAPTURED -> UPLOAD_VERIFIED -> ISSUE_UPDATED
 ```
 
-The record persists the task/run IDs, source issue, repository, base branch/commit, workspace, branch, commit SHA, PR number/URL, test result, diff evidence, publication attempts/backoff, and report identity. Milestones distinguish agent completion, tests passed, PR publication, and report delivery.
+The record persists the task/run IDs, source issue, repository, base branch/commit, workspace, branch, commit SHA, PR number/URL, test result, diff evidence, publication attempts/backoff, and report identity. Milestones distinguish agent completion, tests passed, PR publication, Drive upload verification (`REPORT_VERIFIED`), Issue acknowledgement (`ISSUE_DELIVERED`), and acknowledged Telegram API delivery (`TELEGRAM_SENT`). A queued or ambiguous Telegram send is not marked sent. Reports and Issue comments are snapshots: steps not reached at snapshot time render `pending` or `not_run`, and `REPORT_DELIVERED` is retained only as a legacy alias of `ISSUE_DELIVERED`.
 
 Recovery rules:
 

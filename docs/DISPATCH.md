@@ -231,7 +231,16 @@ REQUEST_ACCEPTED -> WORKSPACE_PREPARED -> AGENT_RUNNING -> AGENT_COMPLETED
   -> ISSUE_UPDATED -> notification outbox state
 ```
 
-The workflow distinguishes `AGENT_COMPLETED`, `TESTS_PASSED`, `PR_PUBLISHED`, and `REPORT_DELIVERED`. An agent completion is not test success, and a verified report does not prove the code is correct or merged.
+The workflow distinguishes `AGENT_COMPLETED`, `TESTS_PASSED`, `PR_PUBLISHED`, `REPORT_VERIFIED`, `ISSUE_DELIVERED`, and `TELEGRAM_SENT`. An agent completion is not test success, and a verified report does not prove the code is correct or merged.
+
+Delivery milestones have distinct meanings:
+
+- `REPORT_VERIFIED` means the Drive upload passed the established MD5/read-back contract.
+- `ISSUE_DELIVERED` means GitHub acknowledged the Issue comment, or a later idempotent poll reconciled an already-present delivery marker. A comment is built before its own API acknowledgement, so it renders `ISSUE_DELIVERED=pending (this comment)` rather than claiming its own delivery.
+- `TELEGRAM_SENT` means the Telegram API acknowledged a send with a message id. A queued, pending, failed, or ambiguous notification is not marked sent. The Issue comment is published before the Telegram outbox is drained, so the comment renders `TELEGRAM_SENT=pending`; the durable ledger advances after the API acknowledgement.
+- `REPORT_DELIVERED` remains a legacy alias of `ISSUE_DELIVERED` for old ledger records and older reports. New reports use the three canonical delivery milestones above.
+
+Reports and delivery comments are snapshots. A milestone that had not been reached at snapshot time renders `pending` (or `not_run` when a blocked task skipped it); it is not rewritten retroactively after later upload, Issue, or Telegram steps.
 
 Legacy state machine:
 

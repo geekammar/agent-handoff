@@ -185,11 +185,15 @@ def handle_comment(argv: list[str]) -> int:
             "id": len(entries) + 1,
             "body": body,
             "user": load("user.json", {"login": "dev"}),
-            "html_url": f"https://github.test/example/issues/{number}#issuecomment-{len(entries) + 1}",
+            "html_url": f"https://github.test/example/issues/{number}#issuecomment-{len(entries)}",
             "created_at": "2026-11-19T00:00:00Z",
         }
     )
     save("comments.json", comments)
+    lost = os.environ.get("FAKE_GH_LOST_COMMENT_RESPONSE_FILE")
+    if lost and Path(lost).exists():
+        Path(lost).unlink()
+        return fail("simulated lost GitHub comment acknowledgement")
     print(f"https://github.test/example/issues/{number}#issuecomment-{len(entries)}")
     return 0
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from ...util import sanitize_error, truncate
+from .milestones import milestone_state
 
 
 def coding_outcome(record: Mapping[str, Any]) -> str:
@@ -45,7 +46,6 @@ def coding_report_sections(record: Mapping[str, Any]) -> str:
     agent = coding.get("agent") or {}
     limits = coding.get("limits") or {}
     request = record.get("request") or {}
-    milestones = coding.get("milestones") or {}
     lines = [
         "",
         "## Coding task contract",
@@ -65,16 +65,22 @@ def coding_report_sections(record: Mapping[str, Any]) -> str:
         "",
         "## Coding stage and milestones",
         "",
+        "Milestone values are a snapshot captured when this report was generated. "
+        "`pending` means the durable stage had not reached that step yet; `not_run` means "
+        "the task was blocked before it. Later upload, Issue, and Telegram steps are recorded "
+        "in the durable ledger after this report snapshot and are not rewritten here.",
+        "",
         f"- Durable stage: `{coding.get('stage')}`",
-        f"- Agent completed: `{bool(milestones.get('AGENT_COMPLETED'))}`",
-        f"- Trusted tests passed: `{bool(milestones.get('TESTS_PASSED'))}`",
-        f"- Diff validated: `{bool(milestones.get('DIFF_VALIDATED'))}`",
-        f"- Commit created: `{bool(milestones.get('COMMIT_CREATED'))}`",
-        f"- Branch published: `{bool(milestones.get('BRANCH_PUBLISHED'))}`",
-        f"- Draft PR created: `{bool(milestones.get('PR_CREATED') or milestones.get('PR_PUBLISHED'))}`",
-        f"- Report verified: `{bool(milestones.get('REPORT_VERIFIED'))}`",
-        f"- Issue delivered: `{bool(milestones.get('ISSUE_DELIVERED'))}`",
-        f"- Report delivered: `{bool(milestones.get('REPORT_DELIVERED'))}`",
+        f"- Agent completed: `{milestone_state(coding, 'AGENT_COMPLETED')}`",
+        f"- Trusted tests passed: `{milestone_state(coding, 'TESTS_PASSED')}`",
+        f"- Diff validated: `{milestone_state(coding, 'DIFF_VALIDATED')}`",
+        f"- Commit created: `{milestone_state(coding, 'COMMIT_CREATED')}`",
+        f"- Branch published: `{milestone_state(coding, 'BRANCH_PUBLISHED')}`",
+        f"- Draft PR created: `{milestone_state(coding, 'PR_CREATED')}`",
+        f"- Report verified: `{milestone_state(coding, 'REPORT_VERIFIED')}`",
+        f"- Issue delivered: `{milestone_state(coding, 'ISSUE_DELIVERED')}`",
+        f"- Telegram sent: `{milestone_state(coding, 'TELEGRAM_SENT')}`",
+        f"- Report delivered (legacy alias of Issue delivered): `{milestone_state(coding, 'REPORT_DELIVERED')}`",
         f"- Blocked: `{bool(coding.get('blocked'))}`",
         f"- Blocked stage: `{coding.get('blocked_stage') or 'none'}`",
         f"- Blocked reason: {sanitize_error(str(coding.get('blocked_reason') or 'none'), 1200)}",

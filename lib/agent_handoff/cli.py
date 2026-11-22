@@ -24,6 +24,8 @@ from .config import (
 from .adapters import agy_hook, auto_complete, git_info, integration_log, normalize_outcome, normalize_status, spawn_upload
 from .dispatch.config import DispatchConfigError, validate_core_config, validate_dispatch_config
 from .dispatch.delivery import (
+    apply_issue_delivered,
+    apply_upload_verified,
     diagnose_historical_run,
     delivery_marker,
     merged_upload_attempts,
@@ -1425,6 +1427,7 @@ def _cmd_dispatch_deliver(args: argparse.Namespace) -> int:
         item["session"] = {**(item.get("session") or {}), "mode": "new", "id": agent.get("session_id")}
         item["model"] = agent.get("model")
         item["status"] = "UPLOAD_VERIFIED"
+        apply_upload_verified(item)
     record = ledger.update(repository, issue_number, apply_reconcile, note="verified upload metadata reconciled")
     marker = delivery_marker(args.run)
     reporter.emit("publishing", "checking for an existing idempotent delivery comment")
@@ -1453,6 +1456,13 @@ def _cmd_dispatch_deliver(args: argparse.Namespace) -> int:
             "attention_reason": None,
         },
     )
+    if final_record.get("task_type") == "coding":
+        final_record = ledger.update(
+            repository,
+            issue_number,
+            apply_issue_delivered,
+            note="coding Issue delivery milestone recorded",
+        )
     notification_data: dict[str, Any] = {
         "enabled": notifier.enabled,
         "configured_enabled": notifier.configured_enabled,

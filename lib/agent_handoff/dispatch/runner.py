@@ -19,6 +19,8 @@ from .coding.report import coding_next_action, coding_outcome, coding_report_sec
 from .coding.testrunner import test_evidence_for_report
 from .coding.workspace import cleanup_workspace
 from .delivery import (
+    apply_issue_delivered,
+    apply_upload_verified,
     build_issue_comment,
     delivery_marker,
     merged_upload_attempts,
@@ -1511,11 +1513,9 @@ class DispatchRunner:
             if milestone:
                 coding.setdefault("milestones", {})[milestone] = True
             if stage == "UPLOAD_VERIFIED":
-                coding["upload_verified_at"] = utcnow_iso_precise()
-                coding.setdefault("milestones", {})["REPORT_VERIFIED"] = True
+                apply_upload_verified(item)
             if stage == "ISSUE_UPDATED":
-                coding["report_delivered_at"] = utcnow_iso_precise()
-                coding.setdefault("milestones", {})["ISSUE_DELIVERED"] = True
+                apply_issue_delivered(item)
 
         self.ledger.update(record["repository"], int(record["issue_number"]), apply, note=note or f"coding milestone {stage}")
 

@@ -47,6 +47,21 @@ def pr_marker(task_id: str, run_id: str) -> str:
     return PR_MARKER.format(task_id=task_id, run_id=run_id)
 
 
+def build_pr_title(prefix: str | None, subject: str | None) -> str:
+    """Join a configured prefix and an issue title with exactly one space.
+
+    Older configurations may omit the trailing space after ``Agent Handoff:``.
+    Normalizing here keeps existing configurations valid without rewriting
+    stored config or renaming any existing pull request.
+    """
+
+    head = " ".join(str(prefix or "Agent Handoff:").split()) or "Agent Handoff:"
+    text = " ".join(str(subject or "").split())
+    if not text:
+        return head
+    return f"{head} {text}"
+
+
 def build_commit_message(*, project: str, title: str, issue_number: int, task_id: str, run_id: str) -> str:
     subject = " ".join(str(title or "").split())[:120] or f"Agent Handoff issue #{issue_number}"
     return (

@@ -6,7 +6,8 @@ from typing import Any, Callable
 
 from ..store import Store
 from ..upload import Uploader
-from ..util import atomic_write_json, sanitize_error, utcnow, utcnow_iso
+from ..util import atomic_write_json, sanitize_error, utcnow, utcnow_iso, utcnow_iso_precise
+from .coding.milestones import PER_STAGE_ORDER, milestone_state
 
 RECEIPT_NAME = "UPLOAD-RECEIPT.json"
 
@@ -26,6 +27,34 @@ def delivery_marker(run_id: str) -> str:
 
 def rejection_marker(issue_number: int, body_sha256: str) -> str:
     return f"<!-- agent-handoff-rejected:{issue_number}:{body_sha256[:16]} -->"
+
+
+def apply_upload_verified(record: dict[str, Any], *, at: str | None = None) -> None:
+    """Record Drive upload verification without changing the run identity."""
+
+    coding = record.get("coding")
+    if not isinstance(coding, dict):
+        return
+    coding["upload_verified_at"] = at or utcnow_iso_precise()
+    coding.setdefault("milestones", {})["REPORT_VERIFIED"] = True
+    current = str(coding.get("stage") or "")
+    if PER_STAGE_ORDER.get("UPLOAD_VERIFIED", -1) >= PER_STAGE_ORDER.get(current, -1):
+        coding["stage"] = "UPLOAD_VERIFIED"
+
+
+def apply_issue_delivered(record: dict[str, Any], *, at: str | None = None) -> None:
+    """Record acknowledged Issue publication and the legacy delivery alias."""
+
+    coding = record.get("coding")
+    if not isinstance(coding, dict):
+        return
+    coding["report_delivered_at"] = at or utcnow_iso_precise()
+    milestones = coding.setdefault("milestones", {})
+    milestones["ISSUE_DELIVERED"] = True
+    milestones["REPORT_DELIVERED"] = True
+    current = str(coding.get("stage") or "")
+    if PER_STAGE_ORDER.get("ISSUE_UPDATED", -1) >= PER_STAGE_ORDER.get(current, -1):
+        coding["stage"] = "ISSUE_UPDATED"
 
 
 def _complete_upload(complete: dict[str, Any]) -> dict[str, Any]:
@@ -268,12 +297,11 @@ def build_issue_comment(record: dict[str, Any]) -> str:
     session = record.get("session") or {}
     coding = record.get("coding") or {}
     publication = coding.get("publication") or {}
-    milestones = coding.get("milestones") or {}
     report_url = upload.get("report_url")
     receipt_url = upload.get("receipt_url")
     lines = [
         delivery_marker(str(capture.get("run_id") or record.get("dispatch_id"))),
-        "**Agent Handoff — verified report delivered.**",
+        "**Agent Handoff — verified report available.**",
         "",
         f"- Project: `{(record.get('project') or {}).get('name')}`",
         f"- Agent: `{record.get('agent')}`",
@@ -287,6 +315,11 @@ def build_issue_comment(record: dict[str, Any]) -> str:
     ]
     if record.get("task_type") == "coding":
         coding_outcome = "blocked" if coding.get("blocked") else "draft_pr_published"
+        issue_state = milestone_state(coding, "ISSUE_DELIVERED")
+        telegram_state = milestone_state(coding, "TELEGRAM_SENT")
+        report_state = "true" if upload.get("verified") else milestone_state(coding, "REPORT_VERIFIED")
+        issue_note = " (this comment)" if issue_state == "pending" else ""
+        telegram_note = " (attempted after this comment)" if telegram_state == "pending" else ""
         lines.extend(
             [
                 "- Task type: `coding`",
@@ -295,10 +328,12 @@ def build_issue_comment(record: dict[str, Any]) -> str:
                 f"- Branch: `{publication.get('branch') or 'not created'}`",
                 f"- Commit: `{publication.get('commit') or 'not created'}`",
                 f"- Draft PR: {publication.get('pr_url') or 'not created'}",
-                f"- Milestones: AGENT_COMPLETED=`{bool(milestones.get('AGENT_COMPLETED'))}`, "
-                f"TESTS_PASSED=`{bool(milestones.get('TESTS_PASSED'))}`, "
-                f"PR_PUBLISHED=`{bool(milestones.get('PR_PUBLISHED'))}`, "
-                f"REPORT_DELIVERED=`{bool(milestones.get('REPORT_DELIVERED'))}`",
+                f"- Coding milestones: AGENT_COMPLETED=`{milestone_state(coding, 'AGENT_COMPLETED')}`, "
+                f"TESTS_PASSED=`{milestone_state(coding, 'TESTS_PASSED')}`, "
+                f"PR_PUBLISHED=`{milestone_state(coding, 'PR_PUBLISHED')}`",
+                f"- Delivery milestones: REPORT_VERIFIED=`{report_state}`, "
+                f"ISSUE_DELIVERED=`{issue_state}`{issue_note}, "
+                f"TELEGRAM_SENT=`{telegram_state}`{telegram_note}",
             ]
         )
     if receipt_url:
@@ -307,6 +342,9 @@ def build_issue_comment(record: dict[str, Any]) -> str:
     if record.get("task_type") == "coding":
         lines.append(
             "The report link above was verified by MD5/read-back before this comment was posted. "
+            "Issue delivery is acknowledged only after GitHub creates this comment. A Telegram "
+            "notification, when enabled, is attempted after this Issue comment; it is not a prerequisite "
+            "for report delivery, and exactly-once Telegram delivery is not claimed. "
             "Any Draft Pull Request is a review artifact only: it is not merged, deployed, or accepted "
             "automatically. Tests passing is not proof of correctness or production readiness."
         )
