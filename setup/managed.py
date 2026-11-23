@@ -83,6 +83,20 @@ def tracked_files(root: Path) -> list[Path] | None:
     return [Path(item.decode("utf-8")) for item in result.stdout.split(b"\0") if item]
 
 
+def source_commit(root: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
 def walk_files(root: Path) -> list[Path]:
     files: list[Path] = []
     for directory, dirnames, filenames in os.walk(root, followlinks=False):
