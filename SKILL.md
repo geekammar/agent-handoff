@@ -11,6 +11,7 @@ This file is reusable guidance for any assistant that supports a skill-style ent
 
 - A user wants upload-verified reports for OpenCode or AGY work.
 - A user wants to install Agent Handoff on their own Linux machine or VPS.
+- A user or AI agent wants a read-only preflight and approval-based setup plan.
 - A user wants a private GitHub Issue to run OpenCode in one explicit local project.
 - A user needs to diagnose a pending report upload, a stale remote `COMPLETE.json`, or a missing issue delivery.
 - A user wants an optional Telegram notification with a verified report link and a copy-ready Arabic ChatGPT handoff prompt.
@@ -41,6 +42,7 @@ Never ask for tokens, rclone config contents, `.env` contents, or SSH private ke
 ```bash
 git clone https://github.com/OWNER/agent-handoff.git ~/src/agent-handoff
 python3 ~/src/agent-handoff/setup/install.py --home ~/agent-handoff
+agent-handoff setup plan --json
 agent-handoff auth
 agent-handoff project add --name ProjectA --path ~/projects/project-a
 agent-handoff project add --name ProjectB --path ~/projects/project-b
@@ -49,6 +51,28 @@ agent-handoff config validate
 ```
 
 Use `--home` and `--bin-link` for non-standard locations. Never overwrite an existing runtime config with an example file.
+
+## Guided setup
+
+Start with the read-only plan:
+
+```bash
+agent-handoff setup plan
+agent-handoff setup plan --json
+```
+
+Statuses are `ready`, `missing`, `optional`, and `blocked`; scopes are `core`, `install`, `capture`, `dispatch`, and `coding`. Core capture does not require optional dispatch or coding prerequisites.
+
+Preview and apply only explicitly supported configuration fields:
+
+```bash
+agent-handoff setup plan --json --drive-root-folder-id <ROOT_FOLDER_ID>
+agent-handoff setup apply --approve --json --drive-root-folder-id <ROOT_FOLDER_ID>
+```
+
+`setup apply` preserves unknown fields, validates the proposed configuration, creates a mode-600 backup, writes atomically, re-validates, and rolls back on failure. It never enables the dispatcher, coding, `workspace_write`, isolation, notifications, or a service, and never stores credentials. If an apply is interrupted, read the reported recovery state and run `agent-handoff setup recover --approve --json`; never delete an ambiguous journal.
+
+See `docs/SETUP.md` for the full contract.
 
 ## Verify before claiming success
 
@@ -75,7 +99,7 @@ A folder existing, a queue item disappearing, or `ok: true` from a retry command
 1. `gh auth status`
 2. Confirm the repository is private with Issues enabled.
 3. `opencode models` to discover exact model IDs.
-4. Add `dispatch` to `$AGENT_HANDOFF_HOME/config/config.json` using `config/config.dispatch.example.json` as a structural reference only.
+4. Add `dispatch` to `$AGENT_HANDOFF_HOME/config/config.json` using `config/config.dispatch.example.json` as a structural reference only. Guided setup never enables it.
 5. `agent-handoff config validate`
 6. `agent-handoff dispatch run --once`
 7. Continuous operation: a systemd **user** service with explicit user consent; see `docs/DISPATCH.md`.
@@ -101,6 +125,8 @@ Reject `session: same`; v1.1 does not support continuation. Never derive a path 
 ## Recovery
 
 ```bash
+agent-handoff setup plan --json                 # interrupted setup and required steps
+agent-handoff setup recover --approve --json    # safe cleanup only; never guesses
 agent-handoff dispatch status                     # health, links, notification state, next action
 agent-handoff dispatch status --json
 agent-handoff dispatch inspect --task <task-id> --run <run-id> --json
@@ -112,6 +138,7 @@ agent-handoff dispatch notify --retry --json      # retry confirmed Telegram fai
 agent-handoff dispatch notify --retry --notification <id> --acknowledge-duplicate --json
 ```
 
+- An interrupt during setup apply is recoverable with `setup recover --approve`; an ambiguous journal fails closed.
 - An interrupt during upload is safe: the existing task/run/session identity is reused. Do not submit a duplicate issue.
 - Upload failure: retry upload only.
 - GitHub publication failure: retry publication only.
@@ -145,4 +172,4 @@ Export the real token in the dispatcher environment; do not paste it into chat, 
 
 ## Boundaries
 
-Keep the core CLI working when dispatch is disabled. C1 isolation is an opt-in foundation only; do not enable coding tasks, create a Unix account, or provision provider keys without explicit owner approval. Do not merge a Draft PR without human approval. Do not add speculative adapters. Stop and report accurately if a credential or permission is missing.
+Keep the core CLI working when dispatch is disabled. Setup planning is read-only and setup apply is narrowly scoped and approval-gated. C1 isolation is an opt-in foundation only; do not enable coding tasks, create a Unix account, or provision provider keys without explicit owner approval. Do not merge a Draft PR without human approval. Do not add speculative adapters. Stop and report accurately if a credential or permission is missing.

@@ -20,6 +20,7 @@ This is the neutral first entrypoint for coding agents working on or with Agent 
 | Architecture and runtime boundaries | `docs/ARCHITECTURE.md` |
 | Dispatcher behavior, state machine, security | `docs/DISPATCH.md` |
 | C1 secure coding foundation and staging acceptance | `docs/SECURE-CODING.md` |
+| Guided setup foundation, approval, recovery | `docs/SETUP.md` |
 | AI-assisted setup | `docs/AI-QUICKSTART.md` |
 | Acceptance evidence | `docs/ACCEPTANCE.md` |
 | Failure recovery | `docs/TROUBLESHOOTING.md` |
@@ -37,6 +38,8 @@ Do not invent commands, config fields, model IDs, or guarantees. If documentatio
 - Optional, disabled-by-default Telegram notifications with a durable local outbox; notification failure never changes verified delivery.
 - Read-only OpenCode execution by default.
 - Repeatable install, upgrade, rollback, doctor, and config validation.
+- Read-only guided setup discovery and a deterministic `agent-handoff setup plan --json` contract.
+- Explicitly approved, narrowly scoped, validated, backed-up, atomic configuration apply with recovery.
 - Deterministic tests with fake GitHub, fake OpenCode, and fake rclone.
 
 ## Explicit non-capabilities
@@ -50,6 +53,8 @@ Do not invent commands, config fields, model IDs, or guarantees. If documentatio
 - No generic notification platform, bot provisioning, Telegram login, or guaranteed exactly-once Telegram delivery.
 - No production C2 enablement, OS account creation, provider-key creation, workspace provisioning, deployment, auto-merge, or Draft PR automation without an explicit owner-configured coding policy.
 - No full kernel/network sandbox for coding or tests; UID/GID isolation is not a complete sandbox.
+- No full interactive setup wizard, credential automation, automatic model selection, service activation, or coding enablement in the guided setup foundation.
+- No second configuration system; guided setup uses the existing config contracts and validators.
 
 ## Safe setup sequence
 
@@ -58,6 +63,7 @@ Use generic paths. Do not copy another user's home directory, Drive IDs, GitHub 
 ```bash
 git clone https://github.com/OWNER/agent-handoff.git ~/src/agent-handoff
 python3 ~/src/agent-handoff/setup/install.py --home ~/agent-handoff
+agent-handoff setup plan --json
 agent-handoff auth
 agent-handoff project add --name ProjectA --path ~/projects/project-a
 agent-handoff project add --name ProjectB --path ~/projects/project-b
@@ -66,6 +72,18 @@ agent-handoff config validate
 ```
 
 For a non-standard location use `--home` and `--bin-link`. The installer preserves `config/config.json`, runtime data, queue, state, logs, and credentials.
+
+## Guided setup contract
+
+1. Run `agent-handoff setup plan --json` first. It is read-only and deterministic for the same host and configuration.
+2. Interpret statuses `ready`, `missing`, `optional`, and `blocked`; scopes are `core`, `install`, `capture`, `dispatch`, and `coding`.
+3. Complete required core steps first: installation, valid configuration, Drive root folder id, Drive authorization, one project mapping, and one upload-verified capture.
+4. Preview a configuration change before applying it. Never apply an unreviewed proposal.
+5. `agent-handoff setup apply` requires `--approve`. It only supports `drive` folder identifiers/names, `workspace_roots`, and `auto_register_projects`.
+6. Never use setup to enable `dispatch.enabled`, coding, `workspace_write`, isolation, notifications, or a systemd service.
+7. If `setup plan` reports recovery required, run `agent-handoff setup recover --approve --json` only after reviewing the journal status. Do not delete or overwrite an ambiguous journal.
+8. Never place credentials in a setup plan, journal, backup, config file, report, log, comment, or Git history.
+9. If an AI assistant lacks shell access, it must provide the documented commands and ask the user to run them. It must not claim installation, authorization, upload, or verification succeeded.
 
 ## Dispatcher setup
 
@@ -111,6 +129,8 @@ Add `task: coding` only when the selected project has an explicit owner-enabled 
 - Do not weaken `read_only` permissions unless the user deliberately configures `workspace_write` and `allow_write`.
 - Do not run persistent background processes or enable systemd services during tests.
 - Keep Telegram disabled unless deliberately configured. The bot token belongs only in the environment variable named by `notifications.telegram.token_env`; never in config, reports, logs, or Issues.
+- Guided setup planning must not write configuration. Configuration apply must validate first, preserve unknown fields, create a mode-600 backup, write atomically, and roll back on failure.
+- Do not activate a systemd service, coding, or write-capable isolation through setup.
 
 ## Tests
 

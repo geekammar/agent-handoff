@@ -20,6 +20,7 @@ Prerequisites: Python 3.10+, `rclone`, and (optional) OpenCode. The dispatcher a
 ```bash
 git clone https://github.com/OWNER/agent-handoff.git ~/src/agent-handoff
 python3 ~/src/agent-handoff/setup/install.py --home ~/agent-handoff
+agent-handoff setup plan --json
 agent-handoff auth
 agent-handoff project add --name ProjectA --path ~/projects/project-a
 agent-handoff doctor
@@ -35,6 +36,28 @@ AGENT_HANDOFF_HOME="$HOME/agent-handoff" \
 ```
 
 The installer synchronizes managed source files, records an ownership manifest, links the CLI, and registers the OpenCode and AGY capture integrations. It never touches runtime `data/`, `queue/`, `state/`, `locks/`, `logs/`, `tmp/`, `releases/`, `config/config.json`, or `rclone` authorization.
+
+## Guided setup
+
+`agent-handoff setup plan` is the canonical first inspection for a new user or an AI coding agent. It is read-only and reports the operating system, Python, git, rclone, GitHub CLI and authorization, OpenCode, installation, configuration, project mappings, Drive authorization, dispatcher/service state, and any interrupted setup.
+
+```bash
+agent-handoff setup plan
+agent-handoff setup plan --json
+
+# Preview a narrowly scoped configuration change without writing it:
+agent-handoff setup plan --json --drive-root-folder-id <ROOT_FOLDER_ID>
+
+# Apply only after explicit approval:
+agent-handoff setup apply --approve --json --drive-root-folder-id <ROOT_FOLDER_ID>
+
+# Recover safely after an interrupted apply:
+agent-handoff setup recover --approve --json
+```
+
+Configuration apply preserves unknown valid fields, validates the proposed runtime view with the existing contracts, writes a mode-600 backup, uses an atomic mode-600 write, re-validates the result, and rolls back on failure. It can only change `drive` folder identifiers/names, `workspace_roots`, and `auto_register_projects`. It never enables the dispatcher, coding, `workspace_write`, isolation, notifications, or a service, and it never stores credentials.
+
+Statuses are `ready`, `missing`, `optional`, and `blocked`, with `core`, `install`, `capture`, `dispatch`, and `coding` scopes. See [docs/SETUP.md](docs/SETUP.md) for the machine-readable contract, approval model, recovery behavior, and AI capability boundaries.
 
 ## Architecture
 
@@ -335,9 +358,9 @@ See [docs/DISPATCH.md](docs/DISPATCH.md) for the outbox state machine and [docs/
 
 ## AI-native onboarding
 
-Share the repository URL with a tool-enabled AI assistant and point it at [AGENTS.md](AGENTS.md) or [docs/AI-QUICKSTART.md](docs/AI-QUICKSTART.md).
+Share the repository URL with a tool-enabled AI assistant and point it at [AGENTS.md](AGENTS.md), [docs/AI-QUICKSTART.md](docs/AI-QUICKSTART.md), and [docs/SETUP.md](docs/SETUP.md).
 
-An assistant with shell, GitHub, and Drive authorization can follow the commands and verify each step. An assistant without those permissions must explain the setup steps and ask the user to run them; it must not pretend to have installed, authenticated, executed, uploaded, or verified anything.
+An assistant with shell, GitHub, and Drive authorization can follow the commands, run `agent-handoff setup plan --json`, apply only explicitly approved setup fields, and verify each step. An assistant without those permissions must explain the setup steps and ask the user to run them; it must not pretend to have installed, authenticated, executed, uploaded, or verified anything. A browser chat session does not automatically have access to a user's VPS.
 
 A universal prompt is provided in `docs/AI-QUICKSTART.md`. Tool-specific instructions are thin pointers to the same canonical commands, not divergent copies.
 
@@ -387,7 +410,7 @@ Upgrade snapshots the installed code and restores it automatically if installati
 agent-handoff/
   bin/agent-handoff
   lib/agent_handoff/
-    cli.py, config.py, report.py, store.py, upload.py, util.py
+    cli.py, config.py, guided_setup.py, report.py, store.py, upload.py, util.py
     adapters/                  # core session-ingest adapters (OpenCode/AGY capture)
     dispatch/                  # optional v1.1 dispatcher
       config.py, requests.py, ledger.py, github.py, runner.py, delivery.py
@@ -399,7 +422,7 @@ agent-handoff/
   setup/                       # installer, upgrade, rollback, auth helper
   tests/                       # deterministic tests + fake backends
   config/                      # sanitized examples only
-  docs/                        # architecture, dispatch, acceptance, troubleshooting, AI quickstart
+  docs/                        # architecture, dispatch, secure coding, setup, acceptance, troubleshooting, AI quickstart
   AGENTS.md                    # neutral AI entrypoint
   SKILL.md                     # reusable skill-oriented guide
 ```
@@ -416,6 +439,8 @@ agent-handoff/
 - Telegram delivery is best-effort at-least-once with local deduplication, not a mathematically guaranteed exactly-once transaction. An interrupted send may have an ambiguous outcome and is flagged for review; a generic retry excludes it.
 - Telegram notifications do not create bots, authenticate Telegram accounts, alter Drive permissions, or replay historical deliveries on first enablement.
 - Google Drive folder IDs must remain stable; renaming a project in config does not rename the Drive folder.
+- P1-B1 guided setup is a read-only preflight plus a narrowly scoped safe configuration foundation, not a complete interactive wizard. It never installs credentials, selects models, enables the dispatcher or coding, or activates a service.
+- `setup plan` may invoke `gh auth status` to determine whether authorization exists; its output is discarded and token values are never included.
 
 ## More documentation
 

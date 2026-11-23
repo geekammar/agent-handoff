@@ -36,6 +36,7 @@ from .dispatch.ledger import Ledger
 from .dispatch.progress import ProgressReporter
 from .dispatch.runner import DispatchRunner
 from .dispatch.status import GROUP_ORDER, format_status_view, record_status_view, status_group
+from . import guided_setup
 from .notify.config import NotificationConfigError, validate_notification_config
 from .notify.service import NotificationService
 from .report import manual_report
@@ -1598,6 +1599,156 @@ def _cmd_dispatch_deliver(args: argparse.Namespace) -> int:
     return 0
 
 
+def _setup_config_path() -> Path:
+    return guided_setup.config_path_from_env()
+
+
+def _setup_patch_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    return guided_setup.patch_from_values(
+        drive_parent_folder_id=getattr(args, "drive_parent_folder_id", None),
+        drive_parent_folder_name=getattr(args, "drive_parent_folder_name", None),
+        drive_root_folder_id=getattr(args, "drive_root_folder_id", None),
+        drive_root_folder_name=getattr(args, "drive_root_folder_name", None),
+        workspace_roots=getattr(args, "workspace_root", None),
+        auto_register_projects=getattr(args, "auto_register_projects", None),
+    )
+
+
+def _setup_plan(args: argparse.Namespace, patch: dict[str, Any] | None = None) -> dict[str, Any]:
+    state = guided_setup.read_config_state(_setup_config_path())
+    return guided_setup.build_setup_plan(
+        state,
+        patch=_setup_patch_from_args(args) if patch is None else patch,
+        base_dir=BASE_DIR,
+        home=Path.home(),
+    )
+
+
+def _emit_setup_error(args: argparse.Namespace, command: str, exc: Exception) -> int:
+    message = sanitize_error(str(exc))
+    if getattr(args, "json", False):
+        emit({"ok": False, "command": command, "error": message})
+    else:
+        print(f"error: {message}", file=sys.stderr)
+    return 1
+
+
+def cmd_setup_plan(args: argparse.Namespace) -> int:
+    try:
+        plan = _setup_plan(args)
+    except guided_setup.SetupError as exc:
+        return _emit_setup_error(args, "setup.plan", exc)
+    if args.json:
+        emit(plan)
+    else:
+        print(guided_setup.format_setup_plan(plan))
+    return 0 if plan.get("ok") else 1
+
+
+def cmd_setup_apply(args: argparse.Namespace) -> int:
+    try:
+        patch = _setup_patch_from_args(args)
+        recovery = guided_setup.inspect_setup_recovery(_setup_config_path())
+        if recovery.get("required"):
+            if recovery.get("status") not in ("complete_cleanup_required", "rollback_cleanup_required"):
+                raise guided_setup.SetupRecoveryError(
+                    f"setup recovery must be completed first ({recovery.get('status')}): {recovery.get('reason')}"
+                )
+            if not args.approve:
+                preview = _setup_plan(args, patch)
+                if args.json:
+                    emit({"ok": False, "command": "setup.apply", "approval_required": True, "recovery": recovery, "plan": preview})
+                else:
+                    print(guided_setup.format_setup_plan(preview))
+                    print("Approval required: rerun with --approve to finalize the interrupted setup first.", file=sys.stderr)
+                return 2
+            guided_setup.recover_setup(_setup_config_path(), approve=True)
+        plan = _setup_plan(args, patch)
+        if not plan["config_plan"]["changes_required"]:
+            if plan["config_plan"]["errors"]:
+                raise guided_setup.SetupValidationError("; ".join(plan["config_plan"]["errors"]))
+            if not plan.get("ok"):
+                blocking = [item for item in plan.get("blockers") or [] if item.get("scope") in ("core", "install")]
+                detail = "; ".join(item["summary"] for item in blocking) or "setup is blocked"
+                raise guided_setup.SetupValidationError(detail)
+            result = {
+                "ok": True,
+                "command": "setup.apply",
+                "changed": False,
+                "approval_required": False,
+                "config": str(_setup_config_path()),
+                "message": "configuration already satisfies the requested setup values",
+                "plan_status": plan["status"],
+            }
+            if args.json:
+                emit(result)
+            else:
+                print(result["message"])
+                if plan["remaining_required_steps"]:
+                    print("Required setup steps still remain: " + ", ".join(plan["remaining_required_steps"]))
+            return 0
+        if not args.approve:
+            if args.json:
+                emit({"ok": False, "command": "setup.apply", "approval_required": True, "plan": plan})
+            else:
+                print(guided_setup.format_setup_plan(plan))
+            print("Approval required: rerun with --approve to apply the proposed configuration.", file=sys.stderr)
+            return 2
+        result = guided_setup.apply_setup_patch(
+            _setup_config_path(),
+            patch=patch,
+            defaults=guided_setup.DEFAULT_CONFIG,
+            approve=True,
+        )
+        if args.json:
+            emit(result)
+        else:
+            if result.get("changed"):
+                print("Configuration updated after validation.")
+                if result.get("backup"):
+                    print(f"Previous configuration backup: {result['backup']}")
+                for change in result.get("changes") or []:
+                    print(f"  {change['path']}: {change['before']!r} -> {change['after']!r}")
+            else:
+                print(result.get("message") or "No configuration change was necessary.")
+        return 0
+    except guided_setup.SetupError as exc:
+        return _emit_setup_error(args, "setup.apply", exc)
+
+
+def cmd_setup_recover(args: argparse.Namespace) -> int:
+    command = "setup.recover"
+    try:
+        recovery = guided_setup.inspect_setup_recovery(_setup_config_path())
+        if not recovery.get("required"):
+            result = {"ok": True, "command": command, "changed": False, "recovery": recovery, "message": "no recovery is required"}
+            if args.json:
+                emit(result)
+            else:
+                print(result["message"])
+            return 0
+        if not args.approve:
+            result = {"ok": False, "command": command, "approval_required": True, "recovery": recovery}
+            if args.json:
+                emit(result)
+            else:
+                print(f"Recovery status: {recovery.get('status')}")
+                print(f"Reason: {recovery.get('reason')}")
+                print("Approval required: rerun with --approve to finalize a safe cleanup.", file=sys.stderr)
+            return 2
+        result = guided_setup.recover_setup(_setup_config_path(), approve=True)
+        result["command"] = command
+        if args.json:
+            emit(result)
+        else:
+            print("Interrupted setup recovery finalized.")
+            if result.get("recovery", {}).get("backup"):
+                print(f"Recovery backup retained: {result['recovery']['backup']}")
+        return 0
+    except guided_setup.SetupError as exc:
+        return _emit_setup_error(args, command, exc)
+
+
 def cmd_version(args: argparse.Namespace) -> int:
     print(__version__)
     return 0
@@ -1610,6 +1761,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
+            "  agent-handoff setup plan --json\n"
+            "  agent-handoff setup apply --approve --drive-root-folder-id <ROOT_FOLDER_ID>\n"
             "  agent-handoff doctor\n"
             "  agent-handoff config validate\n"
             "  agent-handoff init --project ProjectA --agent opencode --title \"Fix login\" --prompt-file prompt.txt\n"
@@ -1737,6 +1890,50 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--strict", action="store_true", help="treat warnings as a non-zero exit")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_config_validate)
+
+    setup_parser = sub.add_parser("setup", help="guided setup preflight, planning, and safe configuration changes")
+    setup_sub = setup_parser.add_subparsers(dest="setup_command", required=True)
+
+    def add_setup_patch_arguments(target: argparse.ArgumentParser) -> None:
+        target.add_argument("--drive-parent-folder-id", help="Google Drive parent folder id for the reports root")
+        target.add_argument("--drive-parent-folder-name", help="display name of the parent folder")
+        target.add_argument("--drive-root-folder-id", help="Google Drive reports root folder id required for uploads")
+        target.add_argument("--drive-root-folder-name", help="display name of the reports root folder")
+        target.add_argument(
+            "--workspace-root",
+            action="append",
+            default=None,
+            help="add an existing local workspace root; existing roots are preserved",
+        )
+        group = target.add_mutually_exclusive_group()
+        group.add_argument(
+            "--auto-register-projects",
+            dest="auto_register_projects",
+            action="store_true",
+            default=None,
+            help="enable project auto-registration under workspace roots",
+        )
+        group.add_argument(
+            "--no-auto-register-projects",
+            dest="auto_register_projects",
+            action="store_false",
+            help="disable project auto-registration",
+        )
+        target.add_argument("--json", action="store_true")
+
+    p = setup_sub.add_parser("plan", help="inspect the environment and preview setup steps without changing anything")
+    add_setup_patch_arguments(p)
+    p.set_defaults(func=cmd_setup_plan)
+
+    p = setup_sub.add_parser("apply", help="validate, back up, and atomically apply approved setup configuration")
+    add_setup_patch_arguments(p)
+    p.add_argument("--approve", action="store_true", help="explicitly approve the proposed configuration change")
+    p.set_defaults(func=cmd_setup_apply)
+
+    p = setup_sub.add_parser("recover", help="finalize a safe cleanup after an interrupted setup apply")
+    p.add_argument("--approve", action="store_true", help="explicitly approve the recovery cleanup")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_setup_recover)
 
     dispatch_parser = sub.add_parser("dispatch", help="optional private GitHub Issues dispatcher")
     dispatch_sub = dispatch_parser.add_subparsers(dest="dispatch_command", required=True)

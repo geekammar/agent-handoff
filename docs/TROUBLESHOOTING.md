@@ -41,6 +41,43 @@ A snapshot created before ownership manifests has no `manifest.json`. The rollba
 
 The installer never follows source symlinks or writes through destination symlink components. If it reports an unsafe managed path, inspect the runtime paths involved and replace the symlink with a normal directory before retrying. Do not delete runtime data or configuration directories.
 
+## Guided setup reports missing or blocked checks
+
+Run `agent-handoff setup plan --json` first. Checks are scoped to `core`, `install`, `capture`, `dispatch`, or `coding`; `missing` is an actionable setup step, while `blocked` means the host or configuration is not usable until it is fixed. `ok` covers core and install blockers only. Optional dispatch or coding prerequisites do not stop core capture.
+
+Choose one path for missing prerequisites:
+
+- missing rclone: install it and re-run the plan;
+- no Drive authorization: run `agent-handoff auth` or import a mode-600 token file produced by `rclone authorize "drive"`;
+- no project: run `agent-handoff project add` after Drive authorization;
+- missing GitHub authorization for dispatch: run `gh auth login` with your own account;
+- missing OpenCode: install it only if you want automatic capture or dispatch.
+
+## Guided setup reports an invalid configuration
+
+`setup plan` and `setup apply` fail closed when the runtime configuration is invalid JSON or fails the existing core, dispatcher, or notification validators. Guided setup never overwrites an invalid file blindly. Restore a valid file from your own backup or fix the reported error, then re-run the plan.
+
+A symbolic-link configuration is also refused; replace it with a regular mode-600 file before applying changes.
+
+## Guided setup requires approval
+
+`setup apply` changes configuration only with `--approve`. Without it, the command prints a plan or JSON preview, sets `approval_required: true`, and exits non-zero. Review the proposed `config_plan.changes`, then rerun with `--approve`.
+
+Applying setup values never enables the dispatcher, coding, `workspace_write`, isolation, notifications, or a systemd service.
+
+## Guided setup was interrupted
+
+If `setup plan --json` reports `setup.recovery.required: true`:
+
+1. read `recovery.status` and `recovery.reason`;
+2. do not delete the journal or edit the configuration by hand;
+3. run `agent-handoff setup recover --approve --json`;
+4. re-run `agent-handoff setup plan --json` and `agent-handoff config validate --json`.
+
+`setup recover` finalizes cleanup only when the current file hash matches the recorded previous or proposed state. An `ambiguous` state is preserved for manual review and is never guessed.
+
+A retained `.backup-setup-*` file is the recoverable pre-apply configuration.
+
 ## Google Drive is not authorized
 
 Symptoms:
