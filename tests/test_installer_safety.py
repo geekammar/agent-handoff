@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -14,6 +15,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ".agent-handoff-manifest.json"
+
+
+def managed_digest(root: Path, files: list[str]) -> str:
+    digest = hashlib.sha256()
+    for relative in sorted(files):
+        file_digest = hashlib.sha256((root / relative).read_bytes()).hexdigest()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(file_digest.encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
 
 
 def make_source(root: Path, version: str = "old", plugin: str = "// old plugin\n") -> Path:
@@ -65,6 +77,27 @@ def make_git_source(root: Path, version: str, plugin: str) -> tuple[Path, str]:
     return source, commit
 
 
+def commit_source(source: Path, message: str) -> str:
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "Installer Test",
+            "GIT_AUTHOR_EMAIL": "installer-test@example.invalid",
+            "GIT_COMMITTER_NAME": "Installer Test",
+            "GIT_COMMITTER_EMAIL": "installer-test@example.invalid",
+        }
+    )
+    subprocess.run(["git", "add", "-A"], cwd=source, check=True, env=env)
+    subprocess.run(["git", "commit", "-qm", message], cwd=source, check=True, env=env)
+    return subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    ).stdout.strip()
+
+
 def inject_mid_install_failure(installer: Path) -> None:
     lines = installer.read_text(encoding="utf-8").splitlines(keepends=True)
     updated = []
@@ -77,6 +110,22 @@ def inject_mid_install_failure(installer: Path) -> None:
         updated.append(line)
     if not injected:
         raise AssertionError("could not find the AGY installation call for failure injection")
+    installer.write_text("".join(updated), encoding="utf-8")
+
+
+def inject_sync_interruption(installer: Path, after: int = 5) -> None:
+    lines = installer.read_text(encoding="utf-8").splitlines(keepends=True)
+    updated = []
+    injected = False
+    for line in lines:
+        updated.append(line)
+        if "copied += 1" in line and not line.lstrip().startswith("def "):
+            indent = line[: len(line) - len(line.lstrip())]
+            updated.append(f"{indent}if copied >= {after}:\n")
+            updated.append(f'{indent}    raise SystemExit("injected code sync interruption")\n')
+            injected = True
+    if not injected:
+        raise AssertionError("could not find the copy counter for sync interruption injection")
     installer.write_text("".join(updated), encoding="utf-8")
 
 
@@ -206,6 +255,8 @@ class InstallerSafetyTests(unittest.TestCase):
         manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
         self.assertEqual(manifest.get("source_commit"), c1)
         self.assertEqual(manifest.get("source_commit_source"), "install")
+        self.assertEqual(manifest.get("source_provenance"), "verified")
+        self.assertEqual(manifest.get("content_sha256"), managed_digest(self.home, manifest["files"]))
 
         v2, c2 = make_git_source(self.root / "commit-v2", "new", "// plugin-v2\n")
         upgraded = self.upgrade(v2, "--no-opencode", "--no-agy")
@@ -213,19 +264,29 @@ class InstallerSafetyTests(unittest.TestCase):
         manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
         self.assertEqual(manifest.get("source_commit"), c2)
         self.assertEqual(manifest.get("source_commit_source"), "install")
+        self.assertEqual(manifest.get("source_provenance"), "verified")
+        self.assertEqual(manifest.get("content_sha256"), managed_digest(self.home, manifest["files"]))
         releases = sorted(path for path in (self.home / "releases").iterdir() if path.is_dir())
         self.assertEqual(len(releases), 1)
         pre_upgrade = releases[0]
         release_manifest = json.loads((pre_upgrade / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(release_manifest.get("source_commit"), c2)
+        self.assertEqual(release_manifest.get("upgrade_source_commit"), c2)
         self.assertEqual(release_manifest.get("installed_source_commit"), c1)
         self.assertEqual(release_manifest.get("installed_source_commit_source"), "install")
+        self.assertEqual(release_manifest.get("installed_source_provenance"), "verified")
+        self.assertEqual(
+            release_manifest.get("installed_content_sha256"),
+            managed_digest(pre_upgrade / "code", release_manifest["files"]),
+        )
 
         rolled = self.upgrade(v2, "--no-opencode", "--no-agy", "--rollback", pre_upgrade.name)
         self.assertEqual(rolled.returncode, 0, rolled.stderr)
         manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
         self.assertEqual(manifest.get("source_commit"), c1)
         self.assertEqual(manifest.get("source_commit_source"), "restore")
+        self.assertEqual(manifest.get("source_provenance"), "verified")
+        self.assertEqual(manifest.get("content_sha256"), managed_digest(self.home, manifest["files"]))
         self.assertIn('__version__ = "old"', (self.home / "lib" / "agent_handoff" / "__init__.py").read_text())
 
         self.assertEqual(self.upgrade(v2, "--no-opencode", "--no-agy").returncode, 0)
@@ -234,6 +295,7 @@ class InstallerSafetyTests(unittest.TestCase):
         manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
         self.assertEqual(manifest.get("source_commit"), c1)
         self.assertEqual(manifest.get("source_commit_source"), "restore")
+        self.assertEqual(manifest.get("source_provenance"), "verified")
 
     def test_failed_upgrade_auto_rollback_restores_installed_source_commit(self) -> None:
         if shutil.which("git") is None:
@@ -248,6 +310,8 @@ class InstallerSafetyTests(unittest.TestCase):
         manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
         self.assertEqual(manifest.get("source_commit"), c1)
         self.assertEqual(manifest.get("source_commit_source"), "restore")
+        self.assertEqual(manifest.get("source_provenance"), "verified")
+        self.assertEqual(manifest.get("content_sha256"), managed_digest(self.home, manifest["files"]))
         self.assertIn('__version__ = "old"', (self.home / "lib" / "agent_handoff" / "__init__.py").read_text())
         self.assert_runtime_preserved()
 
@@ -257,6 +321,9 @@ class InstallerSafetyTests(unittest.TestCase):
         manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
         self.assertIsNone(manifest.get("source_commit"))
         self.assertEqual(manifest.get("source_commit_source"), "install")
+        self.assertEqual(manifest.get("source_provenance"), "unknown")
+        self.assertEqual(manifest.get("source_commit_reason"), "not_a_git_repository")
+        self.assertEqual(manifest.get("content_sha256"), managed_digest(self.home, manifest["files"]))
 
     def test_legacy_release_source_commit_is_not_trusted_as_installed_content(self) -> None:
         v1 = make_source(self.root / "legacy-commit-v1", version="old")
@@ -267,8 +334,15 @@ class InstallerSafetyTests(unittest.TestCase):
         release_manifest = json.loads((pre_upgrade / "manifest.json").read_text(encoding="utf-8"))
         legacy_commit = "a" * 40
         release_manifest["source_commit"] = legacy_commit
-        release_manifest.pop("installed_source_commit", None)
-        release_manifest.pop("installed_source_commit_source", None)
+        for key in (
+            "installed_source_commit",
+            "installed_source_commit_source",
+            "installed_source_provenance",
+            "installed_content_sha256",
+            "installed_source_commit_reason",
+            "installed_source_repository",
+        ):
+            release_manifest.pop(key, None)
         (pre_upgrade / "manifest.json").write_text(json.dumps(release_manifest), encoding="utf-8")
 
         rolled = self.upgrade(v2, "--no-opencode", "--no-agy", "--rollback", pre_upgrade.name)
@@ -277,6 +351,242 @@ class InstallerSafetyTests(unittest.TestCase):
         self.assertIsNone(manifest.get("source_commit"))
         self.assertNotEqual(manifest.get("source_commit"), legacy_commit)
         self.assertEqual(manifest.get("source_commit_source"), "restore")
+        self.assertEqual(manifest.get("source_provenance"), "unknown")
+        self.assertTrue(manifest.get("source_commit_reason"))
+        self.assertEqual(manifest.get("content_sha256"), managed_digest(self.home, manifest["files"]))
+
+    def test_dirty_git_source_marks_provenance_unknown(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is unavailable")
+        source, _commit = make_git_source(self.root / "dirty-source", "dirty", "// plugin\n")
+        (source / "README.md").write_text("dirty working tree\n", encoding="utf-8")
+        result = self.install(source, "--no-opencode", "--no-agy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        self.assertIsNone(manifest.get("source_commit"))
+        self.assertEqual(manifest.get("source_provenance"), "unknown")
+        self.assertIn(manifest.get("source_commit_reason"), {"working_tree_changes", "working_tree_content_differs"})
+        self.assertEqual(manifest.get("source_commit_source"), "install")
+        self.assertEqual(manifest.get("content_sha256"), managed_digest(self.home, manifest["files"]))
+        self.assertEqual((self.home / "README.md").read_text(encoding="utf-8"), "dirty working tree\n")
+
+    def test_staged_git_source_marks_provenance_unknown(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is unavailable")
+        source, _commit = make_git_source(self.root / "staged-source", "staged", "// plugin\n")
+        (source / "README.md").write_text("staged change\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=source, check=True, env=self.env())
+        result = self.install(source, "--no-opencode", "--no-agy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        self.assertIsNone(manifest.get("source_commit"))
+        self.assertEqual(manifest.get("source_provenance"), "unknown")
+        self.assertEqual(manifest.get("source_commit_reason"), "staged_changes")
+        self.assertEqual(manifest.get("content_sha256"), managed_digest(self.home, manifest["files"]))
+
+    def test_untracked_managed_file_is_not_installed_and_provenance_is_unknown(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is unavailable")
+        source, _commit = make_git_source(self.root / "untracked-source", "untracked", "// plugin\n")
+        untracked = source / "lib" / "agent_handoff" / "untracked_module.py"
+        untracked.write_text("UNTRACKED = True\n", encoding="utf-8")
+        result = self.install(source, "--no-opencode", "--no-agy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.home / "lib" / "agent_handoff" / "untracked_module.py").exists())
+        manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        self.assertNotIn("lib/agent_handoff/untracked_module.py", manifest["files"])
+        self.assertIsNone(manifest.get("source_commit"))
+        self.assertEqual(manifest.get("source_provenance"), "unknown")
+        self.assertEqual(manifest.get("source_commit_reason"), "untracked_managed_files")
+        self.assertEqual(manifest.get("content_sha256"), managed_digest(self.home, manifest["files"]))
+
+    def test_source_inside_parent_git_repository_does_not_inherit_parent_head(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is unavailable")
+        parent = self.root / "parent-repository"
+        parent.mkdir()
+        source = make_source(parent / "project", version="nested", plugin="// plugin\n")
+        subprocess.run(["git", "init", "-q"], cwd=parent, check=True, env=self.env())
+        commit_source(parent, "parent")
+        result = self.install(source, "--no-opencode", "--no-agy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        self.assertIsNone(manifest.get("source_commit"))
+        self.assertEqual(manifest.get("source_provenance"), "unknown")
+        self.assertEqual(manifest.get("source_commit_reason"), "source_not_git_root")
+        self.assertIsNone(manifest.get("source_repository"))
+        self.assertEqual(manifest.get("content_sha256"), managed_digest(self.home, manifest["files"]))
+
+    def test_source_change_during_install_marks_provenance_unknown(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is unavailable")
+        source, _commit = make_git_source(self.root / "changing-source", "changing", "// plugin\n")
+        spec = importlib.util.spec_from_file_location("agent_handoff_install_changing", source / "setup" / "install.py")
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        real_copy = module.atomic_copy
+        state = {"copies": 0}
+
+        def changing_copy(src: Path, dst: Path) -> None:
+            real_copy(src, dst)
+            state["copies"] += 1
+            if state["copies"] == 1:
+                (source / "README.md").write_text("changed during install\n", encoding="utf-8")
+
+        module.atomic_copy = changing_copy
+        try:
+            module.sync_code(source, self.home)
+        finally:
+            module.atomic_copy = real_copy
+        manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        self.assertIsNone(manifest.get("source_commit"))
+        self.assertEqual(manifest.get("source_provenance"), "unknown")
+        self.assertEqual(manifest.get("source_commit_reason"), "source_changed_during_install")
+        self.assertEqual(manifest.get("content_sha256"), managed_digest(self.home, manifest["files"]))
+
+    def test_old_pr17_manifest_without_provenance_is_never_trusted(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is unavailable")
+        v1, c1 = make_git_source(self.root / "old-manifest-v1", "old", "// plugin-v1\n")
+        self.assertEqual(self.install(v1, "--no-opencode", "--no-agy").returncode, 0)
+        manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        manifest.pop("source_provenance", None)
+        manifest.pop("content_sha256", None)
+        manifest.pop("source_commit_reason", None)
+        manifest.pop("source_repository", None)
+        self.assertEqual(manifest.get("source_commit"), c1)
+        self.assertEqual(manifest.get("source_commit_source"), "install")
+        (self.home / MANIFEST).write_text(json.dumps(manifest), encoding="utf-8")
+
+        v2, c2 = make_git_source(self.root / "old-manifest-v2", "new", "// plugin-v2\n")
+        self.assertEqual(self.upgrade(v2, "--no-opencode", "--no-agy").returncode, 0)
+        pre_upgrade = sorted(path for path in (self.home / "releases").iterdir() if path.is_dir())[0]
+        release_manifest = json.loads((pre_upgrade / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(release_manifest.get("installed_source_provenance"), "unknown")
+        self.assertIsNone(release_manifest.get("installed_source_commit"))
+        self.assertTrue(release_manifest.get("installed_content_sha256"))
+
+        rolled = self.upgrade(v2, "--no-opencode", "--no-agy", "--rollback", pre_upgrade.name)
+        self.assertEqual(rolled.returncode, 0, rolled.stderr)
+        manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        self.assertIsNone(manifest.get("source_commit"))
+        self.assertEqual(manifest.get("source_provenance"), "unknown")
+        self.assertEqual(manifest.get("source_commit_source"), "restore")
+        self.assertTrue(manifest.get("source_commit_reason"))
+        self.assertNotEqual(manifest.get("source_commit"), c1)
+        self.assertNotEqual(manifest.get("source_commit"), c2)
+
+    def test_dirty_install_snapshot_restores_unknown_provenance(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is unavailable")
+        v1, _c1 = make_git_source(self.root / "dirty-snapshot-v1", "old", "// plugin-v1\n")
+        (v1 / "README.md").write_text("dirty baseline\n", encoding="utf-8")
+        self.assertEqual(self.install(v1, "--no-opencode", "--no-agy").returncode, 0)
+        dirty_manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        dirty_digest = dirty_manifest.get("content_sha256")
+        self.assertIsNone(dirty_manifest.get("source_commit"))
+        self.assertEqual(dirty_manifest.get("source_provenance"), "unknown")
+
+        v2, _c2 = make_git_source(self.root / "dirty-snapshot-v2", "new", "// plugin-v2\n")
+        self.assertEqual(self.upgrade(v2, "--no-opencode", "--no-agy").returncode, 0)
+        pre_upgrade = sorted(path for path in (self.home / "releases").iterdir() if path.is_dir())[0]
+        release_manifest = json.loads((pre_upgrade / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(release_manifest.get("installed_source_provenance"), "unknown")
+        self.assertIsNone(release_manifest.get("installed_source_commit"))
+        self.assertEqual(release_manifest.get("installed_content_sha256"), dirty_digest)
+
+        rolled = self.upgrade(v2, "--no-opencode", "--no-agy", "--rollback", pre_upgrade.name)
+        self.assertEqual(rolled.returncode, 0, rolled.stderr)
+        manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        self.assertIsNone(manifest.get("source_commit"))
+        self.assertEqual(manifest.get("source_provenance"), "unknown")
+        self.assertEqual(manifest.get("source_commit_source"), "restore")
+        self.assertEqual(manifest.get("content_sha256"), dirty_digest)
+        self.assertEqual((self.home / "README.md").read_text(encoding="utf-8"), "dirty baseline\n")
+
+    def test_multiple_release_generations_restore_correct_verified_commits(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is unavailable")
+        v1, c1 = make_git_source(self.root / "generation-v1", "old", "// plugin-v1\n")
+        v2, c2 = make_git_source(self.root / "generation-v2", "middle", "// plugin-v2\n")
+        v3, _c3 = make_git_source(self.root / "generation-v3", "new", "// plugin-v3\n")
+        self.assertEqual(self.install(v1, "--no-opencode", "--no-agy").returncode, 0)
+        self.assertEqual(self.upgrade(v2, "--no-opencode", "--no-agy").returncode, 0)
+        self.assertEqual(self.upgrade(v3, "--no-opencode", "--no-agy").returncode, 0)
+        releases: dict[str, str] = {}
+        for path in (self.home / "releases").iterdir():
+            if not path.is_dir():
+                continue
+            metadata = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+            commit = metadata.get("installed_source_commit")
+            if commit:
+                releases[commit] = path.name
+        self.assertIn(c1, releases)
+        self.assertIn(c2, releases)
+
+        first = self.upgrade(v3, "--no-opencode", "--no-agy", "--rollback", releases[c1])
+        self.assertEqual(first.returncode, 0, first.stderr)
+        manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        self.assertEqual(manifest.get("source_commit"), c1)
+        self.assertEqual(manifest.get("source_provenance"), "verified")
+        self.assertIn('__version__ = "old"', (self.home / "lib" / "agent_handoff" / "__init__.py").read_text())
+
+        self.assertEqual(self.upgrade(v3, "--no-opencode", "--no-agy").returncode, 0)
+        second = self.upgrade(v3, "--no-opencode", "--no-agy", "--rollback", releases[c2])
+        self.assertEqual(second.returncode, 0, second.stderr)
+        manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        self.assertEqual(manifest.get("source_commit"), c2)
+        self.assertEqual(manifest.get("source_provenance"), "verified")
+        self.assertEqual(manifest.get("content_sha256"), managed_digest(self.home, manifest["files"]))
+        self.assertIn('__version__ = "middle"', (self.home / "lib" / "agent_handoff" / "__init__.py").read_text())
+
+    def test_upgrade_interrupted_during_code_sync_auto_rollback_restores_verified_provenance(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is unavailable")
+        self.seed_integrations()
+        v1, c1 = make_git_source(self.root / "sync-failure-v1", "old", "// plugin-v1\n")
+        self.assertEqual(self.install(v1).returncode, 0)
+        v2, _c2 = make_git_source(self.root / "sync-failure-v2", "new", "// plugin-v2\n")
+        (v2 / "lib" / "agent_handoff" / "new_module.py").write_text("NEW = True\n", encoding="utf-8")
+        commit_source(v2, "new module")
+        inject_sync_interruption(v2 / "setup" / "install.py", after=1)
+        result = self.upgrade(v2)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.home / "lib" / "agent_handoff" / "new_module.py").exists())
+        manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        self.assertEqual(manifest.get("source_commit"), c1)
+        self.assertEqual(manifest.get("source_provenance"), "verified")
+        self.assertEqual(manifest.get("source_commit_source"), "restore")
+        self.assertEqual(manifest.get("content_sha256"), managed_digest(self.home, manifest["files"]))
+        self.assertIn('__version__ = "old"', (self.home / "lib" / "agent_handoff" / "__init__.py").read_text())
+        self.assert_runtime_preserved()
+
+    def test_upgrade_rollback_preserves_ledger_notifications_queue_and_receipts(self) -> None:
+        records = self.home / "state" / "dispatch" / "records"
+        notifications = self.home / "state" / "dispatch" / "notifications" / "records"
+        queue = self.home / "queue"
+        run = self.home / "data" / "projects" / "Synthetic" / "TASKS" / "t-1" / "RUNS" / "r-1"
+        for directory in (records, notifications, queue, run):
+            directory.mkdir(parents=True)
+        files = {
+            records / "record.json": '{"status": "ISSUE_UPDATED"}\n',
+            notifications / "notification.json": '{"state": "SENT"}\n',
+            queue / "queue.json": '{"kind": "run"}\n',
+            run / "REPORT.md": "# Synthetic report\n",
+            run / "UPLOAD-RECEIPT.json": '{"verified": true}\n',
+        }
+        for path, text in files.items():
+            path.write_text(text, encoding="utf-8")
+        before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
+        v1, _c1 = make_git_source(self.root / "preserve-v1", "old", "// plugin-v1\n")
+        v2, _c2 = make_git_source(self.root / "preserve-v2", "new", "// plugin-v2\n")
+        self.assertEqual(self.install(v1, "--no-opencode", "--no-agy").returncode, 0)
+        self.assertEqual(self.upgrade(v2, "--no-opencode", "--no-agy").returncode, 0)
+        self.assertEqual(self.upgrade(v2, "--no-opencode", "--no-agy", "--rollback", "latest").returncode, 0)
+        after = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
+        self.assertEqual(after, before)
+        self.assert_runtime_preserved()
 
     def test_legacy_snapshot_fails_safely_without_removing_files(self) -> None:
         source = make_source(self.root / "legacy-source", version="current")

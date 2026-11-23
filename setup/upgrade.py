@@ -25,6 +25,13 @@ from managed import (  # noqa: E402
     walk_files,
     write_manifest,
 )
+from provenance import (  # noqa: E402
+    PROVENANCE_UNKNOWN,
+    PROVENANCE_VERIFIED,
+    managed_content_digest,
+    trusted_manifest_source,
+    trusted_release_source,
+)
 
 SOURCE = Path(__file__).resolve().parents[1]
 DEFAULT_HOME = Path(os.environ.get("AGENT_HANDOFF_HOME", str(Path.home() / "agent-handoff")))
@@ -79,14 +86,22 @@ def snapshot(home: Path, label: str) -> Path | None:
     else:
         files = present
         origin = "snapshot-inventory"
-    installed_commit = None
-    installed_commit_source = None
-    if runtime_manifest and runtime_manifest.get("source_commit_source") in {"install", "restore"}:
-        installed_commit = runtime_manifest.get("source_commit")
-        installed_commit_source = runtime_manifest.get("source_commit_source")
     if not files:
         log("no installed managed files to snapshot")
         return None
+    file_list = [item.as_posix() for item in files]
+    try:
+        home_digest = managed_content_digest(home, file_list)
+    except (OSError, ValueError):
+        home_digest = None
+    trusted = trusted_manifest_source(runtime_manifest, home, content_sha256=home_digest)
+    installed_provenance = trusted.get("provenance") or PROVENANCE_UNKNOWN
+    installed_commit = trusted.get("commit") if installed_provenance == PROVENANCE_VERIFIED else None
+    installed_repository = trusted.get("repository")
+    installed_reason = trusted.get("reason")
+    installed_commit_source = None
+    if installed_provenance == PROVENANCE_VERIFIED and runtime_manifest:
+        installed_commit_source = runtime_manifest.get("source_commit_source")
     target = unique_release(releases_root(home) / f"{timestamp()}-{label}")
     target.mkdir(parents=True, exist_ok=False)
     code = target / "code"
@@ -95,17 +110,33 @@ def snapshot(home: Path, label: str) -> Path | None:
         destination = code / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(home / relative, destination)
+    try:
+        snapshot_digest = managed_content_digest(code, file_list)
+    except (OSError, ValueError):
+        snapshot_digest = None
+    if home_digest is None or snapshot_digest is None or snapshot_digest != home_digest:
+        installed_provenance = PROVENANCE_UNKNOWN
+        installed_commit = None
+        installed_repository = None
+        installed_reason = "snapshot_copy_mismatch"
+        installed_commit_source = None
     created_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    upgrade_source_commit = source_commit(SOURCE)
     write_manifest(
         target / "manifest.json",
-        [item.as_posix() for item in files],
+        file_list,
         {
             "created_at": created_at,
             "label": label,
             "source": str(SOURCE),
-            "source_commit": source_commit(SOURCE),
+            "source_commit": upgrade_source_commit,
+            "upgrade_source_commit": upgrade_source_commit,
             "installed_source_commit": installed_commit,
+            "installed_source_provenance": installed_provenance,
+            "installed_source_repository": installed_repository,
+            "installed_source_commit_reason": installed_reason,
             "installed_source_commit_source": installed_commit_source,
+            "installed_content_sha256": snapshot_digest,
             "home": str(home),
             "origin": origin,
         },
@@ -114,9 +145,14 @@ def snapshot(home: Path, label: str) -> Path | None:
         "created_at": created_at,
         "label": label,
         "source": str(SOURCE),
-        "source_commit": source_commit(SOURCE),
+        "source_commit": upgrade_source_commit,
+        "upgrade_source_commit": upgrade_source_commit,
         "installed_source_commit": installed_commit,
+        "installed_source_provenance": installed_provenance,
+        "installed_source_repository": installed_repository,
+        "installed_source_commit_reason": installed_reason,
         "installed_source_commit_source": installed_commit_source,
+        "installed_content_sha256": snapshot_digest,
         "home": str(home),
         "items": sorted({item.parts[0] for item in files}),
         "files": len(files),
@@ -186,15 +222,31 @@ def restore(home: Path, release: Path) -> None:
             continue
         atomic_copy(source, target)
         restored += 1
+    restored_files = sorted(release_files)
+    try:
+        restored_digest = managed_content_digest(home, restored_files)
+    except (OSError, ValueError):
+        restored_digest = None
+    trusted = trusted_release_source(
+        release_manifest,
+        home,
+        restored_files,
+        content_sha256=restored_digest,
+    )
+    installed_provenance = trusted.get("provenance") or PROVENANCE_UNKNOWN
     write_manifest(
         home / MANIFEST_NAME,
-        sorted(release_files),
+        restored_files,
         {
             "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
             "state": "restored",
             "release": release.name,
-            "source_commit": release_manifest.get("installed_source_commit"),
+            "source_commit": trusted.get("commit") if installed_provenance == PROVENANCE_VERIFIED else None,
+            "source_provenance": installed_provenance,
+            "source_repository": trusted.get("repository") if installed_provenance == PROVENANCE_VERIFIED else None,
+            "source_commit_reason": trusted.get("reason"),
             "source_commit_source": "restore",
+            "content_sha256": restored_digest,
         },
     )
     log(f"restored code from: {release} ({restored} file(s) restored, {removed} newer file(s) removed)")

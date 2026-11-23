@@ -19,9 +19,15 @@ from managed import (  # noqa: E402
     ManifestError,
     load_manifest,
     safe_target,
-    source_commit,
     source_files,
     write_manifest,
+)
+from provenance import (  # noqa: E402
+    PROVENANCE_UNKNOWN,
+    PROVENANCE_VERIFIED,
+    assess_source_provenance,
+    file_sha256,
+    managed_content_digest,
 )
 
 SOURCE = Path(__file__).resolve().parents[1]
@@ -95,6 +101,13 @@ def sync_code(source: Path, home: Path) -> None:
     home.mkdir(parents=True, exist_ok=True)
     selected = source_files(source)
     selected_paths = [item.as_posix() for item in selected]
+    before = assess_source_provenance(source, selected)
+    source_hashes: dict[str, str | None] = {}
+    for relative in selected:
+        try:
+            source_hashes[relative.as_posix()] = file_sha256(source / relative)
+        except OSError:
+            source_hashes[relative.as_posix()] = None
     manifest = home / MANIFEST_NAME
     previous: set[str] = set()
     try:
@@ -126,6 +139,41 @@ def sync_code(source: Path, home: Path) -> None:
             removed += 1
         elif dst.exists():
             log(f"warning: not removing non-file managed path: {relative}")
+    mismatched = []
+    for relative, expected in source_hashes.items():
+        try:
+            actual = file_sha256(home / relative)
+        except OSError:
+            mismatched.append(relative)
+            continue
+        if expected is None or actual != expected:
+            mismatched.append(relative)
+    after = assess_source_provenance(source, selected)
+    try:
+        installed_digest = managed_content_digest(home, selected_paths)
+    except (OSError, ValueError):
+        installed_digest = None
+    provenance = before.get("provenance")
+    commit = before.get("commit")
+    repository = before.get("repository")
+    reason = before.get("reason")
+    if provenance != PROVENANCE_VERIFIED:
+        provenance = PROVENANCE_UNKNOWN
+        commit = None
+        reason = reason or "source_provenance_unknown"
+    elif after.get("provenance") != PROVENANCE_VERIFIED or after.get("commit") != before.get("commit"):
+        provenance = PROVENANCE_UNKNOWN
+        commit = None
+        reason = "source_changed_during_install"
+    elif mismatched:
+        provenance = PROVENANCE_UNKNOWN
+        commit = None
+        reason = "install_copy_mismatch"
+    elif installed_digest is None:
+        provenance = PROVENANCE_UNKNOWN
+        commit = None
+        reason = "installed_content_unreadable"
+    source_repository = repository
     write_manifest(
         manifest,
         selected_paths,
@@ -133,8 +181,12 @@ def sync_code(source: Path, home: Path) -> None:
             "updated_at": timestamp(),
             "state": "installed",
             "source": str(source),
-            "source_commit": source_commit(source),
+            "source_commit": commit if provenance == PROVENANCE_VERIFIED else None,
+            "source_provenance": provenance,
+            "source_repository": source_repository,
+            "source_commit_reason": reason,
             "source_commit_source": "install",
+            "content_sha256": installed_digest,
         },
     )
     log(f"code synchronized: {copied} file(s) updated, {removed} obsolete file(s) removed in {home}")
