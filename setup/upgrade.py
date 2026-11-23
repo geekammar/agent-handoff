@@ -279,7 +279,8 @@ def list_releases(home: Path) -> int:
             pass
         log(
             f"{path.name}  installed={metadata.get('installed_source_commit') or 'unknown'} "
-            f"upgrade_source={metadata.get('source_commit') or 'unknown'}"
+            f"provenance={metadata.get('installed_source_provenance') or 'unknown'} "
+            f"upgrade_source={metadata.get('upgrade_source_commit') or metadata.get('source_commit') or 'unknown'}"
         )
     return 0
 
