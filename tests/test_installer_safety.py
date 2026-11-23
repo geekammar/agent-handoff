@@ -41,6 +41,30 @@ def make_source(root: Path, version: str = "old", plugin: str = "// old plugin\n
     return root
 
 
+def make_git_source(root: Path, version: str, plugin: str) -> tuple[Path, str]:
+    source = make_source(root, version=version, plugin=plugin)
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "Installer Test",
+            "GIT_AUTHOR_EMAIL": "installer-test@example.invalid",
+            "GIT_COMMITTER_NAME": "Installer Test",
+            "GIT_COMMITTER_EMAIL": "installer-test@example.invalid",
+        }
+    )
+    subprocess.run(["git", "init", "-q"], cwd=source, check=True, env=env)
+    subprocess.run(["git", "add", "-A"], cwd=source, check=True, env=env)
+    subprocess.run(["git", "commit", "-qm", version], cwd=source, check=True, env=env)
+    commit = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    ).stdout.strip()
+    return source, commit
+
+
 def inject_mid_install_failure(installer: Path) -> None:
     lines = installer.read_text(encoding="utf-8").splitlines(keepends=True)
     updated = []
@@ -173,6 +197,86 @@ class InstallerSafetyTests(unittest.TestCase):
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         self.assertFalse((self.home / "lib" / "agent_handoff" / "new_module.py").exists())
         self.assert_runtime_preserved()
+
+    def test_git_install_upgrade_and_rollback_record_installed_source_commits(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is unavailable")
+        v1, c1 = make_git_source(self.root / "commit-v1", "old", "// plugin-v1\n")
+        self.assertEqual(self.install(v1, "--no-opencode", "--no-agy").returncode, 0)
+        manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        self.assertEqual(manifest.get("source_commit"), c1)
+        self.assertEqual(manifest.get("source_commit_source"), "install")
+
+        v2, c2 = make_git_source(self.root / "commit-v2", "new", "// plugin-v2\n")
+        upgraded = self.upgrade(v2, "--no-opencode", "--no-agy")
+        self.assertEqual(upgraded.returncode, 0, upgraded.stderr)
+        manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        self.assertEqual(manifest.get("source_commit"), c2)
+        self.assertEqual(manifest.get("source_commit_source"), "install")
+        releases = sorted(path for path in (self.home / "releases").iterdir() if path.is_dir())
+        self.assertEqual(len(releases), 1)
+        pre_upgrade = releases[0]
+        release_manifest = json.loads((pre_upgrade / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(release_manifest.get("source_commit"), c2)
+        self.assertEqual(release_manifest.get("installed_source_commit"), c1)
+        self.assertEqual(release_manifest.get("installed_source_commit_source"), "install")
+
+        rolled = self.upgrade(v2, "--no-opencode", "--no-agy", "--rollback", pre_upgrade.name)
+        self.assertEqual(rolled.returncode, 0, rolled.stderr)
+        manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        self.assertEqual(manifest.get("source_commit"), c1)
+        self.assertEqual(manifest.get("source_commit_source"), "restore")
+        self.assertIn('__version__ = "old"', (self.home / "lib" / "agent_handoff" / "__init__.py").read_text())
+
+        self.assertEqual(self.upgrade(v2, "--no-opencode", "--no-agy").returncode, 0)
+        repeated = self.upgrade(v2, "--no-opencode", "--no-agy", "--rollback", "latest")
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        self.assertEqual(manifest.get("source_commit"), c1)
+        self.assertEqual(manifest.get("source_commit_source"), "restore")
+
+    def test_failed_upgrade_auto_rollback_restores_installed_source_commit(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is unavailable")
+        self.seed_integrations()
+        v1, c1 = make_git_source(self.root / "failure-commit-v1", "old", "// plugin-v1\n")
+        self.assertEqual(self.install(v1).returncode, 0)
+        v2, _c2 = make_git_source(self.root / "failure-commit-v2", "new", "// plugin-v2\n")
+        inject_mid_install_failure(v2 / "setup" / "install.py")
+        result = self.upgrade(v2)
+        self.assertNotEqual(result.returncode, 0)
+        manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        self.assertEqual(manifest.get("source_commit"), c1)
+        self.assertEqual(manifest.get("source_commit_source"), "restore")
+        self.assertIn('__version__ = "old"', (self.home / "lib" / "agent_handoff" / "__init__.py").read_text())
+        self.assert_runtime_preserved()
+
+    def test_non_git_install_records_unknown_source_commit(self) -> None:
+        source = make_source(self.root / "non-git-commit-source", version="current")
+        self.assertEqual(self.install(source, "--no-opencode", "--no-agy").returncode, 0)
+        manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        self.assertIsNone(manifest.get("source_commit"))
+        self.assertEqual(manifest.get("source_commit_source"), "install")
+
+    def test_legacy_release_source_commit_is_not_trusted_as_installed_content(self) -> None:
+        v1 = make_source(self.root / "legacy-commit-v1", version="old")
+        self.assertEqual(self.install(v1, "--no-opencode", "--no-agy").returncode, 0)
+        v2 = make_source(self.root / "legacy-commit-v2", version="new")
+        self.assertEqual(self.upgrade(v2, "--no-opencode", "--no-agy").returncode, 0)
+        pre_upgrade = sorted(path for path in (self.home / "releases").iterdir() if path.is_dir())[0]
+        release_manifest = json.loads((pre_upgrade / "manifest.json").read_text(encoding="utf-8"))
+        legacy_commit = "a" * 40
+        release_manifest["source_commit"] = legacy_commit
+        release_manifest.pop("installed_source_commit", None)
+        release_manifest.pop("installed_source_commit_source", None)
+        (pre_upgrade / "manifest.json").write_text(json.dumps(release_manifest), encoding="utf-8")
+
+        rolled = self.upgrade(v2, "--no-opencode", "--no-agy", "--rollback", pre_upgrade.name)
+        self.assertEqual(rolled.returncode, 0, rolled.stderr)
+        manifest = json.loads((self.home / MANIFEST).read_text(encoding="utf-8"))
+        self.assertIsNone(manifest.get("source_commit"))
+        self.assertNotEqual(manifest.get("source_commit"), legacy_commit)
+        self.assertEqual(manifest.get("source_commit_source"), "restore")
 
     def test_legacy_snapshot_fails_safely_without_removing_files(self) -> None:
         source = make_source(self.root / "legacy-source", version="current")

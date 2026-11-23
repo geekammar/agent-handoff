@@ -21,6 +21,7 @@ from managed import (  # noqa: E402
     ManifestError,
     load_manifest,
     safe_target,
+    source_commit,
     walk_files,
     write_manifest,
 )
@@ -41,20 +42,6 @@ def releases_root(home: Path) -> Path:
     root = home / "releases"
     root.mkdir(parents=True, exist_ok=True)
     return root
-
-
-def source_commit(source: Path) -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(source), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return result.stdout.strip() if result.returncode == 0 else None
 
 
 def unique_release(target: Path) -> Path:
@@ -92,6 +79,11 @@ def snapshot(home: Path, label: str) -> Path | None:
     else:
         files = present
         origin = "snapshot-inventory"
+    installed_commit = None
+    installed_commit_source = None
+    if runtime_manifest and runtime_manifest.get("source_commit_source") in {"install", "restore"}:
+        installed_commit = runtime_manifest.get("source_commit")
+        installed_commit_source = runtime_manifest.get("source_commit_source")
     if not files:
         log("no installed managed files to snapshot")
         return None
@@ -112,6 +104,8 @@ def snapshot(home: Path, label: str) -> Path | None:
             "label": label,
             "source": str(SOURCE),
             "source_commit": source_commit(SOURCE),
+            "installed_source_commit": installed_commit,
+            "installed_source_commit_source": installed_commit_source,
             "home": str(home),
             "origin": origin,
         },
@@ -121,6 +115,8 @@ def snapshot(home: Path, label: str) -> Path | None:
         "label": label,
         "source": str(SOURCE),
         "source_commit": source_commit(SOURCE),
+        "installed_source_commit": installed_commit,
+        "installed_source_commit_source": installed_commit_source,
         "home": str(home),
         "items": sorted({item.parts[0] for item in files}),
         "files": len(files),
@@ -197,7 +193,8 @@ def restore(home: Path, release: Path) -> None:
             "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
             "state": "restored",
             "release": release.name,
-            "source_commit": release_manifest.get("source_commit"),
+            "source_commit": release_manifest.get("installed_source_commit"),
+            "source_commit_source": "restore",
         },
     )
     log(f"restored code from: {release} ({restored} file(s) restored, {removed} newer file(s) removed)")
@@ -228,7 +225,10 @@ def list_releases(home: Path) -> int:
             metadata = json.loads((path / "release.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             pass
-        log(f"{path.name}  commit={metadata.get('source_commit') or 'unknown'}")
+        log(
+            f"{path.name}  installed={metadata.get('installed_source_commit') or 'unknown'} "
+            f"upgrade_source={metadata.get('source_commit') or 'unknown'}"
+        )
     return 0
 
 

@@ -19,6 +19,7 @@ from managed import (  # noqa: E402
     ManifestError,
     load_manifest,
     safe_target,
+    source_commit,
     source_files,
     write_manifest,
 )
@@ -125,7 +126,17 @@ def sync_code(source: Path, home: Path) -> None:
             removed += 1
         elif dst.exists():
             log(f"warning: not removing non-file managed path: {relative}")
-    write_manifest(manifest, selected_paths, {"updated_at": timestamp(), "state": "installed"})
+    write_manifest(
+        manifest,
+        selected_paths,
+        {
+            "updated_at": timestamp(),
+            "state": "installed",
+            "source": str(source),
+            "source_commit": source_commit(source),
+            "source_commit_source": "install",
+        },
+    )
     log(f"code synchronized: {copied} file(s) updated, {removed} obsolete file(s) removed in {home}")
 
 
