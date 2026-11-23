@@ -9,6 +9,7 @@ from .coding.milestones import milestone_state
 from ..util import FileLock, atomic_write_json, ensure_dir, read_json, utcnow_iso, utcnow_iso_precise
 
 SCHEMA = 1
+UNCHANGED = object()
 TERMINAL_STATUSES = {"ISSUE_UPDATED", "REJECTED", "NEEDS_ATTENTION"}
 ACTIVE_STATUSES = {
     "NEW",
@@ -94,16 +95,25 @@ class Ledger:
         self,
         repository: str,
         issue_number: int,
-        mutator: Callable[[dict[str, Any]], None],
+        mutator: Callable[[dict[str, Any]], Any],
         *,
         note: str | None = None,
     ) -> dict[str, Any]:
+        """Apply one mutator under the ledger lock.
+
+        A mutator may return ``UNCHANGED`` to report that the authoritative
+        record needs no mutation. That skips the history entry, ``updated_at``,
+        and the file write while preserving the existing behavior of mutators
+        that return ``None``.
+        """
+
         with self.lock():
             record = self.get(repository, issue_number)
             if not record:
                 raise FileNotFoundError(f"dispatch record not found: {repository}#{issue_number}")
             before = record.get("status")
-            mutator(record)
+            if mutator(record) is UNCHANGED:
+                return record
             if note or record.get("status") != before:
                 record.setdefault("history", []).append(
                     {"at": utcnow_iso(), "status": record.get("status"), "note": note or ""}
