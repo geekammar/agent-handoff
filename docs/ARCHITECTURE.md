@@ -23,6 +23,7 @@ The installer applies one source-selection policy to Git and non-Git checkouts. 
 
 - `cli.py`: argument parsing and command handlers.
 - `config.py`: defaults, runtime config, project name/path resolution, auto-registration.
+- `guided_setup.py`: read-only environment discovery, deterministic JSON setup plans, narrowly allowlisted configuration apply with validation, mode-600 backup, atomic write, recovery journal, rollback, and secrets-free output.
 - `report.py`: required-section enforcement and report rendering.
 - `store.py`: task/run directories, atomic JSON/Markdown writes, session map, indexes, queue items.
 - `upload.py`: rclone command wrapper, hierarchy checks, upload, MD5/read-back verification, retry backoff, worker lock, direct Drive file ID lookup, remote metadata reads.
@@ -166,6 +167,14 @@ v1.1 resolves that truthfully:
 5. Record publication only after the direct URL is available.
 
 `dispatch deliver` applies the same process to an existing run without invoking an agent. It targets only the requested task/run; it does not reconcile unrelated pending queue entries.
+
+## Guided setup model
+
+Setup separates environment discovery, prerequisite validation, configuration planning, safe application, and post-setup verification. `agent-handoff setup plan` never creates the runtime config, directories, backups, or journals. It reuses `validate_core_config`, `validate_dispatch_config`, and `validate_notification_config`, and it reports checks with `ready`/`missing`/`optional`/`blocked` statuses scoped to core capture, installation, capture, dispatch, or coding.
+
+Configuration apply accepts only `drive` folder identifiers/names, `workspace_roots`, and `auto_register_projects`. It merges into the existing JSON object rather than replacing it, rejects secret-like or unsupported fields as blocking errors even on a fresh host, validates the merged runtime view, writes a mode-600 backup and recovery journal, atomically replaces the file with mode 600, re-validates, and restores the previous content on failure. Rollback is verified against the recorded previous SHA-256 before the journal is removed; a failed rollback leaves the journal and backup with a `rollback_failed` status. Apply and recovery share the existing configuration lock, and recovery inspection plus journal deletion happen under that lock. It asserts that dispatch, notification, security, project, storage, integration, and upload sections are unchanged, so it cannot enable a service, coding, isolation, `workspace_write`, or Telegram. An interrupted apply is reconciled only when the current file hash matches a recorded state; otherwise it fails closed as ambiguous.
+
+Drive discovery distinguishes a locally configured rclone remote from live access. The default plan never performs a live Drive request. `setup plan --check-drive` is an explicit, bounded, read-only rclone listing; otherwise `auth --check` or `doctor` remains the live verification path.
 
 ## Upgrade model
 
