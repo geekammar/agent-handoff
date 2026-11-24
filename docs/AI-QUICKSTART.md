@@ -68,9 +68,10 @@ Read the machine-readable result before acting:
 - `ok` covers core and install blockers;
 - `all_scopes_ready` also covers optional dispatch state;
 - `remaining_required_steps`, `next_actions`, and `blockers` list what remains;
-- `config_plan` previews only explicitly requested configuration changes.
+- `config_plan` previews only explicitly requested configuration changes; `requested: true` with `valid: false` is an invalid patch and must be corrected, never ignored;
+- a configured rclone remote is local configuration only; live Drive access requires `agent-handoff auth --check`, `agent-handoff doctor`, or an explicit `agent-handoff setup plan --check-drive --json`.
 
-A read-only plan does not write configuration. Do not invent missing values. Ask the user for their own Drive folder id, project name, and project path.
+A read-only plan does not write configuration. The default plan performs no live Google Drive call. `--check-drive` performs one bounded read-only listing and never logs in, changes tokens, or creates folders. Do not invent missing values. Ask the user for their own Drive folder id, project name, and project path.
 
 If the plan reports `setup.recovery` required, run `agent-handoff setup recover --approve --json` only after reviewing the reported status. Never delete an ambiguous journal yourself.
 
@@ -149,7 +150,7 @@ If `agent-handoff setup plan --json` reports `setup.recovery` with `required: tr
 3. run `agent-handoff setup recover --approve --json`;
 4. run `agent-handoff setup plan --json` and `agent-handoff config validate --json` again.
 
-`setup recover` only finalizes cleanup when the current configuration exactly matches a recorded state. An `ambiguous` state fails closed and is left for the owner to review.
+`setup recover` uses the same configuration lock as `setup apply` and only finalizes cleanup when the current configuration exactly matches a recorded state. An `ambiguous`, unreadable, or `rollback_failed` state fails closed and is left for the owner to review.
 
 ## Continuing without shell access
 

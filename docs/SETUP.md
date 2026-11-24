@@ -9,9 +9,12 @@ The existing commands remain the source of truth for each operation: `agent-hand
 ```bash
 agent-handoff setup plan
 agent-handoff setup plan --json
+agent-handoff setup plan --check-drive --json
 ```
 
 `setup plan` never writes configuration, credentials, service units, or reports. It runs local discovery, reports completed and remaining steps, and previews any requested configuration change.
+
+The default plan does not prove live Google Drive access. `--check-drive` is the only way the plan performs a Drive access check: one bounded, read-only `rclone lsd` request. It never changes tokens, OAuth state, or folders. Without that explicit flag, a configured remote is reported as locally configured only, and `agent-handoff auth --check` / `agent-handoff doctor` remains the required live verification.
 
 ```bash
 agent-handoff setup apply --approve --drive-root-folder-id <ROOT_FOLDER_ID> --json
@@ -77,7 +80,7 @@ Scopes separate required core capture from optional integrations:
 
 | Scope | Examples |
 | --- | --- |
-| `core` | Linux, Python 3.10+, rclone, Agent Handoff installation, runtime configuration, Drive authorization, project mapping, recovery state |
+| `core` | Linux, Python 3.10+, rclone, Agent Handoff installation, runtime configuration, local Drive remote configuration, project mapping, recovery state |
 | `install` | git for source checkout, install, upgrade, and rollback |
 | `capture` | OpenCode for automatic capture |
 | `dispatch` | GitHub CLI, GitHub authorization, dispatcher configuration and service unit |
@@ -96,7 +99,8 @@ A JSON plan includes:
 - `steps` plus `completed_steps`, `remaining_required_steps`, `blocked_required_steps`, and `optional_steps`;
 - `next_actions` with safe commands, approval flags, and placeholder markers;
 - `blockers` with scope and next action;
-- `recovery` state for an interrupted apply;
+- `recovery` state for an interrupted apply, including `rollback_failed`;
+- explicit Drive state: `drive_remote_present`, `drive_live_checked`, `drive_live_connected`, and `drive_live_error`;
 - `config_plan` with requested fields, changes, validation errors, backup and atomic-write expectations, and forbidden activations;
 - `approval_required`.
 
@@ -123,6 +127,19 @@ Everything else is excluded. In particular, `setup apply` rejects:
 
 Project mappings are added with `agent-handoff project add`, which verifies the Drive folder. Dispatcher and coding policy remain separate owner decisions in `docs/DISPATCH.md` and `docs/SECURE-CODING.md`.
 
+## Invalid requested patches
+
+Any requested patch that contains an unsupported, forbidden, secret-like, empty, or invalid value fails closed:
+
+- `config_plan.requested` is `true`;
+- `config_plan.valid` is `false`;
+- `config_plan.errors` names the invalid field or value without echoing a secret;
+- `config_plan.changes` is empty and `changes_required` is `false`;
+- `config_plan` is a blocker even when no runtime configuration exists yet;
+- `setup plan --json` exits nonzero and `setup apply` never writes.
+
+The human-readable plan prints the invalid proposal and a correction instruction. Supplying only invalid fields is never treated as an empty no-op.
+
 ## Apply safety contract
 
 `setup apply --approve`:
@@ -131,12 +148,15 @@ Project mappings are added with `agent-handoff project add`, which verifies the 
 2. preserves unknown existing fields and every unrelated project, dispatch, notification, and security value;
 3. validates the proposed runtime view with the existing core, dispatcher, and notification validators before writing;
 4. writes a mode-600 backup when a configuration file already exists;
-5. writes a recovery journal, then replaces the configuration atomically with mode 600;
+5. writes a mode-600 recovery journal, then replaces the configuration atomically with mode 600;
 6. re-reads and re-validates the written file;
 7. restores the previous file if validation, a write step, or the round-trip check fails;
-8. leaves a retained backup for manual recovery;
-9. is idempotent: repeated execution with unchanged values reports `changed: false` and writes nothing;
-10. never activates a dispatcher service, coding, isolation, or notifications.
+8. verifies the restored SHA-256 before removing the journal;
+9. preserves the journal and backup when rollback fails, marks the journal `rollback_failed`, and fails closed;
+10. leaves a retained backup for manual recovery;
+11. is idempotent: repeated execution with unchanged values reports `changed: false` and writes nothing;
+12. uses the same `config.lock` contract as configuration apply and refuses to continue if the lock cannot be acquired;
+13. never activates a dispatcher service, coding, isolation, or notifications.
 
 Approval is required whenever configuration content would change. Running `setup apply --json` without `--approve` prints a valid JSON preview and exits non-zero with `approval_required: true`.
 
@@ -146,11 +166,15 @@ No apply operation stores a secret in configuration. Drive and GitHub authorizat
 
 Before replacing the configuration, `setup apply` writes a mode-600 journal that records the previous and proposed SHA-256 values and the backup path.
 
+The journal records whether a previous configuration existed, the previous and proposed SHA-256 values, and the backup path. Apply and recovery use the same existing configuration lock; recovery cannot inspect or delete a journal while an apply holds that lock.
+
 If the process is interrupted:
 
 - `setup plan` reports `setup.recovery` as blocked and names the recovery status;
 - `setup recover --approve` finalizes cleanup when the current file exactly matches either recorded state;
-- an ambiguous state is never guessed or overwritten; the journal and backup remain for manual review.
+- `rollback_failed` means automatic restoration did not produce the recorded previous content; the journal and backup are preserved and recovery refuses to guess;
+- an `ambiguous` or unreadable state is never guessed or overwritten; the journal and backup remain for manual review;
+- repeated recovery is safe and reports `changed: false` when no journal remains.
 
 Do not delete a setup journal by hand without comparing the configuration and backup first.
 
@@ -191,6 +215,23 @@ Use the user's own account. The plan only reports whether `gh auth status` succe
 
 ## Google Drive authorization
 
+`rclone listremotes` only proves that a remote is configured locally. It does not prove that the token works, that Drive is reachable, or that the reports folder is accessible.
+
+Required live verification:
+
+```bash
+agent-handoff auth --check
+agent-handoff doctor
+```
+
+Optional explicit setup plan check:
+
+```bash
+agent-handoff setup plan --check-drive --json
+```
+
+`--check-drive` performs one bounded read-only Google Drive listing. It does not log in, refresh or rewrite credentials, create folders, or upload reports.
+
 Interactive browser flow:
 
 ```bash
@@ -221,7 +262,7 @@ Use an exact provider/model ID from that output in `dispatch.models`. Issue text
 ## Verifying the finished setup
 
 ```bash
-agent-handoff setup plan --json
+agent-handoff setup plan --check-drive --json
 agent-handoff config validate --json
 agent-handoff doctor --json
 agent-handoff list --project ProjectA --json
@@ -230,7 +271,7 @@ agent-handoff list --project ProjectA --json
 Confirm the four facts separately:
 
 1. installation and configuration are present and valid;
-2. Drive authorization and project hierarchy are verified;
+2. Drive live access is verified by `auth --check`, `doctor`, or an explicit `setup plan --check-drive`, and the project hierarchy is verified;
 3. at least one run is upload-verified;
 4. any dispatcher, publication, or notification claim has its own evidence.
 

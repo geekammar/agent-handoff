@@ -48,7 +48,8 @@ Run `agent-handoff setup plan --json` first. Checks are scoped to `core`, `insta
 Choose one path for missing prerequisites:
 
 - missing rclone: install it and re-run the plan;
-- no Drive authorization: run `agent-handoff auth` or import a mode-600 token file produced by `rclone authorize "drive"`;
+- no local Drive remote: run `agent-handoff auth` or import a mode-600 token file produced by `rclone authorize "drive"`;
+- local remote configured but live access unknown: run `agent-handoff auth --check` or `agent-handoff doctor`, or explicitly run `agent-handoff setup plan --check-drive --json`;
 - no project: run `agent-handoff project add` after Drive authorization;
 - missing GitHub authorization for dispatch: run `gh auth login` with your own account;
 - missing OpenCode: install it only if you want automatic capture or dispatch.
@@ -58,6 +59,18 @@ Choose one path for missing prerequisites:
 `setup plan` and `setup apply` fail closed when the runtime configuration is invalid JSON or fails the existing core, dispatcher, or notification validators. Guided setup never overwrites an invalid file blindly. Restore a valid file from your own backup or fix the reported error, then re-run the plan.
 
 A symbolic-link configuration is also refused; replace it with a regular mode-600 file before applying changes.
+
+## Guided setup rejects my requested change
+
+`setup plan` reports `config_plan.requested: true` with `config_plan.valid: false` and `config_plan.errors` when any requested field is unsupported, forbidden, secret-like, empty, or invalid. This is a blocker even on a fresh host with no `config.json`; it is never treated as an empty no-op.
+
+The human plan prints the invalid proposal and a correction instruction. Fix or remove the named field, then rerun:
+
+```bash
+agent-handoff setup plan --json
+```
+
+`setup apply` does not write anything while the proposal is invalid. A mixed patch is rejected as a whole, not partially applied.
 
 ## Guided setup requires approval
 
@@ -74,7 +87,11 @@ If `setup plan --json` reports `setup.recovery.required: true`:
 3. run `agent-handoff setup recover --approve --json`;
 4. re-run `agent-handoff setup plan --json` and `agent-handoff config validate --json`.
 
-`setup recover` finalizes cleanup only when the current file hash matches the recorded previous or proposed state. An `ambiguous` state is preserved for manual review and is never guessed.
+`setup recover` uses the same configuration lock as `setup apply`. While an apply holds that lock, recovery waits and cannot delete the active journal. If the lock cannot be acquired, recovery fails closed without changing files.
+
+Recovery finalizes cleanup only when the current file hash matches the recorded previous or proposed state. An `ambiguous`, unreadable, or `rollback_failed` state is preserved for manual review and is never guessed. `rollback_failed` means the previous configuration was not verifiably restored; do not retry blindly.
+
+Repeated recovery is safe: once the journal is gone, another recovery reports `changed: false`.
 
 A retained `.backup-setup-*` file is the recoverable pre-apply configuration.
 
@@ -85,6 +102,7 @@ Symptoms:
 - `doctor` reports `Google Drive access: rclone config not found` or `Not ready`.
 - Queue items show `Google Drive unavailable`.
 - `agent-handoff auth --check` exits nonzero.
+- `setup plan` reports the Drive remote as configured locally; that alone does not prove live access.
 
 Fix:
 

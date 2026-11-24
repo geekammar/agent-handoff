@@ -59,9 +59,12 @@ Start with the read-only plan:
 ```bash
 agent-handoff setup plan
 agent-handoff setup plan --json
+agent-handoff setup plan --check-drive --json
 ```
 
 Statuses are `ready`, `missing`, `optional`, and `blocked`; scopes are `core`, `install`, `capture`, `dispatch`, and `coding`. Core capture does not require optional dispatch or coding prerequisites.
+
+A locally configured rclone remote is not live Drive authorization. The default plan performs no live Drive call; `--check-drive` performs one bounded read-only listing. Use `agent-handoff auth --check` or `agent-handoff doctor` for the normal live verification.
 
 Preview and apply only explicitly supported configuration fields:
 
@@ -70,7 +73,7 @@ agent-handoff setup plan --json --drive-root-folder-id <ROOT_FOLDER_ID>
 agent-handoff setup apply --approve --json --drive-root-folder-id <ROOT_FOLDER_ID>
 ```
 
-`setup apply` preserves unknown fields, validates the proposed configuration, creates a mode-600 backup, writes atomically, re-validates, and rolls back on failure. It never enables the dispatcher, coding, `workspace_write`, isolation, notifications, or a service, and never stores credentials. If an apply is interrupted, read the reported recovery state and run `agent-handoff setup recover --approve --json`; never delete an ambiguous journal.
+`setup apply` preserves unknown fields, validates the proposed configuration, creates a mode-600 backup, writes atomically, re-validates, and rolls back on failure. A rollback is verified against the previous SHA-256; a failed rollback preserves the journal and backup and fails closed. Apply and recovery use the same configuration lock. Invalid or forbidden patches fail closed and are never treated as empty no-ops. Setup never enables the dispatcher, coding, `workspace_write`, isolation, notifications, or a service, and never stores credentials. If an apply is interrupted, read the reported recovery state and run `agent-handoff setup recover --approve --json`; never delete an ambiguous or `rollback_failed` journal.
 
 See `docs/SETUP.md` for the full contract.
 
@@ -138,7 +141,7 @@ agent-handoff dispatch notify --retry --json      # retry confirmed Telegram fai
 agent-handoff dispatch notify --retry --notification <id> --acknowledge-duplicate --json
 ```
 
-- An interrupt during setup apply is recoverable with `setup recover --approve`; an ambiguous journal fails closed.
+- An interrupt during setup apply is recoverable with `setup recover --approve`; an ambiguous, unreadable, or `rollback_failed` journal fails closed.
 - An interrupt during upload is safe: the existing task/run/session identity is reused. Do not submit a duplicate issue.
 - Upload failure: retry upload only.
 - GitHub publication failure: retry publication only.

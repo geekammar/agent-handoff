@@ -77,13 +77,15 @@ For a non-standard location use `--home` and `--bin-link`. The installer preserv
 
 1. Run `agent-handoff setup plan --json` first. It is read-only and deterministic for the same host and configuration.
 2. Interpret statuses `ready`, `missing`, `optional`, and `blocked`; scopes are `core`, `install`, `capture`, `dispatch`, and `coding`.
-3. Complete required core steps first: installation, valid configuration, Drive root folder id, Drive authorization, one project mapping, and one upload-verified capture.
-4. Preview a configuration change before applying it. Never apply an unreviewed proposal.
-5. `agent-handoff setup apply` requires `--approve`. It only supports `drive` folder identifiers/names, `workspace_roots`, and `auto_register_projects`.
-6. Never use setup to enable `dispatch.enabled`, coding, `workspace_write`, isolation, notifications, or a systemd service.
-7. If `setup plan` reports recovery required, run `agent-handoff setup recover --approve --json` only after reviewing the journal status. Do not delete or overwrite an ambiguous journal.
-8. Never place credentials in a setup plan, journal, backup, config file, report, log, comment, or Git history.
-9. If an AI assistant lacks shell access, it must provide the documented commands and ask the user to run them. It must not claim installation, authorization, upload, or verification succeeded.
+3. Complete required core steps first: installation, valid configuration, Drive root folder id, local Drive remote configuration, live Drive verification, one project mapping, and one upload-verified capture.
+4. A configured rclone remote is not proof of live Drive access. Use `agent-handoff setup plan --check-drive --json` for an explicit bounded read-only check, or `agent-handoff auth --check` / `agent-handoff doctor`. The default plan performs no live Drive call.
+5. Preview a configuration change before applying it. Never apply an unreviewed proposal.
+6. `agent-handoff setup apply` requires `--approve`. It only supports `drive` folder identifiers/names, `workspace_roots`, and `auto_register_projects`.
+7. Any invalid, forbidden, secret-like, empty, or unsupported patch must fail closed. Never treat an invalid patch as an empty no-op.
+8. Never use setup to enable `dispatch.enabled`, coding, `workspace_write`, isolation, notifications, or a systemd service.
+9. Apply and recovery use the same configuration lock. If `setup plan` reports recovery required, run `agent-handoff setup recover --approve --json` only after reviewing the journal status. Do not delete or overwrite an ambiguous or `rollback_failed` journal.
+10. Never place credentials in a setup plan, journal, backup, config file, report, log, comment, or Git history.
+11. If an AI assistant lacks shell access, it must provide the documented commands and ask the user to run them. It must not claim installation, authorization, upload, or verification succeeded.
 
 ## Dispatcher setup
 
@@ -130,6 +132,8 @@ Add `task: coding` only when the selected project has an explicit owner-enabled 
 - Do not run persistent background processes or enable systemd services during tests.
 - Keep Telegram disabled unless deliberately configured. The bot token belongs only in the environment variable named by `notifications.telegram.token_env`; never in config, reports, logs, or Issues.
 - Guided setup planning must not write configuration. Configuration apply must validate first, preserve unknown fields, create a mode-600 backup, write atomically, and roll back on failure.
+- Verify a rollback against the recorded previous SHA-256 before removing the journal. If rollback fails, preserve the journal and backup and fail closed.
+- Apply and recovery must use the existing configuration lock contract; do not create a competing lock or recurse into the same lock.
 - Do not activate a systemd service, coding, or write-capable isolation through setup.
 
 ## Tests

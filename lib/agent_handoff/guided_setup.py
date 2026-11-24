@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import os
@@ -9,11 +10,12 @@ import shutil
 import stat
 import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
-from .config import BASE_DIR, CONFIG_PATH, DEFAULT_CONFIG, deep_merge, storage_path
+from .config import BASE_DIR, DEFAULT_CONFIG, config_lock as default_config_lock, deep_merge, storage_path
 from .dispatch.config import DispatchConfigError, validate_core_config, validate_dispatch_config
 from .notify.config import NotificationConfigError, validate_notification_config
 from .util import (
@@ -112,6 +114,7 @@ class SetupPatch:
     values: dict[str, Any] = field(default_factory=dict)
     paths: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    attempted: bool = False
 
     @property
     def requested(self) -> bool:
@@ -129,13 +132,35 @@ def config_path_from_env() -> Path:
     return BASE_DIR / "config" / "config.json"
 
 
+def _config_path(config_path: Path | str | None = None) -> Path:
+    candidate = str(config_path) if config_path is not None else str(config_path_from_env())
+    return Path(os.path.abspath(os.path.expanduser(candidate)))
+
+
 def journal_path_for(config_path: Path) -> Path:
     return config_path.with_name(f".{config_path.name}{JOURNAL_SUFFIX}")
 
 
+@contextmanager
+def _locked_configuration(config_lock: Callable[[], Any] | None = None) -> Iterator[None]:
+    factory = config_lock or default_config_lock
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(factory())
+        except TimeoutError as exc:
+            raise SetupError(
+                "cannot acquire the configuration lock; no setup changes were made. "
+                "Wait for the other configuration operation to finish and retry."
+            ) from exc
+        except OSError as exc:
+            raise SetupError(
+                f"cannot acquire the configuration lock: {sanitize_error(str(exc))}; no setup changes were made"
+            ) from exc
+        yield
+
+
 def read_config_state(config_path: Path | str | None = None, *, defaults: Mapping[str, Any] | None = None) -> ConfigState:
-    candidate = str(config_path) if config_path is not None else str(config_path_from_env())
-    path = Path(os.path.abspath(os.path.expanduser(candidate)))
+    path = _config_path(config_path)
     base_defaults = copy.deepcopy(dict(defaults or DEFAULT_CONFIG))
     if not path.exists() and not path.is_symlink():
         return ConfigState(
@@ -227,6 +252,7 @@ def normalize_setup_patch(patch: Mapping[str, Any] | None) -> SetupPatch:
     result = SetupPatch()
     if not patch:
         return result
+    result.attempted = True
     if not isinstance(patch, Mapping):
         result.errors.append("configuration patch must be an object")
         return result
@@ -503,6 +529,28 @@ def _drive_remote_state(config: Mapping[str, Any], runner: Callable[[list[str], 
     }
 
 
+def _drive_live_state(
+    drive: Mapping[str, Any],
+    runner: Callable[[list[str], float], tuple[int, str, str]],
+    timeout: float,
+) -> dict[str, Any]:
+    if not drive.get("enabled") or not drive.get("remote_present") or not drive.get("rclone"):
+        return {"checked": False, "connected": False, "error": None}
+    bounded = max(1.0, min(float(timeout or 30.0), 120.0))
+    code, stdout, stderr = runner(
+        [str(drive["rclone"]), "lsd", f"{drive['remote']}:", "--max-depth", "1"],
+        bounded,
+    )
+    if code == 0:
+        return {"checked": True, "connected": True, "error": None, "timeout_seconds": bounded}
+    return {
+        "checked": True,
+        "connected": False,
+        "error": sanitize_error(stderr or stdout or "live Drive access check failed"),
+        "timeout_seconds": bounded,
+    }
+
+
 def dispatch_service_unit_path(home: Path | None = None) -> Path:
     override = os.environ.get("AGENT_HANDOFF_DISPATCH_UNIT")
     if override:
@@ -511,7 +559,7 @@ def dispatch_service_unit_path(home: Path | None = None) -> Path:
 
 
 def inspect_setup_recovery(config_path: Path | str | None = None) -> dict[str, Any]:
-    path = Path(config_path or CONFIG_PATH)
+    path = _config_path(config_path)
     journal_path = journal_path_for(path)
     if not journal_path.exists():
         return {"required": False, "status": "none", "journal": str(journal_path), "backup": None, "reason": None}
@@ -527,6 +575,20 @@ def inspect_setup_recovery(config_path: Path | str | None = None) -> dict[str, A
     before = journal.get("before_sha256")
     after = journal.get("after_sha256")
     backup = journal.get("backup")
+    stage = journal.get("stage")
+    if journal.get("rollback_failed") is True or stage == "rollback_failed":
+        rollback_error = journal.get("rollback_error")
+        return {
+            "required": True,
+            "status": "rollback_failed",
+            "journal": str(journal_path),
+            "backup": backup if isinstance(backup, str) else None,
+            "reason": sanitize_error(
+                "automatic rollback failed; the setup journal and backup are preserved for manual review"
+                + (f": {rollback_error}" if isinstance(rollback_error, str) and rollback_error else "")
+            ),
+            "stage": stage,
+        }
     try:
         current_text = path.read_text(encoding="utf-8") if path.exists() else None
     except OSError as exc:
@@ -534,14 +596,20 @@ def inspect_setup_recovery(config_path: Path | str | None = None) -> dict[str, A
             "required": True,
             "status": "unreadable",
             "journal": str(journal_path),
-            "backup": backup,
+            "backup": backup if isinstance(backup, str) else None,
             "reason": sanitize_error(f"cannot read configuration during recovery inspection: {exc}"),
+            "stage": stage,
         }
+    before_exists = journal.get("before_exists")
+    if not isinstance(before_exists, bool):
+        before_exists = isinstance(before, str)
     current = sha256_text(current_text) if current_text is not None else None
     if current is not None and current == after:
         status = "complete_cleanup_required"
         reason = "the proposed configuration was written; finalize by removing the setup journal"
-    elif current == before:
+    elif (before_exists and isinstance(before, str) and current == before) or (
+        not before_exists and current_text is None
+    ):
         status = "rollback_cleanup_required"
         reason = "the previous configuration is already present; finalize by removing the setup journal"
     else:
@@ -553,12 +621,11 @@ def inspect_setup_recovery(config_path: Path | str | None = None) -> dict[str, A
         "journal": str(journal_path),
         "backup": backup if isinstance(backup, str) else None,
         "reason": reason,
+        "stage": stage,
     }
 
 
-def recover_setup(config_path: Path | str | None = None, *, approve: bool = False) -> dict[str, Any]:
-    if not approve:
-        raise SetupApprovalError("setup recovery requires explicit approval (--approve)")
+def _recover_setup_locked(config_path: Path | str | None = None) -> dict[str, Any]:
     info = inspect_setup_recovery(config_path)
     if not info.get("required"):
         return {"ok": True, "changed": False, "recovery": info}
@@ -571,7 +638,26 @@ def recover_setup(config_path: Path | str | None = None, *, approve: bool = Fals
         journal.unlink()
     except FileNotFoundError:
         pass
+    except OSError as exc:
+        raise SetupRecoveryError(
+            f"setup recovery could not remove the journal: {sanitize_error(str(exc))}; "
+            "the journal was preserved for a safe retry"
+        ) from exc
+    if journal.exists():
+        raise SetupRecoveryError("setup recovery did not remove the journal; manual review is required")
     return {"ok": True, "changed": True, "recovery": info}
+
+
+def recover_setup(
+    config_path: Path | str | None = None,
+    *,
+    approve: bool = False,
+    config_lock: Callable[[], Any] | None = None,
+) -> dict[str, Any]:
+    if not approve:
+        raise SetupApprovalError("setup recovery requires explicit approval (--approve)")
+    with _locked_configuration(config_lock):
+        return _recover_setup_locked(config_path)
 
 
 def detect_environment(
@@ -583,6 +669,8 @@ def detect_environment(
     platform_system: str | None = None,
     version_info: tuple[int, ...] | None = None,
     verified_capture: bool | None = None,
+    check_drive_live: bool = False,
+    drive_timeout: float = 30.0,
 ) -> dict[str, Any]:
     runner = runner or _default_runner
     base = Path(base_dir or BASE_DIR)
@@ -849,6 +937,11 @@ def detect_environment(
         "remote": "gdrive",
         "error": "configuration is not available",
     }
+    drive_live = (
+        _drive_live_state(drive, runner, drive_timeout)
+        if check_drive_live
+        else {"checked": False, "connected": False, "error": None}
+    )
     if not drive["enabled"]:
         checks.append(
             _check(
@@ -856,8 +949,31 @@ def detect_environment(
                 "core",
                 STATUS_OPTIONAL,
                 "Upload is disabled in configuration",
-                detail="Reports will remain local.",
+                detail="Reports will remain local; live Drive access is not required.",
                 blocking=False,
+            )
+        )
+    elif drive["remote_present"] and drive_live["checked"] and drive_live["connected"]:
+        checks.append(
+            _check(
+                "drive.authorization",
+                "core",
+                STATUS_READY,
+                "Google Drive remote is configured and live access was verified by this explicit check",
+                detail=f"remote {drive['remote']}; a bounded read-only rclone listing succeeded and no token or folder was changed",
+                blocking=False,
+            )
+        )
+    elif drive["remote_present"] and drive_live["checked"]:
+        checks.append(
+            _check(
+                "drive.authorization",
+                "core",
+                STATUS_BLOCKED,
+                "Google Drive remote is configured but live access failed",
+                detail=drive_live.get("error") or "the live check failed",
+                next_action="Run agent-handoff auth --check or agent-handoff doctor, then re-authorize with agent-handoff auth if needed.",
+                blocking=True,
             )
         )
     elif drive["remote_present"]:
@@ -866,8 +982,12 @@ def detect_environment(
                 "drive.authorization",
                 "core",
                 STATUS_READY,
-                "Google Drive remote is configured",
-                detail=f"remote {drive['remote']} (authorization is verified without printing tokens)",
+                "Google Drive remote is configured locally",
+                detail=(
+                    f"remote {drive['remote']} is present in rclone config; "
+                    "live Drive access is not verified by the default setup plan"
+                ),
+                next_action="Run agent-handoff auth --check or agent-handoff doctor to verify live Drive access.",
                 blocking=False,
             )
         )
@@ -877,7 +997,7 @@ def detect_environment(
                 "drive.authorization",
                 "core",
                 STATUS_MISSING,
-                "Google Drive is not authorized",
+                "Google Drive remote is not configured",
                 detail=drive.get("error") or f"remote {drive['remote']} is not configured",
                 next_action="Run agent-handoff auth, or import a mode-600 token file produced by rclone authorize \"drive\".",
                 blocking=False,
@@ -1008,6 +1128,9 @@ def detect_environment(
             "config_mode": oct(state.mode) if state.mode is not None else None,
             "drive_remote_present": bool(drive.get("remote_present")),
             "drive_remote": drive.get("remote"),
+            "drive_live_checked": bool(drive_live.get("checked")),
+            "drive_live_connected": bool(drive_live.get("connected")),
+            "drive_live_error": drive_live.get("error"),
             "upload_enabled": bool(drive.get("enabled")),
             "project_count": len(projects),
             "projects_with_drive": len(projects_with_drive),
@@ -1078,6 +1201,8 @@ def build_setup_plan(
     platform_system: str | None = None,
     version_info: tuple[int, ...] | None = None,
     verified_capture: bool | None = None,
+    check_drive_live: bool = False,
+    drive_timeout: float = 30.0,
 ) -> dict[str, Any]:
     base_defaults = copy.deepcopy(dict(defaults or DEFAULT_CONFIG))
     state = state or read_config_state(config_path, defaults=base_defaults)
@@ -1090,6 +1215,8 @@ def build_setup_plan(
         platform_system=platform_system,
         version_info=version_info,
         verified_capture=verified_capture,
+        check_drive_live=check_drive_live,
+        drive_timeout=drive_timeout,
     )
     checks = environment["checks"]
     state_info = environment["state"]
@@ -1104,25 +1231,22 @@ def build_setup_plan(
     elif state.exists and state.is_symlink:
         state_errors = ["refusing to overwrite a symbolic-link configuration file"]
     config_errors.extend(state_errors)
-    if state.exists and state.valid_json:
+    patch_invalid = normalized_patch.attempted and not normalized_patch.valid
+    if patch_invalid:
+        config_errors = state_errors + list(normalized_patch.errors)
+    elif state.exists and state.valid_json:
         proposed_raw = _proposed_raw(state, normalized_patch, base_defaults)
-        if normalized_patch.valid:
-            changes = config_diff(state.raw, proposed_raw, normalized_patch.paths)
-            if changes:
-                validation = validate_setup_view(deep_merge(base_defaults, proposed_raw), check_paths=False)
-                config_errors = state_errors + validation["errors"]
-                config_warnings = validation["warnings"]
-        else:
-            config_errors = state_errors + list(normalized_patch.errors)
-    elif not state.exists and normalized_patch.requested:
-        proposed_raw = _proposed_raw(state, normalized_patch, base_defaults)
-        if normalized_patch.valid:
-            changes = config_diff({}, proposed_raw, normalized_patch.paths)
+        changes = config_diff(state.raw, proposed_raw, normalized_patch.paths)
+        if changes:
             validation = validate_setup_view(deep_merge(base_defaults, proposed_raw), check_paths=False)
-            config_errors = validation["errors"]
+            config_errors = state_errors + validation["errors"]
             config_warnings = validation["warnings"]
-        else:
-            config_errors = list(normalized_patch.errors)
+    elif not state.exists and normalized_patch.attempted:
+        proposed_raw = _proposed_raw(state, normalized_patch, base_defaults)
+        changes = config_diff({}, proposed_raw, normalized_patch.paths)
+        validation = validate_setup_view(deep_merge(base_defaults, proposed_raw), check_paths=False)
+        config_errors = validation["errors"]
+        config_warnings = validation["warnings"]
 
     changes_required = bool(changes) and normalized_patch.valid and not config_errors
     if normalized_patch.errors and not config_errors:
@@ -1150,7 +1274,9 @@ def build_setup_plan(
 
     config_check = _check_status(checks, "config.json")
     config_validation_blocked = _check_status(checks, "config.validation") == STATUS_BLOCKED
-    if state.exists and state.is_symlink:
+    if patch_invalid:
+        config_step_status = STEP_BLOCKED
+    elif state.exists and state.is_symlink:
         config_step_status = STEP_BLOCKED
     elif state.exists and state.valid_json:
         if changes_required:
@@ -1216,19 +1342,40 @@ def build_setup_plan(
         )
     )
 
-    drive_status = _map_status(_check_status(checks, "drive.authorization"))
+    drive_check_status = _check_status(checks, "drive.authorization")
+    drive_remote_present = bool(state_info["drive_remote_present"])
+    drive_live_checked = bool(state_info["drive_live_checked"])
+    drive_live_connected = bool(state_info["drive_live_connected"])
+    if drive_check_status == STATUS_OPTIONAL:
+        drive_step_status = STEP_OPTIONAL
+    elif drive_check_status == STATUS_BLOCKED:
+        drive_step_status = STEP_BLOCKED
+    elif drive_remote_present and drive_live_checked and drive_live_connected:
+        drive_step_status = STEP_COMPLETE
+    elif drive_remote_present and state_info["verified_capture"]:
+        drive_step_status = STEP_COMPLETE
+    elif drive_remote_present:
+        drive_step_status = STEP_PENDING
+    else:
+        drive_step_status = _map_status(drive_check_status)
     steps.append(
         _step(
             "drive.authorize",
-            "Authorize Google Drive",
+            "Verify Google Drive access",
             "core",
-            drive_status,
-            description="Authorize rclone with the account that owns the reports folder. The token is stored outside runtime configuration and is never printed.",
-            command=["agent-handoff", "auth"],
+            drive_step_status,
+            description=(
+                "A locally configured rclone remote does not prove live Drive access. "
+                "The default setup plan is read-only and does not perform live network checks. "
+                "An existing upload-verified capture is treated as historical evidence; otherwise run "
+                "agent-handoff auth --check or agent-handoff doctor for the required live verification. "
+                "Use setup plan --check-drive for an explicitly requested read-only check."
+            ),
+            command=["agent-handoff", "auth", "--check"] if drive_remote_present else ["agent-handoff", "auth"],
             required=True,
             automated=False,
             requires_approval=True,
-            mutates="credentials",
+            mutates="credentials" if not drive_remote_present else "none",
         )
     )
 
@@ -1343,14 +1490,14 @@ def build_setup_plan(
                     "next_action": check.get("next_action"),
                 }
             )
-    if config_errors and (normalized_patch.requested or not state.valid_json):
+    if config_errors and (normalized_patch.attempted or not state.valid_json):
         blockers.append(
             {
                 "id": "config.patch_invalid",
                 "scope": "core",
                 "summary": "Proposed configuration is invalid",
                 "detail": "; ".join(config_errors),
-                "next_action": "Correct the requested values or restore a valid configuration file.",
+                "next_action": "Correct or remove the reported setup field(s), or restore a valid configuration file.",
             }
         )
 
@@ -1410,7 +1557,8 @@ def build_setup_plan(
         "next_actions": next_actions,
         "recovery": environment["recovery"],
         "config_plan": {
-            "requested": normalized_patch.requested,
+            "requested": normalized_patch.attempted,
+            "valid": normalized_patch.valid and not config_errors,
             "field_paths": list(normalized_patch.paths),
             "changes_required": changes_required,
             "would_mutate_config": changes_required,
@@ -1457,6 +1605,32 @@ def _atomic_write_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
         raise
 
 
+def _rollback_previous_config(
+    path: Path,
+    previous_text: str | None,
+    previous_sha: str | None,
+) -> dict[str, Any]:
+    try:
+        if previous_text is None:
+            if path.exists() or path.is_symlink():
+                path.unlink()
+            if path.exists() or path.is_symlink():
+                return {"ok": False, "error": "configuration file still exists after rollback to a missing-file state"}
+            return {"ok": True, "restored_sha256": None}
+        expected_sha = previous_sha or sha256_text(previous_text)
+        atomic_write_text(path, previous_text, mode=0o600)
+        restored = path.read_text(encoding="utf-8")
+        restored_sha = sha256_text(restored)
+        if restored != previous_text or restored_sha != expected_sha:
+            return {
+                "ok": False,
+                "error": "restored configuration does not match the recorded previous content",
+            }
+        return {"ok": True, "restored_sha256": restored_sha}
+    except OSError as exc:
+        return {"ok": False, "error": sanitize_error(str(exc))}
+
+
 def apply_setup_patch(
     config_path: Path | str | None = None,
     *,
@@ -1468,17 +1642,14 @@ def apply_setup_patch(
 ) -> dict[str, Any]:
     if not approve:
         raise SetupApprovalError("configuration changes require explicit approval (--approve)")
-    path = Path(config_path or CONFIG_PATH)
+    path = _config_path(config_path)
     base_defaults = copy.deepcopy(dict(defaults or DEFAULT_CONFIG))
-    lock_context = config_lock
-    if lock_context is None:
-        from .config import config_lock as lock_context  # type: ignore[assignment]
 
-    with lock_context():
+    with _locked_configuration(config_lock):
         recovery = inspect_setup_recovery(path)
         if recovery.get("required"):
             if recovery.get("status") in ("complete_cleanup_required", "rollback_cleanup_required"):
-                recover_setup(path, approve=True)
+                _recover_setup_locked(path)
             else:
                 raise SetupRecoveryError(
                     f"setup recovery must be completed first ({recovery.get('status')}): {recovery.get('reason')}"
@@ -1538,8 +1709,10 @@ def apply_setup_patch(
             "started_at": utcnow_iso(),
             "config_path": str(path),
             "backup": str(backup_path) if backup_path else None,
+            "before_exists": previous_text is not None,
             "before_sha256": previous_sha,
             "after_sha256": new_sha,
+            "stage": "applying",
         }
         try:
             atomic_write_json(journal_path, journal, mode=0o600)
@@ -1557,36 +1730,54 @@ def apply_setup_patch(
             if post_write_validator is not None:
                 post_write_validator(written_view)
         except BaseException as exc:
-            restore_error = None
+            original_error = sanitize_error(str(exc)) or exc.__class__.__name__
+            rollback = _rollback_previous_config(path, previous_text, previous_sha)
+            if rollback.get("ok"):
+                journal_cleanup_error = None
+                try:
+                    journal_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as cleanup_exc:
+                    journal_cleanup_error = sanitize_error(str(cleanup_exc))
+                if journal_cleanup_error:
+                    raise SetupError(
+                        f"configuration apply failed ({original_error}) and was rolled back, "
+                        f"but the setup journal could not be removed ({journal_cleanup_error}); "
+                        f"backup: {backup_path}. Run agent-handoff setup plan --json, then "
+                        "agent-handoff setup recover --approve --json before retrying."
+                    ) from None
+                if isinstance(exc, SetupError):
+                    raise
+                raise SetupError(f"configuration apply failed and was rolled back: {original_error}") from None
+
+            rollback_error = sanitize_error(rollback.get("error") or "unknown rollback failure")
+            journal["rollback_failed"] = True
+            journal["stage"] = "rollback_failed"
+            journal["rollback_error"] = rollback_error
+            journal["rollback_failed_at"] = utcnow_iso()
+            journal_update_error = None
             try:
-                if previous_text is not None:
-                    atomic_write_text(path, previous_text, mode=0o600)
-                else:
-                    try:
-                        path.unlink()
-                    except FileNotFoundError:
-                        pass
-            except OSError as restore_exc:
-                restore_error = sanitize_error(str(restore_exc))
-            try:
-                journal_path.unlink()
-            except OSError:
-                pass
-            if restore_error:
-                raise SetupError(
-                    f"configuration apply failed ({sanitize_error(str(exc))}) and rollback also failed ({restore_error}); "
-                    f"backup: {backup_path}. Run agent-handoff setup plan --json before retrying."
-                )
-            if isinstance(exc, SetupError):
-                raise
-            raise SetupError(f"configuration apply failed and was rolled back: {sanitize_error(str(exc))}")
-        journal_cleanup_error = None
+                atomic_write_json(journal_path, journal, mode=0o600)
+            except OSError as journal_exc:
+                journal_update_error = sanitize_error(str(journal_exc))
+            message = (
+                f"configuration apply failed ({original_error}) and rollback to the previous state also failed "
+                f"({rollback_error}). Recovery is required; the setup journal and backup were preserved. "
+                f"Run agent-handoff setup plan --json and review before retrying."
+            )
+            if journal_update_error:
+                message += f" The journal could not be updated with the rollback failure: {journal_update_error}."
+            raise SetupError(message) from None
         try:
             journal_path.unlink()
         except FileNotFoundError:
             pass
         except OSError as exc:
-            journal_cleanup_error = sanitize_error(str(exc))
+            raise SetupError(
+                "configuration was applied and validated, but the setup journal could not be removed "
+                f"({sanitize_error(str(exc))}). Run agent-handoff setup recover --approve --json before retrying."
+            ) from None
         return {
             "ok": True,
             "changed": True,
@@ -1594,8 +1785,7 @@ def apply_setup_patch(
             "backup": str(backup_path) if backup_path else None,
             "changes": changes,
             "warnings": validation["warnings"],
-            "recovery": None if not journal_cleanup_error else {"required": True, "status": "complete_cleanup_required"},
-            "journal_cleanup_error": journal_cleanup_error,
+            "recovery": None,
             "atomic_write": True,
             "mode": "600",
         }
@@ -1622,7 +1812,7 @@ def format_setup_plan(plan: Mapping[str, Any]) -> str:
         }.get(check["status"], check["status"].upper())
         detail = f" — {check['detail']}" if check.get("detail") else ""
         lines.append(f"[{label:8}] ({check['scope']}) {check['summary']}{detail}")
-        if check.get("next_action") and check["status"] != STATUS_READY:
+        if check.get("next_action"):
             lines.append(f"           Next: {check['next_action']}")
     lines.append("")
     lines.append("Setup steps:")
@@ -1645,7 +1835,9 @@ def format_setup_plan(plan: Mapping[str, Any]) -> str:
         lines.append("Invalid configuration proposal:")
         for error in config_plan["errors"]:
             lines.append(f"[FAIL] {error}")
-    if config_plan.get("changes"):
+        lines.append("Correction: correct or remove the reported setup field(s), then rerun agent-handoff setup plan --json.")
+        lines.append("No configuration changes will be written while this proposal is invalid.")
+    elif config_plan.get("changes"):
         lines.append("")
         lines.append("Proposed configuration changes (approval required):")
         for change in config_plan["changes"]:

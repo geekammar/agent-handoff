@@ -39,11 +39,14 @@ The installer synchronizes managed source files, records an ownership manifest, 
 
 ## Guided setup
 
-`agent-handoff setup plan` is the canonical first inspection for a new user or an AI coding agent. It is read-only and reports the operating system, Python, git, rclone, GitHub CLI and authorization, OpenCode, installation, configuration, project mappings, Drive authorization, dispatcher/service state, and any interrupted setup.
+`agent-handoff setup plan` is the canonical first inspection for a new user or an AI coding agent. It is read-only and reports the operating system, Python, git, rclone, GitHub CLI and authorization, OpenCode, installation, configuration, project mappings, local Drive remote configuration, dispatcher/service state, and any interrupted setup. A locally configured rclone remote is not reported as live Drive authorization.
 
 ```bash
 agent-handoff setup plan
 agent-handoff setup plan --json
+
+# Explicit, bounded, read-only live Drive check (never logs in or changes folders):
+agent-handoff setup plan --check-drive --json
 
 # Preview a narrowly scoped configuration change without writing it:
 agent-handoff setup plan --json --drive-root-folder-id <ROOT_FOLDER_ID>
@@ -55,7 +58,7 @@ agent-handoff setup apply --approve --json --drive-root-folder-id <ROOT_FOLDER_I
 agent-handoff setup recover --approve --json
 ```
 
-Configuration apply preserves unknown valid fields, validates the proposed runtime view with the existing contracts, writes a mode-600 backup, uses an atomic mode-600 write, re-validates the result, and rolls back on failure. It can only change `drive` folder identifiers/names, `workspace_roots`, and `auto_register_projects`. It never enables the dispatcher, coding, `workspace_write`, isolation, notifications, or a service, and it never stores credentials.
+Configuration apply preserves unknown valid fields, validates the proposed runtime view with the existing contracts, writes a mode-600 backup, uses an atomic mode-600 write, re-validates the result, and rolls back on failure. Rollback is verified against the previous SHA-256; if it fails, the journal and backup are preserved and recovery fails closed. Apply and recovery share the same configuration lock. Apply can only change `drive` folder identifiers/names, `workspace_roots`, and `auto_register_projects`. Invalid or forbidden patches always fail closed and are never treated as an empty no-op. It never enables the dispatcher, coding, `workspace_write`, isolation, notifications, or a service, and it never stores credentials.
 
 Statuses are `ready`, `missing`, `optional`, and `blocked`, with `core`, `install`, `capture`, `dispatch`, and `coding` scopes. See [docs/SETUP.md](docs/SETUP.md) for the machine-readable contract, approval model, recovery behavior, and AI capability boundaries.
 
@@ -441,6 +444,7 @@ agent-handoff/
 - Google Drive folder IDs must remain stable; renaming a project in config does not rename the Drive folder.
 - P1-B1 guided setup is a read-only preflight plus a narrowly scoped safe configuration foundation, not a complete interactive wizard. It never installs credentials, selects models, enables the dispatcher or coding, or activates a service.
 - `setup plan` may invoke `gh auth status` to determine whether authorization exists; its output is discarded and token values are never included.
+- `setup plan` detects a locally configured rclone remote but does not prove live Drive access unless `--check-drive` is explicitly requested. Use `agent-handoff auth --check` or `agent-handoff doctor` for live verification.
 
 ## More documentation
 

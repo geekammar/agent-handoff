@@ -1621,6 +1621,8 @@ def _setup_plan(args: argparse.Namespace, patch: dict[str, Any] | None = None) -
         patch=_setup_patch_from_args(args) if patch is None else patch,
         base_dir=BASE_DIR,
         home=Path.home(),
+        check_drive_live=bool(getattr(args, "check_drive", False)),
+        drive_timeout=float(getattr(args, "drive_timeout", 30.0) or 30.0),
     )
 
 
@@ -1923,6 +1925,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = setup_sub.add_parser("plan", help="inspect the environment and preview setup steps without changing anything")
     add_setup_patch_arguments(p)
+    p.add_argument(
+        "--check-drive",
+        action="store_true",
+        help="explicitly perform one bounded read-only rclone Drive access check; never changes tokens or folders",
+    )
+    p.add_argument(
+        "--drive-timeout",
+        type=float,
+        default=30.0,
+        help="timeout in seconds for --check-drive (bounded to 120 seconds)",
+    )
     p.set_defaults(func=cmd_setup_plan)
 
     p = setup_sub.add_parser("apply", help="validate, back up, and atomically apply approved setup configuration")
